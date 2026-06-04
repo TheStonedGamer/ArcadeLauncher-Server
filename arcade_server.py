@@ -327,23 +327,34 @@ class MariaDbAuthStore:
                       username VARCHAR(80) NOT NULL UNIQUE,
                       email VARCHAR(255) NOT NULL UNIQUE,
                       password_hash VARCHAR(255) NOT NULL,
+                      is_admin BOOLEAN NOT NULL DEFAULT TRUE,
                       enabled BOOLEAN NOT NULL DEFAULT TRUE,
                       created_at BIGINT NOT NULL
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     """
                 )
+                try:
+                    cur.execute("ALTER TABLE admin_users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT TRUE")
+                except Exception:
+                    pass
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS launcher_tokens (
                       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
                       name VARCHAR(160) NOT NULL,
+                      user_id BIGINT UNSIGNED NULL,
                       token_hash CHAR(64) NOT NULL UNIQUE,
                       token_plain TEXT NULL,
                       enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                      created_at BIGINT NOT NULL
+                      created_at BIGINT NOT NULL,
+                      INDEX (user_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                     """
                 )
+                try:
+                    cur.execute("ALTER TABLE launcher_tokens ADD COLUMN user_id BIGINT UNSIGNED NULL")
+                except Exception:
+                    pass
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -404,8 +415,8 @@ class MariaDbAuthStore:
                     return
                 cur.execute(
                     """
-                    INSERT INTO admin_users (username, email, password_hash, enabled, created_at)
-                    VALUES (%s, %s, %s, TRUE, %s)
+                    INSERT INTO admin_users (username, email, password_hash, is_admin, enabled, created_at)
+                    VALUES (%s, %s, %s, TRUE, TRUE, %s)
                     """,
                     (username, email, hash_password(password), int(time.time())),
                 )
@@ -416,7 +427,7 @@ class MariaDbAuthStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, username, email, password_hash AS passwordHash, enabled
+                    SELECT id, username, email, password_hash AS passwordHash, is_admin AS isAdmin, enabled
                     FROM admin_users
                     WHERE enabled = TRUE AND (username = %s OR email = %s)
                     LIMIT 1
@@ -430,7 +441,7 @@ class MariaDbAuthStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, username, email, password_hash AS passwordHash, enabled
+                    SELECT id, username, email, password_hash AS passwordHash, is_admin AS isAdmin, enabled
                     FROM admin_users WHERE id = %s AND enabled = TRUE
                     """,
                     (admin_id,),
@@ -440,15 +451,26 @@ class MariaDbAuthStore:
     def list_admins(self) -> list[dict]:
         with self.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, username, email, enabled, created_at AS createdAt FROM admin_users ORDER BY username")
+                cur.execute("SELECT id, username, email, is_admin AS isAdmin, enabled, created_at AS createdAt FROM admin_users ORDER BY username")
                 return list(cur.fetchall())
+
+    def create_user(self, username: str, email: str, password: str, is_admin: bool = False) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO admin_users (username, email, password_hash, is_admin, enabled, created_at)
+                    VALUES (%s, %s, %s, %s, TRUE, %s)
+                    """,
+                    (username, email, hash_password(password), bool(is_admin), int(time.time())),
+                )
 
     def list_launcher_tokens(self) -> list[dict]:
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, name, token_plain AS token, enabled, created_at AS createdAt
+                    SELECT id, name, user_id AS userId, token_plain AS token, enabled, created_at AS createdAt
                     FROM launcher_tokens ORDER BY name
                     """
                 )
@@ -465,6 +487,31 @@ class MariaDbAuthStore:
                     """,
                     (name, self.token_hash(token), token, int(time.time())),
                 )
+        return token
+
+    def issue_user_token(self, user_id: int, username: str) -> str:
+        token = secrets.token_urlsafe(36)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM launcher_tokens WHERE user_id = %s LIMIT 1", (user_id,))
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE launcher_tokens
+                        SET name = %s, token_hash = %s, token_plain = %s, enabled = TRUE, created_at = %s
+                        WHERE id = %s
+                        """,
+                        (username, self.token_hash(token), token, int(time.time()), existing["id"]),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO launcher_tokens (name, user_id, token_hash, token_plain, enabled, created_at)
+                        VALUES (%s, %s, %s, %s, TRUE, %s)
+                        """,
+                        (username, user_id, self.token_hash(token), token, int(time.time())),
+                    )
         return token
 
     def delete_launcher_token(self, token_id: int) -> None:
@@ -704,12 +751,18 @@ class ArcadeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             parsed = urlparse(self.path)
+            if parsed.path == "/api/login":
+                self.handle_api_login()
+                return
             if parsed.path in ("/admin", "/admin/login", "/admin/reset"):
                 self.handle_admin_post()
                 return
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
-            self.send_admin_page(str(exc), error=True)
+            if self.path.startswith("/api/"):
+                self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            else:
+                self.send_admin_page(str(exc), error=True)
 
     def route_get(self) -> None:
         parsed = urlparse(self.path)
@@ -737,6 +790,21 @@ class ArcadeHandler(BaseHTTPRequestHandler):
 
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
+    def handle_api_login(self) -> None:
+        form = self.read_form()
+        username = form.get("username", [""])[0]
+        password = form.get("password", [""])[0]
+        user = self.auth_store.find_admin(username)
+        if not user or not verify_password(password, str(user.get("passwordHash", ""))):
+            self.send_json({"error": "invalid username or password"}, HTTPStatus.UNAUTHORIZED)
+            return
+        token = self.auth_store.issue_user_token(int(user["id"]), str(user.get("username", username)))
+        self.send_json({
+            "token": token,
+            "username": str(user.get("username", "")),
+            "isAdmin": bool(user.get("isAdmin", False)),
+        })
+
     def handle_admin_post(self) -> None:
         form = self.read_form()
         action = form.get("action", [""])[0]
@@ -759,11 +827,14 @@ class ArcadeHandler(BaseHTTPRequestHandler):
             return
 
         if action == "add_user":
-            name = form.get("name", [""])[0].strip()
-            if not name:
-                raise ValueError("user name is required")
-            self.auth_store.create_launcher_token(name)
-            self.send_admin_page(f"Created token for {name}.")
+            username = form.get("username", [""])[0].strip()
+            email = form.get("email", [""])[0].strip()
+            password = form.get("password", [""])[0]
+            is_admin = form.get("is_admin", [""])[0] == "1"
+            if not username or not email or len(password) < 10:
+                raise ValueError("username, email, and a 10+ character password are required")
+            self.auth_store.create_user(username, email, password, is_admin)
+            self.send_admin_page(f"Created user {username}.")
             return
 
         if action == "delete_user":
@@ -789,7 +860,7 @@ class ArcadeHandler(BaseHTTPRequestHandler):
         username = form.get("username", [""])[0]
         password = form.get("password", [""])[0]
         admin = self.auth_store.find_admin(username)
-        if not admin or not verify_password(password, str(admin.get("passwordHash", ""))):
+        if not admin or not admin.get("isAdmin", False) or not verify_password(password, str(admin.get("passwordHash", ""))):
             self.send_admin_page("Invalid username or password.", error=True)
             return
         session_token = self.auth_store.create_session(int(admin["id"]))
@@ -989,9 +1060,9 @@ class ArcadeHandler(BaseHTTPRequestHandler):
             self.send_admin_shell(message_html, admin_body)
             return
 
-        users_html = ""
+        tokens_html = ""
         for user in launcher_tokens:
-            users_html += f"""
+            tokens_html += f"""
             <tr>
               <td>{html.escape(str(user.get('name', '')))}</td>
               <td><code class="token">{html.escape(str(user.get('token', '')))}</code></td>
@@ -1015,6 +1086,7 @@ class ArcadeHandler(BaseHTTPRequestHandler):
             <tr>
               <td>{html.escape(str(item.get('username', '')))}</td>
               <td>{html.escape(str(item.get('email', '')))}</td>
+              <td>{'Admin' if item.get('isAdmin', False) else 'Client'}</td>
               <td>{'Enabled' if item.get('enabled', True) else 'Disabled'}</td>
             </tr>"""
 
@@ -1056,8 +1128,8 @@ class ArcadeHandler(BaseHTTPRequestHandler):
                 <div class="metric-grid">
                   <div class="metric"><span>Total Games</span><strong>{summary.get('gameCount', 0)}</strong></div>
                   <div class="metric"><span>Platforms</span><strong>{len(summary.get('byPlatform', {}))}</strong></div>
-                  <div class="metric"><span>Launcher Tokens</span><strong>{len(launcher_tokens)}</strong></div>
-                  <div class="metric"><span>Admin Users</span><strong>{len(admins)}</strong></div>
+                  <div class="metric"><span>Issued Tokens</span><strong>{len(launcher_tokens)}</strong></div>
+                  <div class="metric"><span>Users</span><strong>{len(admins)}</strong></div>
                 </div>
               </section>
 
@@ -1085,27 +1157,31 @@ class ArcadeHandler(BaseHTTPRequestHandler):
               <section id="auth" class="section">
                 <div class="section-heading">
                   <h2>Auth Management</h2>
-                  <span class="muted">Admin users sign in here; launcher devices use bearer tokens.</span>
+                  <span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span>
                 </div>
                 <div class="two-col">
                   <div>
-                    <h3>Launcher Tokens</h3>
+                    <h3>Create User</h3>
                     <form method="post" class="row">
-                      <input name="name" placeholder="Device or user name">
-                      <button name="action" value="add_user">Create Token</button>
+                      <input name="username" placeholder="Username">
+                      <input name="email" type="email" placeholder="Email">
+                      <input name="password" type="password" placeholder="Password">
+                      <label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label>
+                      <button name="action" value="add_user">Create User</button>
                     </form>
+                    <h3>Users</h3>
                     <table>
-                      <thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead>
-                      <tbody>{users_html or '<tr><td colspan="4">No launcher tokens yet.</td></tr>'}</tbody>
+                      <thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th></tr></thead>
+                      <tbody>{admins_html or '<tr><td colspan="4">No users yet.</td></tr>'}</tbody>
                     </table>
                   </div>
                   <div>
-                    <h3>Admin Users</h3>
+                    <h3>Issued Tokens</h3>
                     <table>
-                      <thead><tr><th>Username</th><th>Email</th><th>Status</th></tr></thead>
-                      <tbody>{admins_html or '<tr><td colspan="3">No admin users yet.</td></tr>'}</tbody>
+                      <thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead>
+                      <tbody>{tokens_html or '<tr><td colspan="4">No issued tokens yet.</td></tr>'}</tbody>
                     </table>
-                    <p class="muted">Password resets use the admin email address and SMTP settings below.</p>
+                    <p class="muted">Clients receive these tokens automatically after username/password login.</p>
                   </div>
                 </div>
               </section>
@@ -1214,6 +1290,8 @@ class ArcadeHandler(BaseHTTPRequestHandler):
     .kv dt {{ color: var(--muted); }}
     .kv dd {{ margin: 0; min-width: 0; }}
     .row {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+    .checkline {{ display:inline-flex; align-items:center; gap: 6px; color: var(--muted); }}
+    .checkline input {{ min-width: 0; }}
     .stack {{ display: flex; gap: 10px; flex-direction: column; align-items: flex-start; }}
     .inline {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     .token {{ max-width: 420px; display:inline-block; overflow-wrap:anywhere; }}
