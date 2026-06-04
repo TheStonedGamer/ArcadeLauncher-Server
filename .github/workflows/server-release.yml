@@ -1,0 +1,114 @@
+name: Server Release
+
+# Builds and publishes the backend server package from this repo's main branch.
+on:
+  push:
+    branches: [main]
+    tags:
+      - "server-v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package Server
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump server version
+        id: ver
+        shell: pwsh
+        run: |
+          $author = git log -1 --format='%an'
+          $isTag  = '${{ github.ref_type }}' -eq 'tag'
+          $isBot  = $author -eq 'github-actions[bot]'
+
+          $ver = (Get-Content VERSION -Raw).Trim()
+          $parts = $ver.Split('.')
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $patch = [int]$parts[2]
+
+          Write-Host "Current version : $major.$minor.$patch"
+          Write-Host "Triggered by tag: $isTag   Bot commit: $isBot"
+
+          if (-not $isTag -and -not $isBot) {
+            $msg = git log -1 --format='%s'
+            Write-Host "Commit message  : $msg"
+            if ($msg -match '\[major\]') {
+              $major++; $minor = 0; $patch = 0
+              Write-Host "Bump type       : MAJOR"
+            } elseif ($msg -match '\[minor\]') {
+              $minor++; $patch = 0
+              Write-Host "Bump type       : MINOR"
+            } else {
+              $patch++
+              Write-Host "Bump type       : PATCH"
+            }
+
+            "$major.$minor.$patch" | Set-Content VERSION -NoNewline
+            git add VERSION
+            git commit -m "chore: bump server version to $major.$minor.$patch [skip actions]"
+            git push origin HEAD:main
+          }
+
+          $ver = "$major.$minor.$patch"
+          $tag = "server-v$ver"
+          Write-Host "Server release version : $ver   Tag: $tag"
+          "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          "TAG=$tag"     >> $env:GITHUB_OUTPUT
+
+      - name: Ensure server release tag
+        if: github.ref_type != 'tag'
+        shell: pwsh
+        run: |
+          git tag -f "${{ steps.ver.outputs.TAG }}"
+          git push -f origin "${{ steps.ver.outputs.TAG }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate server Python
+        run: |
+          python -m py_compile arcade_server.py
+          python -m py_compile generate_catalog.py
+
+      - name: Package server zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = "dist\ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}.zip"
+          Compress-Archive `
+            -Path arcade_server.py,generate_catalog.py,catalog.example.json,README.md,deploy,.gitignore,VERSION `
+            -DestinationPath $zip `
+            -Force
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArcadeLauncher-Server-${{ steps.ver.outputs.TAG }}
+          path: dist\ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.TAG }}
+          name: ArcadeLauncher Server ${{ steps.ver.outputs.TAG }}
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          files: dist/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}.zip

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "games": [
+    {
+      "id": "assassins-creed-ii-x360-god",
+      "title": "Assassin's Creed II",
+      "platform": "Xbox360",
+      "installType": "emulator_rom",
+      "contentPath": "games/assassins-creed-ii-x360-god",
+      "coverArtUrl": "",
+      "igdbId": 2164,
+      "launch": {
+        "target": "5553083B/00007000/C3698B02515E795C2B2F",
+        "arguments": "{rom}"
+      }
+    }
+  ]
+}
