@@ -27,11 +27,10 @@ http://127.0.0.1:8721/api/games/<game-id>/manifest
 
 ## Library Layout
 
-`catalog.json` lives at the library root:
+Game files live under the library root. The game catalog itself is stored in MariaDB and rebuilt from the filesystem through the admin panel.
 
 ```text
 D:\ArcadeLibrary\
-  catalog.json
   games\
     assassins-creed-ii-x360-god\
       5553083B\
@@ -42,31 +41,7 @@ D:\ArcadeLibrary\
             Data0001
 ```
 
-Example `catalog.json`:
-
-```json
-{
-  "schemaVersion": 1,
-  "games": [
-    {
-      "id": "assassins-creed-ii-x360-god",
-      "title": "Assassin's Creed II",
-      "platform": "Xbox360",
-      "installType": "emulator_rom",
-      "version": "1",
-      "contentPath": "games/assassins-creed-ii-x360-god",
-      "launch": {
-        "target": "5553083B/00007000/C3698B02515E795C2B2F",
-        "arguments": "{rom}"
-      }
-    }
-  ]
-}
-```
-
-Keep `contentPath` relative to the library root. Do not put absolute NAS/server paths in the catalog.
-
-`contentPath` may point to either a game directory, such as an Xbox 360 GOD folder, or a single ROM file. For mounted ROM libraries, use the admin panel's `Rescan Filesystem and Sync DB` action.
+Catalog entries store paths relative to the library root. Do not put absolute NAS/server paths in the database. A content path may point to either a game directory, such as an Xbox 360 GOD folder, or a single ROM file. For mounted ROM libraries, use the admin panel's `Rescan Filesystem and Sync DB` action.
 
 The native scanner catalogs known emulator ROM formats, Xbox 360 GOD directories, and PC archive installs.
 
@@ -93,7 +68,6 @@ If the game library is mounted from the Proxmox host, make sure the CT can read 
 
 ```text
 /srv/arcade-library/
-  catalog.json
   games/
 ```
 

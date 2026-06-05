@@ -85,7 +85,7 @@ jobs:
         run: |
           mkdir -p dist package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
           cp target/release/arcadelauncher-server package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
-          cp catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          cp README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp -R src package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp -R deploy package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           chmod +x package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/arcadelauncher-server

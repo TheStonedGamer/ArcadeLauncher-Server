@@ -24,9 +24,6 @@ else
   exit 1
 fi
 install -d -o arcade -g arcade -m 0755 /srv/arcade-library
-if [[ ! -f /srv/arcade-library/catalog.json ]]; then
-  install -o arcade -g arcade -m 0644 "${SERVER_DIR}/catalog.example.json" /srv/arcade-library/catalog.json
-fi
 
 if [[ ! -f /etc/arcadelauncher-server.env ]]; then
   install -m 0644 "${SCRIPT_DIR}/arcadelauncher-server.env.example" /etc/arcadelauncher-server.env

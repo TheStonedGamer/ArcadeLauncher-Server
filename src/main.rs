@@ -1100,7 +1100,6 @@ fn server_error(e: impl std::fmt::Display) -> Response {
 
 async fn rescan_catalog(st: &AppState) -> Result<String> {
     let games = scan_catalog(&st.cfg.library_root).await?;
-    write_catalog_json(&st.cfg.library_root, &games).await?;
     sync_catalog_db(&st.db, &games).await?;
 
     let mut by_platform = BTreeMap::<String, usize>::new();
@@ -1108,9 +1107,8 @@ async fn rescan_catalog(st: &AppState) -> Result<String> {
         *by_platform.entry(game.platform.clone()).or_default() += 1;
     }
     let mut msg = format!(
-        "Wrote {} games to {}\nMariaDB sync: yes",
-        games.len(),
-        st.cfg.library_root.join("catalog.json").display()
+        "Synced {} games to MariaDB.",
+        games.len()
     );
     for (platform, count) in by_platform {
         msg.push_str(&format!("\n{platform}: {count}"));
@@ -1296,19 +1294,6 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
             c.exec_drop("DELETE FROM games WHERE id=:id", params! {"id" => id}).await?;
         }
     }
-    Ok(())
-}
-
-async fn write_catalog_json(library_root: &Path, games: &[Game]) -> Result<()> {
-    let catalog = Catalog {
-        schema_version: 1,
-        generated_by: "rust-native".into(),
-        games: games.to_vec(),
-    };
-    let path = library_root.join("catalog.json");
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&catalog)?).await?;
-    fs::rename(tmp, path).await?;
     Ok(())
 }
 
