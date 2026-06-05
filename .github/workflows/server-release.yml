@@ -72,16 +72,6 @@ jobs:
           git tag -f "${{ steps.ver.outputs.TAG }}"
           git push -f origin "${{ steps.ver.outputs.TAG }}"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Validate server Python
-        run: |
-          python -m py_compile arcade_server.py
-          python -m py_compile generate_catalog.py
-
       - name: Build Rust server in Debian 12
         run: |
           docker run --rm \
@@ -95,7 +85,7 @@ jobs:
         run: |
           mkdir -p dist package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
           cp target/release/arcadelauncher-server package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
-          cp arcade_server.py generate_catalog.py catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          cp catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp -R src package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp -R deploy package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           chmod +x package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/arcadelauncher-server
