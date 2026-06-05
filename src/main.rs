@@ -281,6 +281,7 @@ async fn main() -> Result<()> {
 }
 
 async fn ensure_database(cfg: &Config) -> Result<()> {
+    validate_db_identifier(&cfg.db_name)?;
     let pool = Pool::new(cfg.database_url(false).as_str());
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!(
@@ -387,7 +388,7 @@ async fn ensure_bootstrap_admin(db: &Pool, cfg: &Config) -> Result<()> {
     let mut c = db.get_conn().await?;
     let count: Option<u64> = c.query_first("SELECT COUNT(*) FROM admin_users").await?;
     if count.unwrap_or(0) == 0 {
-        let hash = hash_password_scrypt(&cfg.admin_password)?;
+        let hash = hash_password_argon2(&cfg.admin_password)?;
         c.exec_drop(
             "INSERT INTO admin_users (username,email,password_hash,is_admin,enabled,created_at) VALUES (:u,:e,:p,TRUE,TRUE,:t)",
             params! {"u" => &cfg.admin_username, "e" => &cfg.admin_email, "p" => hash, "t" => now()},
@@ -520,8 +521,9 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 match create_session(&st.db, user.id).await {
                     Ok(token) => {
                         let mut r = Redirect::to("/admin").into_response();
-                        let cookie = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECONDS}");
-                        r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+                        if let Ok(cookie) = HeaderValue::from_str(&session_cookie_value(&token)) {
+                            r.headers_mut().insert(header::SET_COOKIE, cookie);
+                        }
                         r
                     }
                     Err(e) => server_error(e),
@@ -762,11 +764,15 @@ async fn setting_value(db: &Pool, key: &str) -> Result<Option<String>> {
 
 async fn save_server_setting(db: &Pool, key: &str, value: &str) -> Result<()> {
     let key = key.trim();
+    let value = value.trim();
     if key.is_empty() {
         return Err(anyhow!("setting key is required"));
     }
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return Err(anyhow!("setting key may only contain letters, numbers, dash, underscore, or dot"));
+    }
+    if is_sensitive_key(key) && value.is_empty() {
+        return Err(anyhow!("blank sensitive settings are not saved"));
     }
     let mut c = db.get_conn().await?;
     c.exec_drop(
@@ -1102,15 +1108,6 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn hash_password_scrypt(password: &str) -> Result<String> {
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
-    let params = ScryptParams::new(14, 8, 1, 64)?;
-    let mut out = [0u8; 64];
-    scrypt(password.as_bytes(), &salt, &params, &mut out)?;
-    Ok(format!("scrypt$n=16384,r=8,p=1${}${}", URL_SAFE.encode(salt), URL_SAFE.encode(out)))
-}
-
 fn hash_password_argon2(password: &str) -> Result<String> {
     use argon2::{
         password_hash::{PasswordHasher, SaltString},
@@ -1359,6 +1356,10 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+fn session_cookie_value(token: &str) -> String {
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}")
+}
+
 fn base_url(headers: &HeaderMap, cfg: &Config) -> String {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
     let proto = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");
@@ -1439,6 +1440,51 @@ fn safe_file_part(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+fn validate_db_identifier(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 64 {
+        return Err(anyhow!("database name must be 1-64 characters"));
+    }
+    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(anyhow!("database name may only contain ASCII letters, numbers, and underscore"));
+    }
+    Ok(())
+}
+
+fn sanitize_search_query(query: &str) -> Result<String> {
+    let cleaned = query
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return Err(anyhow!("search query is required"));
+    }
+    if cleaned.chars().count() > 120 {
+        return Err(anyhow!("search query is too long"));
+    }
+    Ok(cleaned)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.contains("secret") || k.contains("password") || k.contains("token")
+}
+
+fn masked_value(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let len = value.chars().count();
+    if len <= 8 {
+        return "********".into();
+    }
+    let head = value.chars().take(4).collect::<String>();
+    let tail = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+    format!("{head}...{tail}")
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -1571,12 +1617,13 @@ async fn igdb_credentials(db: &Pool) -> Result<(String, String)> {
 }
 
 async fn igdb_search_for_game(st: &AppState, game: &Game, query: &str) -> Result<Vec<IgdbMatch>> {
+    let query = sanitize_search_query(query)?;
     let (client_id, client_secret) = igdb_credentials(&st.db).await?;
     let http = Client::builder().user_agent("ArcadeLauncher-Server/1.0").build()?;
     let token = igdb_authenticate(&http, &client_id, &client_secret).await?;
-    let mut results = igdb_search(&http, &client_id, &token, query, igdb_platform_ids(&game.platform)).await?;
+    let mut results = igdb_search(&http, &client_id, &token, &query, igdb_platform_ids(&game.platform)).await?;
     if results.is_empty() && !igdb_platform_ids(&game.platform).is_empty() {
-        results = igdb_search(&http, &client_id, &token, query, &[]).await?;
+        results = igdb_search(&http, &client_id, &token, &query, &[]).await?;
     }
     Ok(results)
 }
@@ -2105,7 +2152,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
         .map(|(id, name, token, enabled)| {
             format!(
                 "<tr><td>{}</td><td><code class='token'>{}</code></td><td>{}</td><td><form method='post' class='inline'><input type='hidden' name='user_id' value='{}'><button name='action' value='rotate_user'>Rotate</button><button name='action' value='delete_user' class='danger'>Delete</button></form></td></tr>",
-                esc(name), esc(token), if *enabled { "Enabled" } else { "Disabled" }, id
+                esc(name), esc(&masked_value(token)), if *enabled { "Enabled" } else { "Disabled" }, id
             )
         })
         .collect::<String>();
@@ -2116,9 +2163,12 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
     let settings_rows = settings
         .iter()
         .map(|(k, v)| {
+            let sensitive = is_sensitive_key(k);
+            let value = if sensitive { String::new() } else { v.clone() };
+            let masked = if sensitive { format!("<span class='muted'>{}</span>", esc(&masked_value(v))) } else { String::new() };
             format!(
-                "<tr><td><code>{}</code></td><td><form method='post' class='inline'><input type='hidden' name='setting_key' value='{}'><input name='setting_value' value='{}'><button name='action' value='save_setting'>Save</button></form></td></tr>",
-                esc(k), esc(k), esc(v)
+                "<tr><td><code>{}</code></td><td><form method='post' class='inline'><input type='hidden' name='setting_key' value='{}'><input name='setting_value' value='{}'>{}<button name='action' value='save_setting'>Save</button></form></td></tr>",
+                esc(k), esc(k), esc(&value), masked
             )
         })
         .collect::<String>();
@@ -2137,7 +2187,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
-            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="IGDB/Twitch Client Secret" value="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
+            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
         "##,
@@ -2165,7 +2215,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
         esc(&st.cfg.db_name),
         CHUNK_SIZE,
         esc(igdb_client_id),
-        esc(igdb_client_secret),
+        if igdb_client_secret.is_empty() { "IGDB/Twitch Client Secret".into() } else { format!("Saved ({})", masked_value(igdb_client_secret)) },
         if settings_rows.is_empty() { "<tr><td colspan='2'>No managed settings saved yet.</td></tr>".into() } else { settings_rows },
     )))
 }
