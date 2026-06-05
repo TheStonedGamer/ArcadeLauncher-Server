@@ -231,6 +231,9 @@ struct AdminForm {
     setting_value: Option<String>,
     service_name: Option<String>,
     totp_code: Option<String>,
+    game_id: Option<String>,
+    search_query: Option<String>,
+    igdb_id: Option<u64>,
 }
 
 #[tokio::main]
@@ -490,7 +493,7 @@ async fn download_chunk(
 
 async fn admin_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
     match current_admin(&st.db, &headers).await {
-        Ok(Some(admin)) => Html(admin_html(&st, Some(admin), "").await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+        Ok(Some(admin)) => Html(admin_html(&st, Some(admin), "", "", "").await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
         _ => Html(login_html("")).into_response(),
     }
 }
@@ -531,6 +534,8 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             Ok(Some(a)) => a,
             _ => return Html(login_html("Please sign in first.")).into_response(),
         };
+        let matcher_game_id = form.game_id.clone().unwrap_or_default();
+        let matcher_query = form.search_query.clone().unwrap_or_default();
         let msg = match form.action.as_str() {
             "add_user" => {
                 let username = form.username.unwrap_or_default();
@@ -573,6 +578,17 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 Ok(out) => out,
                 Err(e) => e.to_string(),
             },
+            "igdb_search" => "IGDB search results are shown in Metadata Matcher.".to_string(),
+            "igdb_apply" => {
+                let game_id = form.game_id.unwrap_or_default();
+                match form.igdb_id {
+                    Some(igdb_id) => match apply_manual_igdb_match(&st, &game_id, igdb_id).await {
+                        Ok(title) => format!("Applied IGDB metadata to {title}."),
+                        Err(e) => e.to_string(),
+                    },
+                    None => "missing IGDB match id".to_string(),
+                }
+            },
             "validate_games" => match validate_games(&st).await {
                 Ok(report) => report.to_message(),
                 Err(e) => e.to_string(),
@@ -594,7 +610,7 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             },
             _ => "No action taken.".to_string(),
         };
-        Html(admin_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response()
+        Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response()
     }
 }
 
@@ -1545,6 +1561,65 @@ async fn igdb_best_match(http: &Client, client_id: &str, token: &str, game: &Gam
     Ok(best.and_then(|(score, meta)| if score >= 0.60 { Some(meta) } else { None }))
 }
 
+async fn igdb_credentials(db: &Pool) -> Result<(String, String)> {
+    let client_id = setting_value(db, IGDB_CLIENT_ID_KEY).await?.unwrap_or_default();
+    let client_secret = setting_value(db, IGDB_CLIENT_SECRET_KEY).await?.unwrap_or_default();
+    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+        return Err(anyhow!("set IGDB credentials in Configuration first"));
+    }
+    Ok((client_id, client_secret))
+}
+
+async fn igdb_search_for_game(st: &AppState, game: &Game, query: &str) -> Result<Vec<IgdbMatch>> {
+    let (client_id, client_secret) = igdb_credentials(&st.db).await?;
+    let http = Client::builder().user_agent("ArcadeLauncher-Server/1.0").build()?;
+    let token = igdb_authenticate(&http, &client_id, &client_secret).await?;
+    let mut results = igdb_search(&http, &client_id, &token, query, igdb_platform_ids(&game.platform)).await?;
+    if results.is_empty() && !igdb_platform_ids(&game.platform).is_empty() {
+        results = igdb_search(&http, &client_id, &token, query, &[]).await?;
+    }
+    Ok(results)
+}
+
+async fn igdb_fetch_by_id(http: &Client, client_id: &str, token: &str, igdb_id: u64) -> Result<IgdbMatch> {
+    let body = format!(
+        "fields id,name,summary,rating,first_release_date,cover.image_id,genres.name;where id = {igdb_id};limit 1;"
+    );
+    let value: serde_json::Value = http
+        .post("https://api.igdb.com/v4/games")
+        .header("Client-ID", client_id)
+        .bearer_auth(token)
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(parse_igdb_match)
+        .ok_or_else(|| anyhow!("IGDB game {igdb_id} was not found"))
+}
+
+async fn apply_manual_igdb_match(st: &AppState, game_id: &str, igdb_id: u64) -> Result<String> {
+    let game = find_game(&st.db, game_id).await?.ok_or_else(|| anyhow!("game not found"))?;
+    let (client_id, client_secret) = igdb_credentials(&st.db).await?;
+    let http = Client::builder().user_agent("ArcadeLauncher-Server/1.0").build()?;
+    let token = igdb_authenticate(&http, &client_id, &client_secret).await?;
+    let meta = igdb_fetch_by_id(&http, &client_id, &token, igdb_id).await?;
+    let cover_art_url = if !meta.cover_image_id.is_empty() {
+        match cache_igdb_cover(&http, st, &game.id, &meta.cover_image_id).await {
+            Ok(true) => "local".to_string(),
+            _ => igdb_cover_url(&meta.cover_image_id),
+        }
+    } else {
+        game.cover_art_url.clone()
+    };
+    save_game_metadata(&st.db, &game.id, &meta, &cover_art_url).await?;
+    Ok(game.title)
+}
+
 async fn igdb_search(http: &Client, client_id: &str, token: &str, title: &str, platforms: &[i32]) -> Result<Vec<IgdbMatch>> {
     let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
     let mut body = format!(
@@ -2002,7 +2077,7 @@ async fn restart_service(name: &str) -> Result<String> {
     Ok(format!("Restarted {service}."))
 }
 
-async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result<String> {
+async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_game_id: &str, matcher_query: &str) -> Result<String> {
     let users = list_users(&st.db).await.unwrap_or_default();
     let tokens = list_launcher_tokens(&st.db).await.unwrap_or_default();
     let games = list_games(&st.db).await.unwrap_or_default();
@@ -2049,6 +2124,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         .collect::<String>();
     let igdb_client_id = settings.iter().find(|(k, _)| k == IGDB_CLIENT_ID_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
     let igdb_client_secret = settings.iter().find(|(k, _)| k == IGDB_CLIENT_SECRET_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
+    let matcher_html = metadata_matcher_html(st, &games, matcher_game_id, matcher_query).await;
     let signed = admin.map(|a| a.username).unwrap_or_default();
     Ok(shell(&format!(
         r##"
@@ -2059,7 +2135,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
-            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form><h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
+            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
             <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="IGDB/Twitch Client Secret" value="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
@@ -2074,6 +2150,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         service_rows,
         esc(&st.cfg.library_root.display().to_string()),
         esc(&st.cfg.library_root.join(".arcadelauncher").join("art").display().to_string()),
+        matcher_html,
         validation_summary,
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
         if user_rows.is_empty() { "<tr><td colspan='6'>No users yet.</td></tr>".into() } else { user_rows },
@@ -2091,6 +2168,69 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         esc(igdb_client_secret),
         if settings_rows.is_empty() { "<tr><td colspan='2'>No managed settings saved yet.</td></tr>".into() } else { settings_rows },
     )))
+}
+
+async fn metadata_matcher_html(st: &AppState, games: &[Game], selected_id: &str, query: &str) -> String {
+    let selected = games
+        .iter()
+        .find(|g| g.id == selected_id)
+        .or_else(|| games.first());
+    let selected_id = selected.map(|g| g.id.as_str()).unwrap_or("");
+    let default_query = if query.trim().is_empty() {
+        selected.map(|g| g.title.as_str()).unwrap_or("")
+    } else {
+        query
+    };
+    let options = games
+        .iter()
+        .map(|g| {
+            let sel = if g.id == selected_id { " selected" } else { "" };
+            format!("<option value=\"{}\"{}>{} - {}</option>", esc(&g.id), sel, esc(&g.platform), esc(&g.title))
+        })
+        .collect::<String>();
+    let mut result_rows = String::new();
+    if let Some(game) = selected {
+        if !query.trim().is_empty() {
+            match igdb_search_for_game(st, game, query.trim()).await {
+                Ok(results) if results.is_empty() => {
+                    result_rows = "<tr><td colspan='6'>No IGDB matches found.</td></tr>".into();
+                }
+                Ok(results) => {
+                    result_rows = results
+                        .into_iter()
+                        .map(|m| {
+                            let year = if m.release_date > 0 {
+                                chrono::DateTime::from_timestamp(m.release_date, 0).map(|d| d.format("%Y").to_string()).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            let summary = if m.summary.chars().count() > 180 {
+                                format!("{}...", m.summary.chars().take(180).collect::<String>())
+                            } else {
+                                m.summary.clone()
+                            };
+                            format!(
+                                "<tr><td>{}</td><td>{}</td><td>{:.0}</td><td>{}</td><td>{}</td><td><form method='post'><input type='hidden' name='game_id' value='{}'><input type='hidden' name='search_query' value='{}'><input type='hidden' name='igdb_id' value='{}'><button name='action' value='igdb_apply'>Apply</button></form></td></tr>",
+                                esc(&m.name), esc(&year), m.rating, esc(&m.genres), esc(&summary), esc(&game.id), esc(query), m.id
+                            )
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    result_rows = format!("<tr><td colspan='6'>{}</td></tr>", esc(&e.to_string()));
+                }
+            }
+        }
+    }
+    if result_rows.is_empty() {
+        result_rows = "<tr><td colspan='6'>Search IGDB to choose a metadata match.</td></tr>".into();
+    }
+    format!(
+        r#"<h3>Metadata Matcher</h3><form method="post" class="row matcher-form"><select name="game_id">{}</select><input name="search_query" value="{}" placeholder="Search title"><button name="action" value="igdb_search">Search IGDB</button></form><table class="matcher-results"><thead><tr><th>IGDB Title</th><th>Year</th><th>Rating</th><th>Genres</th><th>Summary</th><th>Action</th></tr></thead><tbody>{}</tbody></table>"#,
+        options,
+        esc(default_query),
+        result_rows
+    )
 }
 
 async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize, token_count: usize) -> String {
@@ -2260,5 +2400,5 @@ fn esc(s: &str) -> String {
 
 static CSS: &str = r#"
 :root{color-scheme:dark;--bg:#0f1115;--panel:#171b21;--panel2:#1d232b;--line:#2c3540;--text:#e8edf2;--muted:#9aa7b5;--accent:#4cc2ff;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split,.two-col{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.two-col{grid-template-columns:repeat(2,minmax(0,1fr))}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.new-setting{margin-top:12px}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split,.two-col{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split,.two-col{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.two-col{grid-template-columns:repeat(2,minmax(0,1fr))}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.new-setting{margin-top:12px}.matcher-form{margin:10px 0}.matcher-form select{max-width:420px}.matcher-results{margin-bottom:14px}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input,select{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split,.two-col{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
 "#;
