@@ -18,6 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cookie = "0.18"
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
 http = "1"
 mime_guess = "2"
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }

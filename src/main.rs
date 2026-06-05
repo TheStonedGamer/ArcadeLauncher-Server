@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE, Engine};
 use bytes::Bytes;
 use cookie::Cookie;
 use futures_util::TryStreamExt;
+use hmac::{Hmac, Mac};
 use mysql_async::{params, prelude::Queryable, Pool, Row};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use rust_scrypt::{scrypt, Params as ScryptParams};
@@ -196,6 +197,8 @@ struct ManifestChunk {
 struct LoginForm {
     username: String,
     password: String,
+    #[serde(default, alias = "totpCode")]
+    totp_code: String,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +212,7 @@ struct AdminForm {
     setting_key: Option<String>,
     setting_value: Option<String>,
     service_name: Option<String>,
+    totp_code: Option<String>,
 }
 
 #[tokio::main]
@@ -282,6 +286,8 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     )
     .await?;
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT TRUE").await;
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN totp_secret VARCHAR(64) NULL").await;
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT FALSE").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS launcher_tokens (
           id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -367,13 +373,14 @@ async fn api_health(State(_): State<AppState>) -> Json<serde_json::Value> {
 
 async fn api_login(State(st): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     match find_user(&st.db, &form.username).await {
-        Ok(Some(user)) if verify_password_any(&form.password, &user.password_hash) => {
+        Ok(Some(user)) if verify_password_any(&form.password, &user.password_hash)
+            && verify_user_totp(&user, &form.totp_code) => {
             match issue_user_token(&st.db, user.id, &user.username).await {
                 Ok(token) => Json(serde_json::json!({"token": token, "username": user.username, "isAdmin": user.is_admin})).into_response(),
                 Err(e) => server_error(e),
             }
         }
-        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid username or password"}))).into_response(),
+        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid username, password, or 2FA code"}))).into_response(),
     }
 }
 
@@ -472,7 +479,8 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
         let username = form.username.unwrap_or_default();
         let password = form.password.unwrap_or_default();
         match find_user(&st.db, &username).await {
-            Ok(Some(user)) if user.is_admin && verify_password_any(&password, &user.password_hash) => {
+            Ok(Some(user)) if user.is_admin && verify_password_any(&password, &user.password_hash)
+                && verify_user_totp(&user, form.totp_code.as_deref().unwrap_or("")) => {
                 match create_session(&st.db, user.id).await {
                     Ok(token) => {
                         let mut r = Redirect::to("/admin").into_response();
@@ -483,7 +491,7 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     Err(e) => server_error(e),
                 }
             }
-            _ => Html(login_html("Invalid username or password.")).into_response(),
+            _ => Html(login_html("Invalid username, password, or 2FA code.")).into_response(),
         }
     } else {
         let admin = match current_admin(&st.db, &headers).await {
@@ -511,6 +519,14 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             "delete_user" => match form.user_id {
                 Some(id) => delete_launcher_token(&st.db, id).await.map(|_| "Deleted user token.".to_string()).unwrap_or_else(|e| e.to_string()),
                 None => "missing token id".to_string(),
+            },
+            "enable_totp" => match form.user_id {
+                Some(id) => enable_user_totp(&st.db, id).await.unwrap_or_else(|e| e.to_string()),
+                None => "missing user id".to_string(),
+            },
+            "disable_totp" => match form.user_id {
+                Some(id) => disable_user_totp(&st.db, id).await.map(|_| "Disabled 2FA.".to_string()).unwrap_or_else(|e| e.to_string()),
+                None => "missing user id".to_string(),
             },
             "rescan" => match rescan_catalog(&st).await {
                 Ok(out) => format!("Catalog rescan complete.\n{out}"),
@@ -549,18 +565,20 @@ struct User {
     password_hash: String,
     is_admin: bool,
     enabled: bool,
+    totp_secret: Option<String>,
+    totp_enabled: bool,
 }
 
 fn user_from_row(row: Row) -> User {
-    let (id, username, email, password_hash, is_admin, enabled): (u64, String, String, String, bool, bool) = mysql_async::from_row(row);
-    User { id, username, email, password_hash, is_admin, enabled }
+    let (id, username, email, password_hash, is_admin, enabled, totp_secret, totp_enabled): (u64, String, String, String, bool, bool, Option<String>, bool) = mysql_async::from_row(row);
+    User { id, username, email, password_hash, is_admin, enabled, totp_secret, totp_enabled }
 }
 
 async fn find_user(db: &Pool, key: &str) -> Result<Option<User>> {
     let mut c = db.get_conn().await?;
     let row: Option<Row> = c
         .exec_first(
-            "SELECT id, username, email, password_hash, is_admin, enabled FROM admin_users WHERE enabled = TRUE AND (username = :k OR email = :k) LIMIT 1",
+            "SELECT id, username, email, password_hash, is_admin, enabled, totp_secret, totp_enabled FROM admin_users WHERE enabled = TRUE AND (username = :k OR email = :k) LIMIT 1",
             params! {"k" => key.trim()},
         )
         .await?;
@@ -569,7 +587,7 @@ async fn find_user(db: &Pool, key: &str) -> Result<Option<User>> {
 
 async fn list_users(db: &Pool) -> Result<Vec<User>> {
     let mut c = db.get_conn().await?;
-    let rows: Vec<Row> = c.query("SELECT id, username, email, password_hash, is_admin, enabled FROM admin_users ORDER BY username").await?;
+    let rows: Vec<Row> = c.query("SELECT id, username, email, password_hash, is_admin, enabled, totp_secret, totp_enabled FROM admin_users ORDER BY username").await?;
     Ok(rows.into_iter().map(user_from_row).collect())
 }
 
@@ -652,7 +670,7 @@ async fn current_admin(db: &Pool, headers: &HeaderMap) -> Result<Option<User>> {
     c.exec_drop("DELETE FROM admin_sessions WHERE expires_at <= :t", params! {"t" => ts}).await?;
     let row: Option<Row> = c
         .exec_first(
-            r#"SELECT a.id,a.username,a.email,a.password_hash,a.is_admin,a.enabled
+            r#"SELECT a.id,a.username,a.email,a.password_hash,a.is_admin,a.enabled,a.totp_secret,a.totp_enabled
                FROM admin_sessions s JOIN admin_users a ON a.id=s.admin_id
                WHERE s.token_hash=:h AND s.expires_at > :t AND a.enabled=TRUE AND a.is_admin=TRUE LIMIT 1"#,
             params! {"h" => hash, "t" => ts},
@@ -1016,6 +1034,112 @@ fn verify_password_any(password: &str, stored: &str) -> bool {
     } else {
         false
     }
+}
+
+fn verify_user_totp(user: &User, code: &str) -> bool {
+    if !user.totp_enabled {
+        return true;
+    }
+    let Some(secret) = user.totp_secret.as_deref() else { return false; };
+    let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 6 {
+        return false;
+    }
+    let now_step = now() / 30;
+    for step in [now_step - 1, now_step, now_step + 1] {
+        if matches!(totp_code(secret, step as u64), Ok(expected) if expected == digits) {
+            return true;
+        }
+    }
+    false
+}
+
+fn totp_code(secret_b32: &str, step: u64) -> Result<String> {
+    type HmacSha1 = Hmac<Sha1>;
+    let key = base32_decode(secret_b32)?;
+    let mut msg = [0u8; 8];
+    msg.copy_from_slice(&step.to_be_bytes());
+    let mut mac = HmacSha1::new_from_slice(&key).map_err(|_| anyhow!("invalid TOTP key"))?;
+    mac.update(&msg);
+    let digest = mac.finalize().into_bytes();
+    let offset = (digest[19] & 0x0f) as usize;
+    let bin = (((digest[offset] & 0x7f) as u32) << 24)
+        | ((digest[offset + 1] as u32) << 16)
+        | ((digest[offset + 2] as u32) << 8)
+        | (digest[offset + 3] as u32);
+    Ok(format!("{:06}", bin % 1_000_000))
+}
+
+fn base32_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for &b in data {
+        buffer = (buffer << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            let idx = ((buffer >> (bits - 5)) & 31) as usize;
+            out.push(ALPHABET[idx] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        let idx = ((buffer << (5 - bits)) & 31) as usize;
+        out.push(ALPHABET[idx] as char);
+    }
+    out
+}
+
+fn base32_decode(s: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for c in s.chars().filter(|c| !c.is_whitespace() && *c != '=') {
+        let v = match c.to_ascii_uppercase() {
+            'A'..='Z' => c.to_ascii_uppercase() as u8 - b'A',
+            '2'..='7' => c as u8 - b'2' + 26,
+            _ => return Err(anyhow!("invalid base32 secret")),
+        } as u32;
+        buffer = (buffer << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            out.push(((buffer >> (bits - 8)) & 0xff) as u8);
+            bits -= 8;
+        }
+    }
+    Ok(out)
+}
+
+async fn enable_user_totp(db: &Pool, user_id: u64) -> Result<String> {
+    let mut secret = [0u8; 20];
+    rand::thread_rng().fill_bytes(&mut secret);
+    let encoded = base32_encode(&secret);
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        "UPDATE admin_users SET totp_secret=:s, totp_enabled=TRUE WHERE id=:id",
+        params! {"s" => &encoded, "id" => user_id},
+    ).await?;
+    let user: Option<(String, String)> = c.exec_first(
+        "SELECT username,email FROM admin_users WHERE id=:id",
+        params! {"id" => user_id},
+    ).await?;
+    let account = user.map(|(u, e)| if e.is_empty() { u } else { e }).unwrap_or_else(|| user_id.to_string());
+    let uri = format!(
+        "otpauth://totp/ArcadeLauncher:{}?secret={}&issuer=ArcadeLauncher&algorithm=SHA1&digits=6&period=30",
+        urlencoding::encode(&account),
+        encoded
+    );
+    Ok(format!("Enabled 2FA. Add this authenticator URI:\n{uri}"))
+}
+
+async fn disable_user_totp(db: &Pool, user_id: u64) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        "UPDATE admin_users SET totp_secret=NULL, totp_enabled=FALSE WHERE id=:id",
+        params! {"id" => user_id},
+    ).await?;
+    Ok(())
 }
 
 fn verify_scrypt(password: &str, stored: &str) -> bool {
@@ -1491,7 +1615,15 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
     }
     let user_rows = users
         .iter()
-        .map(|u| format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", esc(&u.username), esc(&u.email), if u.is_admin { "Admin" } else { "Client" }, if u.enabled { "Enabled" } else { "Disabled" }))
+        .map(|u| {
+            let twofa = if u.totp_enabled { "Enabled" } else { "Disabled" };
+            let action = if u.totp_enabled { "disable_totp" } else { "enable_totp" };
+            let label = if u.totp_enabled { "Disable 2FA" } else { "Enable 2FA" };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method='post' class='inline'><input type='hidden' name='user_id' value='{}'><button name='action' value='{}'>{}</button></form></td></tr>",
+                esc(&u.username), esc(&u.email), if u.is_admin { "Admin" } else { "Client" }, if u.enabled { "Enabled" } else { "Disabled" }, twofa, u.id, action, label
+            )
+        })
         .collect::<String>();
     let token_rows = tokens
         .iter()
@@ -1526,7 +1658,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="validate_games">Validate Games</button></form><h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
-            <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
+            <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
             <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
@@ -1541,7 +1673,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         esc(&st.cfg.library_root.display().to_string()),
         validation_summary,
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
-        if user_rows.is_empty() { "<tr><td colspan='4'>No users yet.</td></tr>".into() } else { user_rows },
+        if user_rows.is_empty() { "<tr><td colspan='6'>No users yet.</td></tr>".into() } else { user_rows },
         if token_rows.is_empty() { "<tr><td colspan='4'>No issued tokens yet.</td></tr>".into() } else { token_rows },
         esc(&st.cfg.host),
         st.cfg.port,
@@ -1697,7 +1829,7 @@ fn status_row(name: &str, ok: bool, details: &str, restart: Option<&str>) -> Str
 
 fn login_html(message: &str) -> String {
     shell(&format!(
-        r#"<section><h2>Sign In</h2>{}<form method="post" action="/admin/login" class="stack"><input name="username" placeholder="Username or email" autofocus required><input name="password" type="password" placeholder="Password" required><button name="action" value="login">Sign In</button></form></section>"#,
+        r#"<section><h2>Sign In</h2>{}<form method="post" action="/admin/login" class="stack"><input name="username" placeholder="Username or email" autofocus required><input name="password" type="password" placeholder="Password" required><input name="totp_code" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA code, if enabled"><button name="action" value="login">Sign In</button></form></section>"#,
         notice(message)
     ))
 }

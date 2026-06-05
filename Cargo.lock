@@ -62,6 +62,7 @@ dependencies = [
  "cookie",
  "futures-util",
  "hex",
+ "hmac",
  "http",
  "mime_guess",
  "mysql_async",
