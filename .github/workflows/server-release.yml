@@ -15,14 +15,8 @@ jobs:
   package:
     name: Package Server
     runs-on: ubuntu-latest
-    container: debian:12
 
     steps:
-      - name: Install build tools
-        run: |
-          apt-get update
-          apt-get install -y ca-certificates curl build-essential pkg-config cmake git python3
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -30,14 +24,13 @@ jobs:
 
       - name: Configure git
         run: |
-          git -C "$GITHUB_WORKSPACE" config user.name  "github-actions[bot]"
-          git -C "$GITHUB_WORKSPACE" config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Bump server version
         id: ver
         shell: bash
         run: |
-          cd "$GITHUB_WORKSPACE"
           author="$(git log -1 --format='%an')"
           is_tag="${{ github.ref_type }}"
           ver="$(tr -d '[:space:]' < VERSION)"
@@ -76,7 +69,6 @@ jobs:
         if: github.ref_type != 'tag'
         shell: bash
         run: |
-          cd "$GITHUB_WORKSPACE"
           git tag -f "${{ steps.ver.outputs.TAG }}"
           git push -f origin "${{ steps.ver.outputs.TAG }}"
 
@@ -87,25 +79,20 @@ jobs:
 
       - name: Validate server Python
         run: |
-          cd "$GITHUB_WORKSPACE"
-          python3 -m py_compile arcade_server.py
-          python3 -m py_compile generate_catalog.py
+          python -m py_compile arcade_server.py
+          python -m py_compile generate_catalog.py
 
-      - name: Set up Rust
+      - name: Build Rust server in Debian 12
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build Rust server
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          . "$HOME/.cargo/env"
-          cargo build --release --locked
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            debian:12 \
+            bash -lc 'apt-get update && apt-get install -y ca-certificates curl build-essential pkg-config cmake && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && cargo build --release --locked'
 
       - name: Package server tarball
         shell: bash
         run: |
-          cd "$GITHUB_WORKSPACE"
           mkdir -p dist package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
           cp target/release/arcadelauncher-server package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp arcade_server.py generate_catalog.py catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
