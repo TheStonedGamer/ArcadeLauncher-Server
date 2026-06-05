@@ -162,6 +162,19 @@ struct ManifestFile {
     size: u64,
     sha256: String,
     url: String,
+    chunk_size: usize,
+    chunks: Vec<ManifestChunk>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestChunk {
+    index: usize,
+    offset: u64,
+    size: u64,
+    sha256: String,
+    compression: String,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +191,8 @@ struct AdminForm {
     password: Option<String>,
     is_admin: Option<String>,
     user_id: Option<u64>,
+    setting_key: Option<String>,
+    setting_value: Option<String>,
 }
 
 #[tokio::main]
@@ -203,6 +218,7 @@ async fn main() -> Result<()> {
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/files/:id/*rel", get(download_file))
+        .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -292,6 +308,14 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS server_settings (
+          setting_key VARCHAR(120) NOT NULL PRIMARY KEY,
+          setting_value TEXT NOT NULL,
+          updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -376,6 +400,29 @@ async fn download_file(
     }
 }
 
+async fn download_chunk(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, file_index, chunk_index, rel)): AxumPath<(String, usize, usize, String)>,
+) -> Response {
+    if !authorized_api(&st, &headers).await {
+        return unauthorized();
+    }
+    let game = match find_game(&st.db, &id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return (StatusCode::NOT_FOUND, "game not found").into_response(),
+        Err(e) => return server_error(e),
+    };
+    let file_path = match file_path_for(&st.cfg, &game, &rel).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match stream_chunk(file_path, file_index, chunk_index).await {
+        Ok(r) => r,
+        Err(e) => server_error(e),
+    }
+}
+
 async fn admin_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
     match current_admin(&st.db, &headers).await {
         Ok(Some(admin)) => Html(admin_html(&st, Some(admin), "").await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
@@ -443,6 +490,14 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             "rescan" => match rescan_catalog(&st.cfg).await {
                 Ok(out) => format!("Catalog rescan complete.\n{out}"),
                 Err(e) => e.to_string(),
+            },
+            "save_setting" => {
+                let key = form.setting_key.unwrap_or_default();
+                let value = form.setting_value.unwrap_or_default();
+                match save_server_setting(&st.db, &key, &value).await {
+                    Ok(_) => format!("Saved setting {key}. Some runtime/env settings may require a service restart."),
+                    Err(e) => e.to_string(),
+                }
             },
             _ => "No action taken.".to_string(),
         };
@@ -583,6 +638,31 @@ async fn list_launcher_tokens(db: &Pool) -> Result<Vec<(u64, String, String, boo
     Ok(rows.into_iter().map(mysql_async::from_row).collect())
 }
 
+async fn list_server_settings(db: &Pool) -> Result<Vec<(String, String)>> {
+    let mut c = db.get_conn().await?;
+    let rows: Vec<Row> = c.query("SELECT setting_key,setting_value FROM server_settings ORDER BY setting_key").await?;
+    Ok(rows.into_iter().map(mysql_async::from_row).collect())
+}
+
+async fn save_server_setting(db: &Pool, key: &str, value: &str) -> Result<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("setting key is required"));
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        return Err(anyhow!("setting key may only contain letters, numbers, dash, underscore, or dot"));
+    }
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        r#"INSERT INTO server_settings (setting_key,setting_value,updated_at)
+           VALUES (:k,:v,:t)
+           ON DUPLICATE KEY UPDATE setting_value=:v, updated_at=:t"#,
+        params! {"k" => key, "v" => value, "t" => now()},
+    )
+    .await?;
+    Ok(())
+}
+
 async fn list_games(db: &Pool) -> Result<Vec<Game>> {
     let mut c = db.get_conn().await?;
     let rows: Vec<Row> = c
@@ -650,14 +730,17 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
     };
     let base = base_url(headers, &st.cfg);
     let mut manifest_files = Vec::new();
-    for path in files {
+    for (file_index, path) in files.into_iter().enumerate() {
         let rel = path.strip_prefix(&rel_root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
         let meta = fs::metadata(&path).await?;
+        let chunks = chunks_for_file(&path, &base, &game.id, file_index, &rel, meta.len()).await?;
         manifest_files.push(ManifestFile {
             path: rel.clone(),
             size: meta.len(),
             sha256: sha256_file(&path).await?,
             url: format!("{}/files/{}/{}", base, urlencoding::encode(&game.id), encode_path(&rel)),
+            chunk_size: CHUNK_SIZE,
+            chunks,
         });
     }
     Ok(Manifest {
@@ -717,6 +800,66 @@ async fn stream_file(path: PathBuf, range: Option<&HeaderValue>) -> Result<Respo
         resp = resp.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
     Ok(resp.body(Body::from_stream(stream))?)
+}
+
+async fn stream_chunk(path: PathBuf, _file_index: usize, chunk_index: usize) -> Result<Response> {
+    let meta = fs::metadata(&path).await?;
+    if !meta.is_file() {
+        return Err(anyhow!("file not found"));
+    }
+    let size = meta.len();
+    let start = (chunk_index as u64).saturating_mul(CHUNK_SIZE as u64);
+    if start >= size {
+        return Err(anyhow!("chunk out of range"));
+    }
+    let len = ((CHUNK_SIZE as u64).min(size - start)) as u64;
+    let mut file = File::open(&path).await?;
+    file.seek(SeekFrom::Start(start)).await?;
+    let stream = ReaderStream::new(file.take(len)).map_ok(Bytes::from);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .body(Body::from_stream(stream))?)
+}
+
+async fn chunks_for_file(
+    path: &Path,
+    base: &str,
+    game_id: &str,
+    file_index: usize,
+    rel: &str,
+    size: u64,
+) -> Result<Vec<ManifestChunk>> {
+    let mut out = Vec::new();
+    let mut file = File::open(path).await?;
+    let mut offset = 0u64;
+    let mut index = 0usize;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while offset < size {
+        let want = ((size - offset).min(CHUNK_SIZE as u64)) as usize;
+        file.read_exact(&mut buf[..want]).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(&buf[..want]);
+        out.push(ManifestChunk {
+            index,
+            offset,
+            size: want as u64,
+            sha256: hex::encode(hasher.finalize()),
+            compression: "none".into(),
+            url: format!(
+                "{}/chunks/{}/{}/{}/{}",
+                base,
+                urlencoding::encode(game_id),
+                file_index,
+                index,
+                encode_path(rel)
+            ),
+        });
+        offset += want as u64;
+        index += 1;
+    }
+    Ok(out)
 }
 
 fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>> {
@@ -922,6 +1065,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
     let users = list_users(&st.db).await.unwrap_or_default();
     let tokens = list_launcher_tokens(&st.db).await.unwrap_or_default();
     let games = list_games(&st.db).await.unwrap_or_default();
+    let settings = list_server_settings(&st.db).await.unwrap_or_default();
     let service_rows = service_status_rows(st, games.len(), users.len(), tokens.len()).await;
     let mut by_platform = BTreeMap::<String, usize>::new();
     for g in &games {
@@ -944,6 +1088,15 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         .iter()
         .map(|(p, c)| format!("<div class='platform-row'><span>{}</span><strong>{}</strong></div>", esc(p), c))
         .collect::<String>();
+    let settings_rows = settings
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "<tr><td><code>{}</code></td><td><form method='post' class='inline'><input type='hidden' name='setting_key' value='{}'><input name='setting_value' value='{}'><button name='action' value='save_setting'>Save</button></form></td></tr>",
+                esc(k), esc(k), esc(v)
+            )
+        })
+        .collect::<String>();
     let signed = admin.map(|a| a.username).unwrap_or_default();
     Ok(shell(&format!(
         r##"
@@ -956,6 +1109,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button></form></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
+            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
         "##,
@@ -970,6 +1124,14 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
         if user_rows.is_empty() { "<tr><td colspan='4'>No users yet.</td></tr>".into() } else { user_rows },
         if token_rows.is_empty() { "<tr><td colspan='4'>No issued tokens yet.</td></tr>".into() } else { token_rows },
+        esc(&st.cfg.host),
+        st.cfg.port,
+        esc(&st.cfg.library_root.display().to_string()),
+        esc(&st.cfg.db_host),
+        st.cfg.db_port,
+        esc(&st.cfg.db_name),
+        CHUNK_SIZE,
+        if settings_rows.is_empty() { "<tr><td colspan='2'>No managed settings saved yet.</td></tr>".into() } else { settings_rows },
     )))
 }
 
@@ -1100,5 +1262,5 @@ fn esc(s: &str) -> String {
 
 static CSS: &str = r#"
 :root{color-scheme:dark;--bg:#0f1115;--panel:#171b21;--panel2:#1d232b;--line:#2c3540;--text:#e8edf2;--muted:#9aa7b5;--accent:#4cc2ff;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split,.two-col{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.two-col{grid-template-columns:repeat(2,minmax(0,1fr))}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.new-setting{margin-top:12px}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split,.two-col{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
 "#;
