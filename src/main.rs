@@ -15,9 +15,10 @@ use mysql_async::{params, prelude::Queryable, Pool, Row};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use rust_scrypt::{scrypt, Params as ScryptParams};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
@@ -511,7 +512,7 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 Some(id) => delete_launcher_token(&st.db, id).await.map(|_| "Deleted user token.".to_string()).unwrap_or_else(|e| e.to_string()),
                 None => "missing token id".to_string(),
             },
-            "rescan" => match rescan_catalog(&st.cfg).await {
+            "rescan" => match rescan_catalog(&st).await {
                 Ok(out) => format!("Catalog rescan complete.\n{out}"),
                 Err(e) => e.to_string(),
             },
@@ -936,6 +937,24 @@ async fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+async fn walk_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = fs::read_dir(dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            let meta = entry.metadata().await?;
+            if meta.is_dir() {
+                out.push(path.clone());
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 async fn sha256_file(path: &Path) -> Result<String> {
     let mut f = File::open(path).await?;
     let mut h = Sha256::new();
@@ -1079,21 +1098,276 @@ fn server_error(e: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
 }
 
-async fn rescan_catalog(cfg: &Config) -> Result<String> {
-    let out = Command::new("python3")
-        .arg("/opt/arcadelauncher-server/generate_catalog.py")
-        .arg("--library-root")
-        .arg(&cfg.library_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() {
-        return Err(anyhow!(text));
+async fn rescan_catalog(st: &AppState) -> Result<String> {
+    let games = scan_catalog(&st.cfg.library_root).await?;
+    write_catalog_json(&st.cfg.library_root, &games).await?;
+    sync_catalog_db(&st.db, &games).await?;
+
+    let mut by_platform = BTreeMap::<String, usize>::new();
+    for game in &games {
+        *by_platform.entry(game.platform.clone()).or_default() += 1;
     }
-    Ok(text)
+    let mut msg = format!(
+        "Wrote {} games to {}\nMariaDB sync: yes",
+        games.len(),
+        st.cfg.library_root.join("catalog.json").display()
+    );
+    for (platform, count) in by_platform {
+        msg.push_str(&format!("\n{platform}: {count}"));
+    }
+    Ok(msg)
+}
+
+async fn scan_catalog(library_root: &Path) -> Result<Vec<Game>> {
+    let mut games = Vec::new();
+    games.extend(scan_single_file_platforms(library_root).await?);
+    games.extend(scan_xbox360_god(library_root).await?);
+    games.extend(scan_pc_archives(library_root).await?);
+    games.sort_by(|a, b| {
+        (a.platform.as_str(), a.title.to_lowercase(), a.id.as_str())
+            .cmp(&(b.platform.as_str(), b.title.to_lowercase(), b.id.as_str()))
+    });
+    Ok(games)
+}
+
+async fn scan_single_file_platforms(library_root: &Path) -> Result<Vec<Game>> {
+    let specs: &[(&str, &str, &[&str])] = &[
+        ("Nintendo/NES", "NES", &["nes", "fds", "unf", "unif"]),
+        ("Nintendo/SNES", "SNES", &["sfc", "smc", "fig", "bs", "st"]),
+        ("Nintendo/N64", "N64", &["z64", "n64", "v64", "rom"]),
+        ("Nintendo/Switch", "Ryujinx", &["nsp", "xci", "nca", "nro"]),
+        ("Nintendo/Gamecube", "Dolphin", &["iso", "gcm", "rvz", "gcz"]),
+        ("Nintendo/Wii", "Dolphin", &["iso", "rvz", "gcz", "wbfs", "dol", "elf"]),
+    ];
+    let skip: HashSet<&str> = ["sqlite", "db", "txt", "nfo", "jpg", "jpeg", "png", "webp"].into_iter().collect();
+    let mut out = Vec::new();
+    let games_root = library_root.join("games");
+    for (relative_dir, platform, extensions) in specs {
+        let platform_root = games_root.join(relative_dir);
+        if fs::metadata(&platform_root).await.is_err() {
+            continue;
+        }
+        let allowed: HashSet<&str> = extensions.iter().copied().collect();
+        for path in walk_files(&platform_root).await? {
+            let suffix = file_ext(&path);
+            if suffix.is_empty() || skip.contains(suffix.as_str()) || !allowed.contains(suffix.as_str()) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+            out.push(game_entry(
+                library_root,
+                &path,
+                platform,
+                &clean_title(name),
+                Path::new(name),
+                "emulator_rom",
+                "{rom}",
+            ).await?);
+        }
+    }
+    Ok(out)
+}
+
+async fn scan_xbox360_god(library_root: &Path) -> Result<Vec<Game>> {
+    let xbox_root = library_root.join("games").join("Microsoft").join("Xbox 360");
+    if fs::metadata(&xbox_root).await.is_err() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut seen_roots = HashSet::<PathBuf>::new();
+    let god_dirs = ["00007000", "0007000"];
+    for dir in walk_dirs(&xbox_root).await? {
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()) else { continue; };
+        if !god_dirs.contains(&name) {
+            continue;
+        }
+        let Some(package) = find_god_package(&dir).await? else { continue; };
+        let relative_god_dir = dir.strip_prefix(&xbox_root).unwrap_or(&dir);
+        let Some(first) = relative_god_dir.components().next() else { continue; };
+        let game_root = xbox_root.join(first.as_os_str());
+        if !seen_roots.insert(game_root.clone()) {
+            continue;
+        }
+        let target = package.strip_prefix(&game_root).unwrap_or(&package).to_path_buf();
+        let title = game_root.file_name().and_then(|s| s.to_str()).map(clean_title).unwrap_or_else(|| "Xbox 360 Game".into());
+        out.push(game_entry(library_root, &game_root, "Xbox360", &title, &target, "emulator_rom", "{rom}").await?);
+    }
+    Ok(out)
+}
+
+async fn scan_pc_archives(library_root: &Path) -> Result<Vec<Game>> {
+    let archive_root = library_root.join("games").join("PC").join("Steam");
+    if fs::metadata(&archive_root).await.is_err() {
+        return Ok(Vec::new());
+    }
+    let allowed: HashSet<&str> = ["zip", "7z", "rar"].into_iter().collect();
+    let mut out = Vec::new();
+    for path in walk_files(&archive_root).await? {
+        if !allowed.contains(file_ext(&path).as_str()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        out.push(game_entry(library_root, &path, "Repacks", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
+    }
+    Ok(out)
+}
+
+async fn find_god_package(god_dir: &Path) -> Result<Option<PathBuf>> {
+    let mut rd = fs::read_dir(god_dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        let meta = entry.metadata().await?;
+        if !meta.is_file() || path.extension().is_some() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        if fs::metadata(god_dir.join(format!("{name}.data"))).await.map(|m| m.is_dir()).unwrap_or(false) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+async fn game_entry(
+    library_root: &Path,
+    content_path: &Path,
+    platform: &str,
+    title: &str,
+    target: &Path,
+    install_type: &str,
+    arguments: &str,
+) -> Result<Game> {
+    let relative_content = content_path.strip_prefix(library_root).unwrap_or(content_path);
+    Ok(Game {
+        id: stable_id(platform, relative_content),
+        title: title.to_string(),
+        platform: platform.to_string(),
+        install_type: install_type.to_string(),
+        version: version_for(content_path).await?,
+        content_path: relative_content.to_string_lossy().replace('\\', "/"),
+        cover_art_url: String::new(),
+        igdb_id: 0,
+        launch: Launch {
+            target: target.to_string_lossy().replace('\\', "/"),
+            arguments: arguments.to_string(),
+        },
+    })
+}
+
+async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    let ts = now();
+    for game in games {
+        c.exec_drop(
+            r#"INSERT INTO games
+              (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,updated_at)
+              VALUES (:id,:title,:platform,:install_type,:version,:content_path,:launch_target,:launch_arguments,:cover_art_url,:igdb_id,:updated_at)
+              ON DUPLICATE KEY UPDATE
+                title=VALUES(title),
+                platform=VALUES(platform),
+                install_type=VALUES(install_type),
+                version=VALUES(version),
+                content_path=VALUES(content_path),
+                launch_target=VALUES(launch_target),
+                launch_arguments=VALUES(launch_arguments),
+                cover_art_url=VALUES(cover_art_url),
+                igdb_id=VALUES(igdb_id),
+                updated_at=VALUES(updated_at)"#,
+            params! {
+                "id" => &game.id,
+                "title" => &game.title,
+                "platform" => &game.platform,
+                "install_type" => &game.install_type,
+                "version" => &game.version,
+                "content_path" => &game.content_path,
+                "launch_target" => &game.launch.target,
+                "launch_arguments" => &game.launch.arguments,
+                "cover_art_url" => &game.cover_art_url,
+                "igdb_id" => game.igdb_id,
+                "updated_at" => ts,
+            },
+        )
+        .await?;
+    }
+    let ids: HashSet<&str> = games.iter().map(|g| g.id.as_str()).collect();
+    let existing: Vec<String> = c.query("SELECT id FROM games").await?;
+    for id in existing {
+        if !ids.contains(id.as_str()) {
+            c.exec_drop("DELETE FROM games WHERE id=:id", params! {"id" => id}).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_catalog_json(library_root: &Path, games: &[Game]) -> Result<()> {
+    let catalog = Catalog {
+        schema_version: 1,
+        generated_by: "rust-native".into(),
+        games: games.to_vec(),
+    };
+    let path = library_root.join("catalog.json");
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&catalog)?).await?;
+    fs::rename(tmp, path).await?;
+    Ok(())
+}
+
+async fn version_for(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path).await?;
+    if meta.is_file() {
+        let modified = modified_secs(&meta);
+        return Ok(sha1_short(&format!("{}:{}:{}", path.file_name().and_then(|s| s.to_str()).unwrap_or(""), meta.len(), modified)));
+    }
+    let mut h = Sha1::new();
+    for file_path in walk_files(path).await? {
+        let meta = fs::metadata(&file_path).await?;
+        let rel = file_path.strip_prefix(path).unwrap_or(&file_path).to_string_lossy().replace('\\', "/");
+        h.update(format!("{}:{}:{}\n", rel, meta.len(), modified_secs(&meta)).as_bytes());
+    }
+    Ok(hex::encode(h.finalize())[..12].to_string())
+}
+
+fn stable_id(platform: &str, relative: &Path) -> String {
+    format!("{}-{}", platform.to_lowercase(), sha1_short(&relative.to_string_lossy().replace('\\', "/")))
+}
+
+fn sha1_short(text: &str) -> String {
+    let mut h = Sha1::new();
+    h.update(text.as_bytes());
+    hex::encode(h.finalize())[..12].to_string()
+}
+
+fn modified_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn file_ext(path: &Path) -> String {
+    path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
+fn clean_title(name: &str) -> String {
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let mut out = String::new();
+    let mut skip_square = 0u32;
+    let mut skip_paren = 0u32;
+    for ch in stem.chars() {
+        match ch {
+            '[' => skip_square += 1,
+            ']' if skip_square > 0 => skip_square -= 1,
+            '(' => skip_paren += 1,
+            ')' if skip_paren > 0 => skip_paren -= 1,
+            '_' if skip_square == 0 && skip_paren == 0 => out.push(' '),
+            _ if skip_square == 0 && skip_paren == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_matches(|c: char| c == ' ' || c == '.' || c == '-' || c == '_').to_string();
+    if trimmed.is_empty() { stem.to_string() } else { trimmed }
 }
 
 struct GameValidationReport {
@@ -1341,11 +1615,10 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         None,
     ));
 
-    let generator = Path::new("/opt/arcadelauncher-server/generate_catalog.py");
     rows.push(status_row(
         "Catalog Generator",
-        fs::metadata(generator).await.map(|m| m.is_file()).unwrap_or(false),
-        &generator.display().to_string(),
+        true,
+        "Native Rust scanner/upserter",
         None,
     ));
 

@@ -9,8 +9,7 @@ The primary backend is a Rust/Linux service:
 - Username/password login for both admin and launcher clients.
 - Per-game install manifests with SHA-256 hashes.
 - HTTP byte-range file serving for resumable launcher downloads.
-- Python `generate_catalog.py` remains as the filesystem catalog sync helper.
-- `arcade_server.py` remains in the package as a fallback/reference implementation.
+- Native Rust filesystem catalog scanner and MariaDB sync.
 
 ## Run
 
@@ -67,13 +66,9 @@ Example `catalog.json`:
 
 Keep `contentPath` relative to the library root. Do not put absolute NAS/server paths in the catalog.
 
-`contentPath` may point to either a game directory, such as an Xbox 360 GOD folder, or a single ROM file. For mounted ROM libraries, generate the catalog with:
+`contentPath` may point to either a game directory, such as an Xbox 360 GOD folder, or a single ROM file. For mounted ROM libraries, use the admin panel's `Rescan Filesystem and Sync DB` action.
 
-```bash
-python3 /opt/arcadelauncher-server/generate_catalog.py --library-root /srv/arcade-library
-```
-
-The generator catalogs known emulator ROM formats and Xbox 360 GOD directories. PC installer archives are intentionally skipped until the launcher has explicit install/extract behavior for them.
+The native scanner catalogs known emulator ROM formats, Xbox 360 GOD directories, and PC archive installs.
 
 ## Proxmox CT Deployment
 
