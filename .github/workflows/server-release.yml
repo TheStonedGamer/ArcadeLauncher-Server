@@ -30,13 +30,14 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "$GITHUB_WORKSPACE" config user.name  "github-actions[bot]"
+          git -C "$GITHUB_WORKSPACE" config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Bump server version
         id: ver
         shell: bash
         run: |
+          cd "$GITHUB_WORKSPACE"
           author="$(git log -1 --format='%an')"
           is_tag="${{ github.ref_type }}"
           ver="$(tr -d '[:space:]' < VERSION)"
@@ -75,6 +76,7 @@ jobs:
         if: github.ref_type != 'tag'
         shell: bash
         run: |
+          cd "$GITHUB_WORKSPACE"
           git tag -f "${{ steps.ver.outputs.TAG }}"
           git push -f origin "${{ steps.ver.outputs.TAG }}"
 
@@ -85,6 +87,7 @@ jobs:
 
       - name: Validate server Python
         run: |
+          cd "$GITHUB_WORKSPACE"
           python3 -m py_compile arcade_server.py
           python3 -m py_compile generate_catalog.py
 
@@ -95,12 +98,14 @@ jobs:
 
       - name: Build Rust server
         run: |
+          cd "$GITHUB_WORKSPACE"
           . "$HOME/.cargo/env"
           cargo build --release --locked
 
       - name: Package server tarball
         shell: bash
         run: |
+          cd "$GITHUB_WORKSPACE"
           mkdir -p dist package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
           cp target/release/arcadelauncher-server package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp arcade_server.py generate_catalog.py catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
