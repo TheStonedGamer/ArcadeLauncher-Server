@@ -1618,14 +1618,14 @@ async fn igdb_credentials(db: &Pool) -> Result<(String, String)> {
 
 async fn igdb_search_for_game(st: &AppState, game: &Game, query: &str) -> Result<Vec<IgdbMatch>> {
     let query = sanitize_search_query(query)?;
+    let platforms = igdb_platform_ids(&game.platform);
+    if platforms.is_empty() {
+        return Err(anyhow!("no IGDB platform mapping is configured for {}", game.platform));
+    }
     let (client_id, client_secret) = igdb_credentials(&st.db).await?;
     let http = Client::builder().user_agent("ArcadeLauncher-Server/1.0").build()?;
     let token = igdb_authenticate(&http, &client_id, &client_secret).await?;
-    let mut results = igdb_search(&http, &client_id, &token, &query, igdb_platform_ids(&game.platform)).await?;
-    if results.is_empty() && !igdb_platform_ids(&game.platform).is_empty() {
-        results = igdb_search(&http, &client_id, &token, &query, &[]).await?;
-    }
-    Ok(results)
+    igdb_search(&http, &client_id, &token, &query, platforms).await
 }
 
 async fn igdb_fetch_by_id(http: &Client, client_id: &str, token: &str, igdb_id: u64) -> Result<IgdbMatch> {
@@ -2243,7 +2243,7 @@ async fn metadata_matcher_html(st: &AppState, games: &[Game], selected_id: &str,
         if !query.trim().is_empty() {
             match igdb_search_for_game(st, game, query.trim()).await {
                 Ok(results) if results.is_empty() => {
-                    result_rows = "<tr><td colspan='6'>No IGDB matches found.</td></tr>".into();
+                    result_rows = format!("<tr><td colspan='6'>No IGDB matches found for {}.</td></tr>", esc(&game.platform));
                 }
                 Ok(results) => {
                     result_rows = results
@@ -2276,7 +2276,8 @@ async fn metadata_matcher_html(st: &AppState, games: &[Game], selected_id: &str,
         result_rows = "<tr><td colspan='6'>Search IGDB to choose a metadata match.</td></tr>".into();
     }
     format!(
-        r#"<h3>Metadata Matcher</h3><form method="post" class="row matcher-form"><select name="game_id">{}</select><input name="search_query" value="{}" placeholder="Search title"><button name="action" value="igdb_search">Search IGDB</button></form><table class="matcher-results"><thead><tr><th>IGDB Title</th><th>Year</th><th>Rating</th><th>Genres</th><th>Summary</th><th>Action</th></tr></thead><tbody>{}</tbody></table>"#,
+        r#"<h3>Metadata Matcher <span class="muted">({})</span></h3><form method="post" class="row matcher-form"><select name="game_id">{}</select><input name="search_query" value="{}" placeholder="Search title"><button name="action" value="igdb_search">Search IGDB</button></form><table class="matcher-results"><thead><tr><th>IGDB Title</th><th>Year</th><th>Rating</th><th>Genres</th><th>Summary</th><th>Action</th></tr></thead><tbody>{}</tbody></table>"#,
+        esc(selected.map(|g| g.platform.as_str()).unwrap_or("No platform")),
         options,
         esc(default_query),
         result_rows
