@@ -1,18 +1,21 @@
 # ArcadeLauncher Server
 
-Prototype backend for a private ArcadeLauncher game library.
+Backend service for a private ArcadeLauncher game library.
 
-This server is intentionally small and dependency-free for the first pass:
+The primary backend is a Rust/Linux service:
 
-- Serves a catalog from `catalog.json`.
-- Builds per-game install manifests from files on disk.
-- Serves game files with HTTP byte ranges so the launcher can resume downloads.
-- Keeps launch metadata separate from storage paths.
+- `axum`/`tokio` HTTP API and admin UI.
+- MariaDB-backed users, bearer tokens, sessions, and game catalog.
+- Username/password login for both admin and launcher clients.
+- Per-game install manifests with SHA-256 hashes.
+- HTTP byte-range file serving for resumable launcher downloads.
+- Python `generate_catalog.py` remains as the filesystem catalog sync helper.
+- `arcade_server.py` remains in the package as a fallback/reference implementation.
 
 ## Run
 
-```powershell
-python arcade_server.py --host 127.0.0.1 --port 8721 --library-root D:\ArcadeLibrary
+```bash
+cargo run --release -- --host 127.0.0.1 --port 8721 --library-root /srv/arcade-library
 ```
 
 Open:

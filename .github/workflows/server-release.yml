@@ -15,8 +15,14 @@ jobs:
   package:
     name: Package Server
     runs-on: ubuntu-latest
+    container: debian:12
 
     steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl build-essential pkg-config cmake git python3
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -79,15 +85,28 @@ jobs:
 
       - name: Validate server Python
         run: |
-          python -m py_compile arcade_server.py
-          python -m py_compile generate_catalog.py
+          python3 -m py_compile arcade_server.py
+          python3 -m py_compile generate_catalog.py
+
+      - name: Set up Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build Rust server
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
 
       - name: Package server tarball
         shell: bash
         run: |
           mkdir -p dist package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
-          cp arcade_server.py generate_catalog.py catalog.example.json README.md .gitignore VERSION package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          cp target/release/arcadelauncher-server package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          cp arcade_server.py generate_catalog.py catalog.example.json README.md .gitignore VERSION Cargo.toml Cargo.lock package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          cp -R src package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
           cp -R deploy package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/
+          chmod +x package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/arcadelauncher-server
           chmod +x package/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}/deploy/install-linux.sh
           tar -C package -czf dist/ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}.tar.gz ArcadeLauncher-Server-${{ steps.ver.outputs.VERSION }}
 

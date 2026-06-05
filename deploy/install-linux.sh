@@ -10,11 +10,19 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 apt-get update
-apt-get install -y mariadb-server python3 python3-pymysql
+apt-get install -y mariadb-server python3 python3-pymysql ca-certificates
 
 id -u arcade >/dev/null 2>&1 || useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin arcade
 
 install -d -o root -g root -m 0755 /opt/arcadelauncher-server
+if [[ -f "${SERVER_DIR}/arcadelauncher-server" ]]; then
+  install -m 0755 "${SERVER_DIR}/arcadelauncher-server" /opt/arcadelauncher-server/arcadelauncher-server
+elif [[ -f "${SERVER_DIR}/target/release/arcadelauncher-server" ]]; then
+  install -m 0755 "${SERVER_DIR}/target/release/arcadelauncher-server" /opt/arcadelauncher-server/arcadelauncher-server
+else
+  echo "Missing Rust server binary: arcadelauncher-server" >&2
+  exit 1
+fi
 install -m 0644 "${SERVER_DIR}/arcade_server.py" /opt/arcadelauncher-server/arcade_server.py
 install -m 0755 "${SERVER_DIR}/generate_catalog.py" /opt/arcadelauncher-server/generate_catalog.py
 
