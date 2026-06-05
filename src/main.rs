@@ -140,6 +140,10 @@ struct Game {
     content_path: String,
     cover_art_url: String,
     igdb_id: u64,
+    summary: String,
+    genres: String,
+    igdb_rating: f64,
+    release_date: i64,
     launch: Launch,
 }
 
@@ -233,6 +237,7 @@ async fn main() -> Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
+        .route("/art/:id", get(download_art))
         .route("/files/:id/*rel", get(download_file))
         .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
         .layer(TraceLayer::new_for_http())
@@ -334,11 +339,19 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
           launch_arguments TEXT NOT NULL,
           cover_art_url TEXT NULL,
           igdb_id BIGINT NOT NULL DEFAULT 0,
+          summary TEXT NULL,
+          genres TEXT NULL,
+          igdb_rating DOUBLE NOT NULL DEFAULT 0,
+          release_date BIGINT NOT NULL DEFAULT 0,
           updated_at BIGINT NOT NULL,
           INDEX idx_games_platform_title (platform, title)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN summary TEXT NULL").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN genres TEXT NULL").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN igdb_rating DOUBLE NOT NULL DEFAULT 0").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN release_date BIGINT NOT NULL DEFAULT 0").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS server_settings (
           setting_key VARCHAR(120) NOT NULL PRIMARY KEY,
@@ -389,7 +402,13 @@ async fn api_catalog(State(st): State<AppState>, headers: HeaderMap) -> Response
         return unauthorized();
     }
     match list_games(&st.db).await {
-        Ok(games) => Json(Catalog { schema_version: 1, generated_by: "mariadb-rust".into(), games }).into_response(),
+        Ok(mut games) => {
+            let base = base_url(&headers, &st.cfg);
+            for game in &mut games {
+                hydrate_server_art_url(&st, &base, game).await;
+            }
+            Json(Catalog { schema_version: 1, generated_by: "mariadb-rust".into(), games }).into_response()
+        },
         Err(e) => server_error(e),
     }
 }
@@ -721,7 +740,7 @@ async fn list_games(db: &Pool) -> Result<Vec<Game>> {
     let mut c = db.get_conn().await?;
     let rows: Vec<Row> = c
         .query(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id FROM games ORDER BY platform,title,id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date FROM games ORDER BY platform,title,id",
         )
         .await?;
     Ok(rows.into_iter().map(game_from_row).collect())
@@ -731,7 +750,7 @@ async fn find_game(db: &Pool, id: &str) -> Result<Option<Game>> {
     let mut c = db.get_conn().await?;
     let row: Option<Row> = c
         .exec_first(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id FROM games WHERE id=:id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date FROM games WHERE id=:id",
             params! {"id" => id},
         )
         .await?;
@@ -739,18 +758,20 @@ async fn find_game(db: &Pool, id: &str) -> Result<Option<Game>> {
 }
 
 fn game_from_row(row: Row) -> Game {
-    let (id, title, platform, install_type, version, content_path, launch_target, launch_arguments, cover_art_url, igdb_id): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        u64,
-    ) = mysql_async::from_row(row);
+    let id = row.get::<String, _>(0).unwrap_or_default();
+    let title = row.get::<String, _>(1).unwrap_or_default();
+    let platform = row.get::<String, _>(2).unwrap_or_default();
+    let install_type = row.get::<String, _>(3).unwrap_or_default();
+    let version = row.get::<String, _>(4).unwrap_or_default();
+    let content_path = row.get::<String, _>(5).unwrap_or_default();
+    let launch_target = row.get::<String, _>(6).unwrap_or_default();
+    let launch_arguments = row.get::<String, _>(7).unwrap_or_default();
+    let cover_art_url = row.get::<String, _>(8).unwrap_or_default();
+    let igdb_id = row.get::<u64, _>(9).unwrap_or_default();
+    let summary = row.get::<String, _>(10).unwrap_or_default();
+    let genres = row.get::<String, _>(11).unwrap_or_default();
+    let igdb_rating = row.get::<f64, _>(12).unwrap_or_default();
+    let release_date = row.get::<i64, _>(13).unwrap_or_default();
     Game {
         id,
         title,
@@ -760,7 +781,33 @@ fn game_from_row(row: Row) -> Game {
         content_path,
         cover_art_url,
         igdb_id,
+        summary,
+        genres,
+        igdb_rating,
+        release_date,
         launch: Launch { target: launch_target, arguments: if launch_arguments.is_empty() { "{rom}".into() } else { launch_arguments } },
+    }
+}
+
+async fn download_art(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let game = match find_game(&st.db, &id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return (StatusCode::NOT_FOUND, "game not found").into_response(),
+        Err(e) => return server_error(e),
+    };
+    let root = match content_path_for(&st.cfg, &game).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let Some(path) = find_local_cover(&root).await else {
+        return (StatusCode::NOT_FOUND, "art not found").into_response();
+    };
+    match stream_file(path, None).await {
+        Ok(r) => r,
+        Err(e) => server_error(e),
     }
 }
 
@@ -776,13 +823,15 @@ async fn authorized_api(st: &AppState, headers: &HeaderMap) -> bool {
 }
 
 async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result<Manifest> {
-    let root = content_path_for(&st.cfg, game).await?;
+    let mut game = game.clone();
+    let base = base_url(headers, &st.cfg);
+    hydrate_server_art_url(st, &base, &mut game).await;
+    let root = content_path_for(&st.cfg, &game).await?;
     let (files, rel_root) = if fs::metadata(&root).await?.is_file() {
         (vec![root.clone()], root.parent().unwrap_or(&st.cfg.library_root).to_path_buf())
     } else {
         (walk_files(&root).await?, root.clone())
     };
-    let base = base_url(headers, &st.cfg);
     let mut manifest_files = Vec::new();
     for (file_index, path) in files.into_iter().enumerate() {
         let rel = path.strip_prefix(&rel_root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
@@ -1033,6 +1082,72 @@ fn verify_password_any(password: &str, stored: &str) -> bool {
             .is_some()
     } else {
         false
+    }
+}
+
+async fn hydrate_server_art_url(st: &AppState, base: &str, game: &mut Game) {
+    if game.cover_art_url.starts_with("http://") || game.cover_art_url.starts_with("https://") {
+        return;
+    }
+    if game.cover_art_url == "local" || game.cover_art_url.is_empty() {
+        if let Ok(root) = content_path_for(&st.cfg, game).await {
+            if find_local_cover(&root).await.is_some() {
+                game.cover_art_url = format!("{}/art/{}", base, urlencoding::encode(&game.id));
+            }
+        }
+    }
+}
+
+async fn find_local_cover(root: &Path) -> Option<PathBuf> {
+    let dir = if fs::metadata(root).await.ok()?.is_file() {
+        root.parent()?.to_path_buf()
+    } else {
+        root.to_path_buf()
+    };
+    for name in ["cover.jpg", "cover.png", "folder.jpg", "poster.jpg", "boxart.jpg", "boxart.png"] {
+        let p = dir.join(name);
+        if fs::metadata(&p).await.map(|m| m.is_file()).unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+async fn apply_sidecar_metadata(root: &Path, game: &mut Game) {
+    let dir = match fs::metadata(root).await {
+        Ok(m) if m.is_file() => root.parent().map(Path::to_path_buf),
+        Ok(_) => Some(root.to_path_buf()),
+        Err(_) => None,
+    };
+    let Some(dir) = dir else { return; };
+    for name in ["arcadelauncher.metadata.json", "metadata.json"] {
+        let path = dir.join(name);
+        let Ok(text) = fs::read_to_string(&path).await else { continue; };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { continue; };
+        if let Some(v) = json.get("coverArtUrl").or_else(|| json.get("cover_art_url")).and_then(|v| v.as_str()) {
+            game.cover_art_url = v.to_string();
+        }
+        if let Some(v) = json.get("summary").and_then(|v| v.as_str()) {
+            game.summary = v.to_string();
+        }
+        if let Some(v) = json.get("genres").and_then(|v| v.as_str()) {
+            game.genres = v.to_string();
+        } else if let Some(arr) = json.get("genres").and_then(|v| v.as_array()) {
+            game.genres = arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ");
+        }
+        if let Some(v) = json.get("igdbRating").or_else(|| json.get("igdb_rating")).and_then(|v| v.as_f64()) {
+            game.igdb_rating = v;
+        }
+        if let Some(v) = json.get("releaseDate").or_else(|| json.get("release_date")).and_then(|v| v.as_i64()) {
+            game.release_date = v;
+        }
+        if let Some(v) = json.get("igdbId").or_else(|| json.get("igdb_id")).and_then(|v| v.as_u64()) {
+            game.igdb_id = v;
+        }
+        break;
+    }
+    if game.cover_art_url.is_empty() && find_local_cover(root).await.is_some() {
+        game.cover_art_url = "local".into();
     }
 }
 
@@ -1360,7 +1475,7 @@ async fn game_entry(
     arguments: &str,
 ) -> Result<Game> {
     let relative_content = content_path.strip_prefix(library_root).unwrap_or(content_path);
-    Ok(Game {
+    let mut game = Game {
         id: stable_id(platform, relative_content),
         title: title.to_string(),
         platform: platform.to_string(),
@@ -1369,11 +1484,17 @@ async fn game_entry(
         content_path: relative_content.to_string_lossy().replace('\\', "/"),
         cover_art_url: String::new(),
         igdb_id: 0,
+        summary: String::new(),
+        genres: String::new(),
+        igdb_rating: 0.0,
+        release_date: 0,
         launch: Launch {
             target: target.to_string_lossy().replace('\\', "/"),
             arguments: arguments.to_string(),
         },
-    })
+    };
+    apply_sidecar_metadata(content_path, &mut game).await;
+    Ok(game)
 }
 
 async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
@@ -1382,8 +1503,8 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
     for game in games {
         c.exec_drop(
             r#"INSERT INTO games
-              (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,updated_at)
-              VALUES (:id,:title,:platform,:install_type,:version,:content_path,:launch_target,:launch_arguments,:cover_art_url,:igdb_id,:updated_at)
+              (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,summary,genres,igdb_rating,release_date,updated_at)
+              VALUES (:id,:title,:platform,:install_type,:version,:content_path,:launch_target,:launch_arguments,:cover_art_url,:igdb_id,:summary,:genres,:igdb_rating,:release_date,:updated_at)
               ON DUPLICATE KEY UPDATE
                 title=VALUES(title),
                 platform=VALUES(platform),
@@ -1392,8 +1513,12 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
                 content_path=VALUES(content_path),
                 launch_target=VALUES(launch_target),
                 launch_arguments=VALUES(launch_arguments),
-                cover_art_url=VALUES(cover_art_url),
-                igdb_id=VALUES(igdb_id),
+                cover_art_url=IF(VALUES(cover_art_url)='',cover_art_url,VALUES(cover_art_url)),
+                igdb_id=IF(VALUES(igdb_id)=0,igdb_id,VALUES(igdb_id)),
+                summary=IF(VALUES(summary)='',summary,VALUES(summary)),
+                genres=IF(VALUES(genres)='',genres,VALUES(genres)),
+                igdb_rating=IF(VALUES(igdb_rating)=0,igdb_rating,VALUES(igdb_rating)),
+                release_date=IF(VALUES(release_date)=0,release_date,VALUES(release_date)),
                 updated_at=VALUES(updated_at)"#,
             params! {
                 "id" => &game.id,
@@ -1406,6 +1531,10 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
                 "launch_arguments" => &game.launch.arguments,
                 "cover_art_url" => &game.cover_art_url,
                 "igdb_id" => game.igdb_id,
+                "summary" => &game.summary,
+                "genres" => &game.genres,
+                "igdb_rating" => game.igdb_rating,
+                "release_date" => game.release_date,
                 "updated_at" => ts,
             },
         )
