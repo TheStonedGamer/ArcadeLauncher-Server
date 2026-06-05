@@ -15,6 +15,7 @@ jobs:
   package:
     name: Package Server
     runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || github.actor != 'github-actions[bot]'
 
     steps:
       - name: Checkout
