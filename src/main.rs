@@ -48,6 +48,8 @@ struct AppState {
 struct Config {
     host: String,
     port: u16,
+    admin_host: String,
+    admin_port: u16,
     library_root: PathBuf,
     auth_token: String,
     admin_username: String,
@@ -65,6 +67,8 @@ impl Config {
         let args: Vec<String> = env::args().collect();
         let mut host = env_string("ARCADE_HOST", "0.0.0.0");
         let mut port = env_u16("ARCADE_PORT", 8721);
+        let mut admin_host = env_string("ARCADE_ADMIN_HOST", "127.0.0.1");
+        let mut admin_port = env_u16("ARCADE_ADMIN_PORT", 8722);
         let mut library_root = PathBuf::from(env_string("ARCADE_LIBRARY_ROOT", "/srv/arcade-library"));
         let mut i = 1;
         while i < args.len() {
@@ -77,6 +81,14 @@ impl Config {
                     port = args[i + 1].parse().context("invalid --port")?;
                     i += 2;
                 }
+                "--admin-host" if i + 1 < args.len() => {
+                    admin_host = args[i + 1].clone();
+                    i += 2;
+                }
+                "--admin-port" if i + 1 < args.len() => {
+                    admin_port = args[i + 1].parse().context("invalid --admin-port")?;
+                    i += 2;
+                }
                 "--library-root" if i + 1 < args.len() => {
                     library_root = PathBuf::from(&args[i + 1]);
                     i += 2;
@@ -87,6 +99,8 @@ impl Config {
         Ok(Self {
             host,
             port,
+            admin_host,
+            admin_port,
             library_root,
             auth_token: env_string("ARCADE_AUTH_TOKEN", ""),
             admin_username: env_string("ARCADE_ADMIN_USERNAME", "admin"),
@@ -193,6 +207,7 @@ struct AdminForm {
     user_id: Option<u64>,
     setting_key: Option<String>,
     setting_value: Option<String>,
+    service_name: Option<String>,
 }
 
 #[tokio::main]
@@ -208,11 +223,7 @@ async fn main() -> Result<()> {
     ensure_bootstrap_admin(&db, &cfg).await?;
 
     let state = AppState { cfg: cfg.clone(), db };
-    let app = Router::new()
-        .route("/", get(admin_page))
-        .route("/admin", get(admin_page).post(admin_post))
-        .route("/admin/login", get(admin_page).post(admin_post))
-        .route("/admin/logout", get(admin_logout))
+    let public_app = Router::new()
         .route("/api/login", post(api_login))
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
@@ -220,12 +231,25 @@ async fn main() -> Result<()> {
         .route("/files/:id/*rel", get(download_file))
         .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
         .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
+
+    let admin_app = Router::new()
+        .route("/", get(admin_page))
+        .route("/admin", get(admin_page).post(admin_post))
+        .route("/admin/login", get(admin_page).post(admin_post))
+        .route("/admin/logout", get(admin_logout))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
-    info!("ArcadeLauncher Rust server listening on http://{}", addr);
+    let admin_addr: SocketAddr = format!("{}:{}", cfg.admin_host, cfg.admin_port).parse()?;
+    info!("ArcadeLauncher API listening on http://{}", addr);
+    info!("ArcadeLauncher admin listening on http://{}", admin_addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    let public_server = axum::serve(listener, public_app);
+    let admin_server = axum::serve(admin_listener, admin_app);
+    tokio::try_join!(public_server, admin_server)?;
     Ok(())
 }
 
@@ -490,6 +514,17 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             "rescan" => match rescan_catalog(&st.cfg).await {
                 Ok(out) => format!("Catalog rescan complete.\n{out}"),
                 Err(e) => e.to_string(),
+            },
+            "validate_games" => match validate_games(&st).await {
+                Ok(report) => report.to_message(),
+                Err(e) => e.to_string(),
+            },
+            "restart_service" => {
+                let name = form.service_name.unwrap_or_default();
+                match restart_service(&name).await {
+                    Ok(msg) => msg,
+                    Err(e) => e.to_string(),
+                }
             },
             "save_setting" => {
                 let key = form.setting_key.unwrap_or_default();
@@ -1061,12 +1096,136 @@ async fn rescan_catalog(cfg: &Config) -> Result<String> {
     Ok(text)
 }
 
+struct GameValidationReport {
+    total: usize,
+    ok: usize,
+    missing: Vec<String>,
+    empty: Vec<String>,
+    errors: Vec<String>,
+    bytes: u64,
+}
+
+impl GameValidationReport {
+    fn to_message(&self) -> String {
+        let mut msg = format!(
+            "Game validation complete.\n{} checked, {} OK, {} missing, {} empty, {} errors, {} total bytes.",
+            self.total,
+            self.ok,
+            self.missing.len(),
+            self.empty.len(),
+            self.errors.len(),
+            self.bytes
+        );
+        for (label, rows) in [("Missing", &self.missing), ("Empty", &self.empty), ("Errors", &self.errors)] {
+            if !rows.is_empty() {
+                msg.push_str(&format!("\n\n{label}:"));
+                for row in rows.iter().take(50) {
+                    msg.push_str("\n- ");
+                    msg.push_str(row);
+                }
+                if rows.len() > 50 {
+                    msg.push_str(&format!("\n- ... {} more", rows.len() - 50));
+                }
+            }
+        }
+        msg
+    }
+}
+
+async fn validate_games(st: &AppState) -> Result<GameValidationReport> {
+    let games = list_games(&st.db).await?;
+    let mut report = GameValidationReport {
+        total: games.len(),
+        ok: 0,
+        missing: Vec::new(),
+        empty: Vec::new(),
+        errors: Vec::new(),
+        bytes: 0,
+    };
+    for game in games {
+        let path = match content_path_for(&st.cfg, &game).await {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push(format!("{}: {}", game.title, e));
+                continue;
+            }
+        };
+        let meta = match fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => {
+                report.missing.push(format!("{} ({}) -> {}", game.title, game.platform, path.display()));
+                continue;
+            }
+        };
+        if meta.is_file() {
+            if meta.len() == 0 {
+                report.empty.push(format!("{} ({}) -> {}", game.title, game.platform, path.display()));
+            } else {
+                report.ok += 1;
+                report.bytes += meta.len();
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            match dir_file_stats(&path).await {
+                Ok((count, bytes)) if count > 0 && bytes > 0 => {
+                    report.ok += 1;
+                    report.bytes += bytes;
+                }
+                Ok(_) => report.empty.push(format!("{} ({}) -> {}", game.title, game.platform, path.display())),
+                Err(e) => report.errors.push(format!("{}: {}", game.title, e)),
+            }
+        }
+    }
+    Ok(report)
+}
+
+async fn dir_file_stats(root: &Path) -> Result<(usize, u64)> {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for path in walk_files(root).await? {
+        let meta = fs::metadata(path).await?;
+        count += 1;
+        bytes += meta.len();
+    }
+    Ok((count, bytes))
+}
+
+async fn restart_service(name: &str) -> Result<String> {
+    let service = match name {
+        "arcadelauncher-server" => "arcadelauncher-server.service",
+        "mariadb" => "mariadb.service",
+        _ => return Err(anyhow!("service is not restartable from this panel")),
+    };
+    if service == "arcadelauncher-server.service" {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            std::process::exit(1);
+        });
+        return Ok("Restarting ArcadeLauncher Server. Refresh the admin panel in a few seconds.".into());
+    }
+    let out = Command::new("sudo")
+        .arg("/bin/systemctl")
+        .arg("restart")
+        .arg(service)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(anyhow!(if err.is_empty() { "service restart failed".into() } else { err }));
+    }
+    Ok(format!("Restarted {service}."))
+}
+
 async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result<String> {
     let users = list_users(&st.db).await.unwrap_or_default();
     let tokens = list_launcher_tokens(&st.db).await.unwrap_or_default();
     let games = list_games(&st.db).await.unwrap_or_default();
     let settings = list_server_settings(&st.db).await.unwrap_or_default();
     let service_rows = service_status_rows(st, games.len(), users.len(), tokens.len()).await;
+    let validation_summary = validation_summary_rows(st, &games).await;
     let mut by_platform = BTreeMap::<String, usize>::new();
     for g in &games {
         *by_platform.entry(g.platform.clone()).or_default() += 1;
@@ -1106,10 +1265,10 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
             <section class="topbar"><div><div class="eyebrow">Private library server</div><h1>Server Administration</h1></div><div class="account-box"><span>Signed in as <strong>{}</strong></span><a class="buttonlink" href="/admin/logout">Sign Out</a></div></section>
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
-            <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></section>
-            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button></form></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
+            <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
+            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="validate_games">Validate Games</button></form><h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
-            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
+            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
         "##,
@@ -1121,11 +1280,14 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         users.len(),
         service_rows,
         esc(&st.cfg.library_root.display().to_string()),
+        validation_summary,
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
         if user_rows.is_empty() { "<tr><td colspan='4'>No users yet.</td></tr>".into() } else { user_rows },
         if token_rows.is_empty() { "<tr><td colspan='4'>No issued tokens yet.</td></tr>".into() } else { token_rows },
         esc(&st.cfg.host),
         st.cfg.port,
+        esc(&st.cfg.admin_host),
+        st.cfg.admin_port,
         esc(&st.cfg.library_root.display().to_string()),
         esc(&st.cfg.db_host),
         st.cfg.db_port,
@@ -1141,6 +1303,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "ArcadeLauncher Server",
         true,
         &format!("Rust process listening on {}:{}", st.cfg.host, st.cfg.port),
+        Some("arcadelauncher-server"),
     ));
 
     let db_ok = db_ping(&st.db).await;
@@ -1151,12 +1314,14 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
             "{}:{} / {} as {}",
             st.cfg.db_host, st.cfg.db_port, st.cfg.db_name, st.cfg.db_user
         ),
+        Some("mariadb"),
     ));
 
     rows.push(status_row(
         "Catalog Database",
         game_count > 0,
         &format!("{game_count} games, {user_count} users, {token_count} issued tokens"),
+        None,
     ));
 
     let library_meta = fs::metadata(&st.cfg.library_root).await;
@@ -1164,6 +1329,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "Library Root",
         library_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
         &st.cfg.library_root.display().to_string(),
+        None,
     ));
 
     let games_path = st.cfg.library_root.join("games");
@@ -1172,6 +1338,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "Game Storage",
         games_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
         &games_path.display().to_string(),
+        None,
     ));
 
     let generator = Path::new("/opt/arcadelauncher-server/generate_catalog.py");
@@ -1179,6 +1346,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "Catalog Generator",
         fs::metadata(generator).await.map(|m| m.is_file()).unwrap_or(false),
         &generator.display().to_string(),
+        None,
     ));
 
     let mount_detail = command_output("findmnt", &["-T", st.cfg.library_root.to_str().unwrap_or("")]).await;
@@ -1186,6 +1354,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "Library Mount",
         mount_detail.is_ok(),
         mount_detail.as_deref().unwrap_or("mount lookup unavailable"),
+        None,
     ));
 
     let disk_detail = command_output("df", &["-h", st.cfg.library_root.to_str().unwrap_or("")]).await;
@@ -1193,6 +1362,7 @@ async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize
         "Disk Space",
         disk_detail.is_ok(),
         disk_detail.as_deref().unwrap_or("disk usage unavailable"),
+        None,
     ));
 
     rows.join("")
@@ -1224,13 +1394,46 @@ async fn command_output(cmd: &str, args: &[&str]) -> Result<String> {
     Ok(text)
 }
 
-fn status_row(name: &str, ok: bool, details: &str) -> String {
+async fn validation_summary_rows(st: &AppState, games: &[Game]) -> String {
+    let mut missing = 0usize;
+    let mut present = 0usize;
+    for game in games {
+        if let Ok(path) = content_path_for(&st.cfg, game).await {
+            if fs::metadata(&path).await.is_ok() {
+                present += 1;
+            } else {
+                missing += 1;
+            }
+        } else {
+            missing += 1;
+        }
+    }
+    let ok = missing == 0 && !games.is_empty();
     format!(
-        "<tr><td>{}</td><td><span class='status {}'>{}</span></td><td><code>{}</code></td></tr>",
+        "<tr><td>Catalog Paths</td><td><span class='status {}'>{}</span></td><td><code>{} present, {} missing. Click Validate Games for file/byte details.</code></td></tr>",
+        if ok { "ok" } else { "bad" },
+        if ok { "OK" } else { "Needs Attention" },
+        present,
+        missing
+    )
+}
+
+fn status_row(name: &str, ok: bool, details: &str, restart: Option<&str>) -> String {
+    let action = restart
+        .map(|svc| {
+            format!(
+                "<form method='post' class='inline'><input type='hidden' name='service_name' value='{}'><button name='action' value='restart_service'>Restart</button></form>",
+                esc(svc)
+            )
+        })
+        .unwrap_or_else(|| "<span class='muted'>Not restartable</span>".into());
+    format!(
+        "<tr><td>{}</td><td><span class='status {}'>{}</span></td><td><code>{}</code></td><td>{}</td></tr>",
         esc(name),
         if ok { "ok" } else { "bad" },
         if ok { "Online" } else { "Needs Attention" },
-        esc(details)
+        esc(details),
+        action
     )
 }
 

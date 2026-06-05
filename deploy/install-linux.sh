@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 apt-get update
-apt-get install -y mariadb-server python3 python3-pymysql ca-certificates
+apt-get install -y mariadb-server python3 python3-pymysql ca-certificates sudo
 
 id -u arcade >/dev/null 2>&1 || useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin arcade
 
@@ -49,6 +49,10 @@ FLUSH PRIVILEGES;
 SQL
 
 install -m 0644 "${SCRIPT_DIR}/arcadelauncher-server.service" /etc/systemd/system/arcadelauncher-server.service
+cat >/etc/sudoers.d/arcadelauncher-server <<'SUDOERS'
+arcade ALL=(root) NOPASSWD: /bin/systemctl restart mariadb.service
+SUDOERS
+chmod 0440 /etc/sudoers.d/arcadelauncher-server
 systemctl daemon-reload
 systemctl enable --now arcadelauncher-server.service
 
