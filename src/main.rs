@@ -14,6 +14,7 @@ use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
 use mysql_async::{params, prelude::Queryable, Pool, Row};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
+use reqwest::Client;
 use rust_scrypt::{scrypt, Params as ScryptParams};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -39,6 +40,8 @@ use tracing::{error, info};
 const CHUNK_SIZE: usize = 1024 * 1024;
 const SESSION_COOKIE: &str = "AL_ADMIN_SESSION";
 const SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
+const IGDB_CLIENT_ID_KEY: &str = "igdb.client_id";
+const IGDB_CLIENT_SECRET_KEY: &str = "igdb.client_secret";
 
 #[derive(Clone)]
 struct AppState {
@@ -151,6 +154,17 @@ struct Game {
 struct Launch {
     target: String,
     arguments: String,
+}
+
+#[derive(Debug, Clone)]
+struct IgdbMatch {
+    id: u64,
+    name: String,
+    summary: String,
+    genres: String,
+    rating: f64,
+    release_date: i64,
+    cover_image_id: String,
 }
 
 #[derive(Serialize)]
@@ -551,6 +565,14 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 Ok(out) => format!("Catalog rescan complete.\n{out}"),
                 Err(e) => e.to_string(),
             },
+            "igdb_enrich" => match enrich_catalog_from_igdb(&st, false).await {
+                Ok(out) => out,
+                Err(e) => e.to_string(),
+            },
+            "igdb_refresh" => match enrich_catalog_from_igdb(&st, true).await {
+                Ok(out) => out,
+                Err(e) => e.to_string(),
+            },
             "validate_games" => match validate_games(&st).await {
                 Ok(report) => report.to_message(),
                 Err(e) => e.to_string(),
@@ -717,6 +739,11 @@ async fn list_server_settings(db: &Pool) -> Result<Vec<(String, String)>> {
     Ok(rows.into_iter().map(mysql_async::from_row).collect())
 }
 
+async fn setting_value(db: &Pool, key: &str) -> Result<Option<String>> {
+    let mut c = db.get_conn().await?;
+    Ok(c.exec_first("SELECT setting_value FROM server_settings WHERE setting_key=:k", params! {"k" => key}).await?)
+}
+
 async fn save_server_setting(db: &Pool, key: &str, value: &str) -> Result<()> {
     let key = key.trim();
     if key.is_empty() {
@@ -802,7 +829,13 @@ async fn download_art(
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let Some(path) = find_local_cover(&root).await else {
+    let cached = server_cover_path(&st.cfg.library_root, &game.id);
+    let path = if fs::metadata(&cached).await.map(|m| m.is_file()).unwrap_or(false) {
+        Some(cached)
+    } else {
+        find_local_cover(&root).await
+    };
+    let Some(path) = path else {
         return (StatusCode::NOT_FOUND, "art not found").into_response();
     };
     match stream_file(path, None).await {
@@ -1090,6 +1123,10 @@ async fn hydrate_server_art_url(st: &AppState, base: &str, game: &mut Game) {
         return;
     }
     if game.cover_art_url == "local" || game.cover_art_url.is_empty() {
+        if fs::metadata(server_cover_path(&st.cfg.library_root, &game.id)).await.map(|m| m.is_file()).unwrap_or(false) {
+            game.cover_art_url = format!("{}/art/{}", base, urlencoding::encode(&game.id));
+            return;
+        }
         if let Ok(root) = content_path_for(&st.cfg, game).await {
             if find_local_cover(&root).await.is_some() {
                 game.cover_art_url = format!("{}/art/{}", base, urlencoding::encode(&game.id));
@@ -1320,6 +1357,74 @@ fn encode_path(path: &str) -> String {
     path.split('/').map(urlencoding::encode).collect::<Vec<_>>().join("/")
 }
 
+fn server_cover_path(library_root: &Path, game_id: &str) -> PathBuf {
+    library_root.join(".arcadelauncher").join("art").join(format!("{}.jpg", safe_file_part(game_id)))
+}
+
+fn igdb_cover_url(image_id: &str) -> String {
+    format!("https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg")
+}
+
+fn igdb_platform_ids(platform: &str) -> &'static [i32] {
+    match platform {
+        "Dolphin" => &[21, 5],
+        "Ryujinx" => &[130],
+        "RPCS3" => &[9],
+        "N64" => &[4],
+        "NES" => &[18],
+        "SNES" => &[19],
+        "PS1" => &[7],
+        "PS2" => &[8],
+        "Xbox360" => &[12],
+        "Xbox" => &[11],
+        _ => &[],
+    }
+}
+
+fn clean_igdb_title(title: &str) -> String {
+    let without_brackets = title
+        .split(['(', '['])
+        .next()
+        .unwrap_or(title)
+        .replace('_', " ")
+        .replace('-', " ");
+    without_brackets.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_title(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    if a.contains(b) || b.contains(a) {
+        return 0.85;
+    }
+    let aw: HashSet<&str> = a.split_whitespace().collect();
+    let bw: HashSet<&str> = b.split_whitespace().collect();
+    let common = aw.intersection(&bw).count() as f64;
+    let total = aw.union(&bw).count() as f64;
+    if total == 0.0 { 0.0 } else { common / total }
+}
+
+fn safe_file_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 fn env_string(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -1340,6 +1445,7 @@ fn server_error(e: impl std::fmt::Display) -> Response {
 async fn rescan_catalog(st: &AppState) -> Result<String> {
     let games = scan_catalog(&st.cfg.library_root).await?;
     sync_catalog_db(&st.db, &games).await?;
+    let enrichment = enrich_catalog_from_igdb(st, false).await.unwrap_or_else(|e| format!("IGDB enrichment skipped: {e}"));
 
     let mut by_platform = BTreeMap::<String, usize>::new();
     for game in &games {
@@ -1352,7 +1458,172 @@ async fn rescan_catalog(st: &AppState) -> Result<String> {
     for (platform, count) in by_platform {
         msg.push_str(&format!("\n{platform}: {count}"));
     }
+    msg.push_str(&format!("\n{enrichment}"));
     Ok(msg)
+}
+
+async fn enrich_catalog_from_igdb(st: &AppState, force: bool) -> Result<String> {
+    let client_id = setting_value(&st.db, IGDB_CLIENT_ID_KEY).await?.unwrap_or_default();
+    let client_secret = setting_value(&st.db, IGDB_CLIENT_SECRET_KEY).await?.unwrap_or_default();
+    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+        return Err(anyhow!("set {IGDB_CLIENT_ID_KEY} and {IGDB_CLIENT_SECRET_KEY} in Configuration first"));
+    }
+
+    let http = Client::builder().user_agent("ArcadeLauncher-Server/1.0").build()?;
+    let token = igdb_authenticate(&http, &client_id, &client_secret).await?;
+    let games = list_games(&st.db).await?;
+    let mut matched = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for game in games {
+        if !force && game.igdb_id > 0 && !game.summary.is_empty() && !game.cover_art_url.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        match igdb_best_match(&http, &client_id, &token, &game).await {
+            Ok(Some(meta)) => {
+                let cover_art_url = if !meta.cover_image_id.is_empty() {
+                    match cache_igdb_cover(&http, st, &game.id, &meta.cover_image_id).await {
+                        Ok(true) => "local".to_string(),
+                        _ => igdb_cover_url(&meta.cover_image_id),
+                    }
+                } else {
+                    game.cover_art_url.clone()
+                };
+                save_game_metadata(&st.db, &game.id, &meta, &cover_art_url).await?;
+                matched += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+            }
+            Ok(None) => {
+                failed += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+            }
+            Err(e) => {
+                failed += 1;
+                error!("IGDB metadata failed for {}: {e}", game.title);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Ok(format!("IGDB enrichment complete. matched: {matched}, skipped: {skipped}, unmatched/failed: {failed}"))
+}
+
+async fn igdb_authenticate(http: &Client, client_id: &str, client_secret: &str) -> Result<String> {
+    let json: serde_json::Value = http
+        .post("https://id.twitch.tv/oauth2/token")
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "client_credentials"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    json.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Twitch auth response did not include access_token"))
+}
+
+async fn igdb_best_match(http: &Client, client_id: &str, token: &str, game: &Game) -> Result<Option<IgdbMatch>> {
+    let title = clean_igdb_title(&game.title);
+    let mut candidates = igdb_search(http, client_id, token, &title, igdb_platform_ids(&game.platform)).await?;
+    if candidates.is_empty() && !igdb_platform_ids(&game.platform).is_empty() {
+        candidates = igdb_search(http, client_id, token, &title, &[]).await?;
+    }
+    let norm_title = normalize_title(&title);
+    let mut best: Option<(f64, IgdbMatch)> = None;
+    for candidate in candidates {
+        let score = title_similarity(&norm_title, &normalize_title(&candidate.name));
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, candidate));
+        }
+    }
+    Ok(best.and_then(|(score, meta)| if score >= 0.60 { Some(meta) } else { None }))
+}
+
+async fn igdb_search(http: &Client, client_id: &str, token: &str, title: &str, platforms: &[i32]) -> Result<Vec<IgdbMatch>> {
+    let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut body = format!(
+        "search \"{escaped}\";fields id,name,summary,rating,first_release_date,cover.image_id,genres.name;"
+    );
+    if !platforms.is_empty() {
+        body.push_str("where release_dates.platform = (");
+        body.push_str(&platforms.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
+        body.push_str(");");
+    }
+    body.push_str("limit 8;");
+    let value: serde_json::Value = http
+        .post("https://api.igdb.com/v4/games")
+        .header("Client-ID", client_id)
+        .bearer_auth(token)
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let Some(items) = value.as_array() else { return Ok(Vec::new()); };
+    Ok(items.iter().filter_map(parse_igdb_match).collect())
+}
+
+fn parse_igdb_match(v: &serde_json::Value) -> Option<IgdbMatch> {
+    let id = v.get("id")?.as_u64()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    let genres = v
+        .get("genres")
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|g| g.get("name").and_then(|n| n.as_str())).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    Some(IgdbMatch {
+        id,
+        name,
+        summary: v.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        genres,
+        rating: v.get("rating").and_then(|r| r.as_f64()).unwrap_or_default(),
+        release_date: v.get("first_release_date").and_then(|d| d.as_i64()).unwrap_or_default(),
+        cover_image_id: v.get("cover").and_then(|c| c.get("image_id")).and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+    })
+}
+
+async fn cache_igdb_cover(http: &Client, st: &AppState, game_id: &str, image_id: &str) -> Result<bool> {
+    let bytes = http.get(igdb_cover_url(image_id)).send().await?.error_for_status()?.bytes().await?;
+    let path = server_cover_path(&st.cfg.library_root, game_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, bytes).await?;
+    Ok(true)
+}
+
+async fn save_game_metadata(db: &Pool, game_id: &str, meta: &IgdbMatch, cover_art_url: &str) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        r#"UPDATE games
+           SET igdb_id=:igdb_id,
+               summary=:summary,
+               genres=:genres,
+               igdb_rating=:igdb_rating,
+               release_date=:release_date,
+               cover_art_url=IF(:cover_art_url='',cover_art_url,:cover_art_url),
+               updated_at=:updated_at
+           WHERE id=:id"#,
+        params! {
+            "id" => game_id,
+            "igdb_id" => meta.id,
+            "summary" => &meta.summary,
+            "genres" => &meta.genres,
+            "igdb_rating" => meta.rating,
+            "release_date" => meta.release_date,
+            "cover_art_url" => cover_art_url,
+            "updated_at" => now(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn scan_catalog(library_root: &Path) -> Result<Vec<Game>> {
@@ -1786,9 +2057,9 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
-            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="validate_games">Validate Games</button></form><h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
+            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Fetch Missing IGDB Metadata</button><button name="action" value="igdb_refresh">Refresh All IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form><h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
-            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
+            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Managed Settings</h3><p class="muted">Use <code>igdb.client_id</code> and <code>igdb.client_secret</code> for Twitch/IGDB metadata sync.</p><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="igdb.client_id"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
         "##,
@@ -1800,6 +2071,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         users.len(),
         service_rows,
         esc(&st.cfg.library_root.display().to_string()),
+        esc(&st.cfg.library_root.join(".arcadelauncher").join("art").display().to_string()),
         validation_summary,
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
         if user_rows.is_empty() { "<tr><td colspan='6'>No users yet.</td></tr>".into() } else { user_rows },
