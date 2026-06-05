@@ -922,6 +922,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
     let users = list_users(&st.db).await.unwrap_or_default();
     let tokens = list_launcher_tokens(&st.db).await.unwrap_or_default();
     let games = list_games(&st.db).await.unwrap_or_default();
+    let service_rows = service_status_rows(st, games.len(), users.len(), tokens.len()).await;
     let mut by_platform = BTreeMap::<String, usize>::new();
     for g in &games {
         *by_platform.entry(g.platform.clone()).or_default() += 1;
@@ -947,11 +948,12 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
     Ok(shell(&format!(
         r##"
         <div class="admin-layout">
-          <aside class="sidebar"><div class="brand-block"><div class="brand-mark">AL</div><div><div class="brand-title">ArcadeLauncher</div><div class="brand-subtitle">Rust Server</div></div></div><nav><a href="#overview">Overview</a><a href="#library">Library</a><a href="#auth">Auth</a><a href="#config">Configuration</a></nav></aside>
+          <aside class="sidebar"><div class="brand-block"><div class="brand-mark">AL</div><div><div class="brand-title">ArcadeLauncher</div><div class="brand-subtitle">Rust Server</div></div></div><nav><a href="#overview">Overview</a><a href="#services">Services</a><a href="#library">Library</a><a href="#auth">Auth</a><a href="#config">Configuration</a></nav></aside>
           <div class="content">
             <section class="topbar"><div><div class="eyebrow">Private library server</div><h1>Server Administration</h1></div><div class="account-box"><span>Signed in as <strong>{}</strong></span><a class="buttonlink" href="/admin/logout">Sign Out</a></div></section>
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
+            <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button></form></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
           </div>
@@ -963,11 +965,111 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str) -> Result
         by_platform.len(),
         tokens.len(),
         users.len(),
+        service_rows,
         esc(&st.cfg.library_root.display().to_string()),
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
         if user_rows.is_empty() { "<tr><td colspan='4'>No users yet.</td></tr>".into() } else { user_rows },
         if token_rows.is_empty() { "<tr><td colspan='4'>No issued tokens yet.</td></tr>".into() } else { token_rows },
     )))
+}
+
+async fn service_status_rows(st: &AppState, game_count: usize, user_count: usize, token_count: usize) -> String {
+    let mut rows = Vec::new();
+    rows.push(status_row(
+        "ArcadeLauncher Server",
+        true,
+        &format!("Rust process listening on {}:{}", st.cfg.host, st.cfg.port),
+    ));
+
+    let db_ok = db_ping(&st.db).await;
+    rows.push(status_row(
+        "MariaDB",
+        db_ok,
+        &format!(
+            "{}:{} / {} as {}",
+            st.cfg.db_host, st.cfg.db_port, st.cfg.db_name, st.cfg.db_user
+        ),
+    ));
+
+    rows.push(status_row(
+        "Catalog Database",
+        game_count > 0,
+        &format!("{game_count} games, {user_count} users, {token_count} issued tokens"),
+    ));
+
+    let library_meta = fs::metadata(&st.cfg.library_root).await;
+    rows.push(status_row(
+        "Library Root",
+        library_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+        &st.cfg.library_root.display().to_string(),
+    ));
+
+    let games_path = st.cfg.library_root.join("games");
+    let games_meta = fs::metadata(&games_path).await;
+    rows.push(status_row(
+        "Game Storage",
+        games_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+        &games_path.display().to_string(),
+    ));
+
+    let generator = Path::new("/opt/arcadelauncher-server/generate_catalog.py");
+    rows.push(status_row(
+        "Catalog Generator",
+        fs::metadata(generator).await.map(|m| m.is_file()).unwrap_or(false),
+        &generator.display().to_string(),
+    ));
+
+    let mount_detail = command_output("findmnt", &["-T", st.cfg.library_root.to_str().unwrap_or("")]).await;
+    rows.push(status_row(
+        "Library Mount",
+        mount_detail.is_ok(),
+        mount_detail.as_deref().unwrap_or("mount lookup unavailable"),
+    ));
+
+    let disk_detail = command_output("df", &["-h", st.cfg.library_root.to_str().unwrap_or("")]).await;
+    rows.push(status_row(
+        "Disk Space",
+        disk_detail.is_ok(),
+        disk_detail.as_deref().unwrap_or("disk usage unavailable"),
+    ));
+
+    rows.join("")
+}
+
+async fn db_ping(db: &Pool) -> bool {
+    let Ok(mut conn) = db.get_conn().await else { return false; };
+    conn.query_drop("SELECT 1").await.is_ok()
+}
+
+async fn command_output(cmd: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if !out.status.success() {
+        return Err(anyhow!(text));
+    }
+    Ok(text)
+}
+
+fn status_row(name: &str, ok: bool, details: &str) -> String {
+    format!(
+        "<tr><td>{}</td><td><span class='status {}'>{}</span></td><td><code>{}</code></td></tr>",
+        esc(name),
+        if ok { "ok" } else { "bad" },
+        if ok { "Online" } else { "Needs Attention" },
+        esc(details)
+    )
 }
 
 fn login_html(message: &str) -> String {
@@ -998,5 +1100,5 @@ fn esc(s: &str) -> String {
 
 static CSS: &str = r#"
 :root{color-scheme:dark;--bg:#0f1115;--panel:#171b21;--panel2:#1d232b;--line:#2c3540;--text:#e8edf2;--muted:#9aa7b5;--accent:#4cc2ff;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
 "#;
