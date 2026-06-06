@@ -1154,10 +1154,38 @@ async fn find_local_cover(root: &Path) -> Option<PathBuf> {
     } else {
         root.to_path_buf()
     };
-    for name in ["cover.jpg", "cover.png", "folder.jpg", "poster.jpg", "boxart.jpg", "boxart.png"] {
+    const COVER_NAMES: &[&str] = &[
+        "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+        "folder.jpg", "folder.jpeg", "folder.png", "folder.webp",
+        "poster.jpg", "poster.jpeg", "poster.png", "poster.webp",
+        "boxart.jpg", "boxart.jpeg", "boxart.png", "boxart.webp",
+    ];
+    for name in COVER_NAMES {
         let p = dir.join(name);
         if fs::metadata(&p).await.map(|m| m.is_file()).unwrap_or(false) {
             return Some(p);
+        }
+    }
+    let mut stack = vec![dir];
+    let mut scanned = 0usize;
+    while let Some(current) = stack.pop() {
+        scanned += 1;
+        if scanned > 200 {
+            break;
+        }
+        let Ok(mut entries) = fs::read_dir(&current).await else { continue; };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else { continue; };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+            let lower = name.to_ascii_lowercase();
+            if COVER_NAMES.iter().any(|candidate| *candidate == lower) {
+                return Some(path);
+            }
         }
     }
     None
