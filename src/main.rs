@@ -42,6 +42,7 @@ const SESSION_COOKIE: &str = "AL_ADMIN_SESSION";
 const SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
 const IGDB_CLIENT_ID_KEY: &str = "igdb.client_id";
 const IGDB_CLIENT_SECRET_KEY: &str = "igdb.client_secret";
+const PUBLIC_BASE_URL_KEY: &str = "server.public_base_url";
 
 #[derive(Clone)]
 struct AppState {
@@ -430,7 +431,7 @@ async fn api_catalog(State(st): State<AppState>, headers: HeaderMap) -> Response
     }
     match list_games(&st.db).await {
         Ok(mut games) => {
-            let base = base_url(&headers, &st.cfg);
+            let base = public_base_url(&st, &headers).await;
             for game in &mut games {
                 hydrate_server_art_url(&st, &base, game).await;
             }
@@ -943,7 +944,7 @@ async fn authorized_api(st: &AppState, headers: &HeaderMap) -> bool {
 
 async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result<Manifest> {
     let mut game = game.clone();
-    let base = base_url(headers, &st.cfg);
+    let base = public_base_url(st, headers).await;
     hydrate_server_art_url(st, &base, &mut game).await;
     let root = content_path_for(&st.cfg, &game).await?;
     let (files, rel_root) = if fs::metadata(&root).await?.is_file() {
@@ -1466,6 +1467,16 @@ fn base_url(headers: &HeaderMap, cfg: &Config) -> String {
     } else {
         format!("{proto}://{host}")
     }
+}
+
+async fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
+    if let Ok(Some(value)) = setting_value(&st.db, PUBLIC_BASE_URL_KEY).await {
+        let value = value.trim().trim_end_matches('/');
+        if value.starts_with("https://") || value.starts_with("http://") {
+            return value.to_string();
+        }
+    }
+    base_url(headers, &st.cfg)
 }
 
 fn encode_path(path: &str) -> String {
@@ -2340,6 +2351,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
         .collect::<String>();
     let igdb_client_id = settings.iter().find(|(k, _)| k == IGDB_CLIENT_ID_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
     let igdb_client_secret = settings.iter().find(|(k, _)| k == IGDB_CLIENT_SECRET_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
+    let public_base_url = settings.iter().find(|(k, _)| k == PUBLIC_BASE_URL_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
     let matcher_html = metadata_matcher_html(st, &games, matcher_game_id, matcher_query).await;
     let signed = admin.map(|a| a.username).unwrap_or_default();
     Ok(shell(&format!(
@@ -2353,7 +2365,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
-            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
+            <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Backend URL</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="server.public_base_url"><input name="setting_value" type="url" placeholder="https://arcade.orlandoaio.net" value="{}"><button name="action" value="save_setting">Save Backend URL</button></form><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
         </div>
         "##,
@@ -2380,6 +2392,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
         st.cfg.db_port,
         esc(&st.cfg.db_name),
         CHUNK_SIZE,
+        esc(public_base_url),
         esc(igdb_client_id),
         if igdb_client_secret.is_empty() { "IGDB/Twitch Client Secret".into() } else { format!("Saved ({})", masked_value(igdb_client_secret)) },
         if settings_rows.is_empty() { "<tr><td colspan='2'>No managed settings saved yet.</td></tr>".into() } else { settings_rows },
