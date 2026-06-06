@@ -1863,7 +1863,7 @@ async fn scan_catalog(library_root: &Path) -> Result<Vec<Game>> {
 async fn scan_single_file_platforms(library_root: &Path) -> Result<Vec<Game>> {
     let specs: &[(&str, &str, &[&str])] = &[
         ("Nintendo/NES", "NES", &["nes", "fds", "unf", "unif"]),
-        ("Nintendo/SNES", "SNES", &["sfc", "smc", "fig", "bs", "st"]),
+        ("Nintendo/SNES", "SNES", &["sfc", "smc", "fig", "bs", "st", "zip", "7z"]),
         ("Nintendo/N64", "N64", &["z64", "n64", "v64", "rom"]),
         ("Nintendo/Switch", "Ryujinx", &["nsp", "xci", "nca", "nro"]),
         ("Nintendo/Gamecube", "Dolphin", &["iso", "gcm", "rvz", "gcz"]),
