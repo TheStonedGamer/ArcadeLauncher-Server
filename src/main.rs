@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/art/:id", get(download_art))
+        .route("/emulators/*rel", get(download_emulator))
         .route("/files/:id/*rel", get(download_file))
         .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
         .layer(TraceLayer::new_for_http())
@@ -909,6 +910,21 @@ async fn download_art(
         return (StatusCode::NOT_FOUND, "art not found").into_response();
     };
     match stream_file(path, None).await {
+        Ok(r) => r,
+        Err(e) => server_error(e),
+    }
+}
+
+async fn download_emulator(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(rel): AxumPath<String>,
+) -> Response {
+    let path = match safe_join(&st.cfg.library_root.join("emulators"), &rel) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match stream_file(path, headers.get(header::RANGE)).await {
         Ok(r) => r,
         Err(e) => server_error(e),
     }
