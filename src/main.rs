@@ -272,6 +272,7 @@ async fn main() -> Result<()> {
         .route("/admin/metadata", get(admin_metadata_page).post(admin_metadata_post))
         .route("/admin/login", get(admin_page).post(admin_post))
         .route("/admin/logout", get(admin_logout))
+        .route("/art/:id", get(download_art))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -1457,6 +1458,14 @@ fn igdb_cover_url(image_id: &str) -> String {
     format!("https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg")
 }
 
+fn admin_cover_src(game: &Game) -> String {
+    if game.cover_art_url == "local" {
+        format!("/art/{}", urlencoding::encode(&game.id))
+    } else {
+        game.cover_art_url.clone()
+    }
+}
+
 fn igdb_platform_ids(platform: &str) -> &'static [i32] {
     match platform {
         "Dolphin" => &[21, 5],
@@ -2365,10 +2374,11 @@ async fn metadata_page_html(st: &AppState, admin: Option<User>, message: &str, s
 
     let current = selected
         .map(|g| {
-            let cover = if g.cover_art_url.is_empty() {
+            let cover_src = admin_cover_src(g);
+            let cover = if cover_src.is_empty() {
                 "<div class='current-cover placeholder'>No Art</div>".to_string()
             } else {
-                format!("<img class='current-cover' src='{}' alt=''>", esc(&g.cover_art_url))
+                format!("<img class='current-cover' src='{}' alt=''>", esc(&cover_src))
             };
             format!(
                 "<div class='current-game'>{}<div><h2>{}</h2><dl class='kv'><dt>Platform</dt><dd>{}</dd><dt>IGDB ID</dt><dd>{}</dd><dt>Rating</dt><dd>{:.0}</dd><dt>Genres</dt><dd>{}</dd><dt>Summary</dt><dd>{}</dd></dl></div></div>",
