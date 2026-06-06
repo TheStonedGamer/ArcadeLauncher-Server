@@ -1286,6 +1286,12 @@ async fn apply_sidecar_metadata(root: &Path, game: &mut Game) {
         if let Some(v) = json.get("igdbId").or_else(|| json.get("igdb_id")).and_then(|v| v.as_u64()) {
             game.igdb_id = v;
         }
+        if let Some(v) = json.get("launchTarget").or_else(|| json.get("launch_target")).and_then(|v| v.as_str()) {
+            game.launch.target = v.replace('\\', "/");
+        }
+        if let Some(v) = json.get("launchArguments").or_else(|| json.get("launch_arguments")).and_then(|v| v.as_str()) {
+            game.launch.arguments = v.to_string();
+        }
         break;
     }
     if game.cover_art_url.is_empty() && find_local_cover(root).await.is_some() {
@@ -1852,7 +1858,7 @@ async fn scan_catalog(library_root: &Path) -> Result<Vec<Game>> {
     let mut games = Vec::new();
     games.extend(scan_single_file_platforms(library_root).await?);
     games.extend(scan_xbox360_god(library_root).await?);
-    games.extend(scan_pc_archives(library_root).await?);
+    games.extend(scan_pc_games(library_root).await?);
     games.sort_by(|a, b| {
         (a.platform.as_str(), a.title.to_lowercase(), a.id.as_str())
             .cmp(&(b.platform.as_str(), b.title.to_lowercase(), b.id.as_str()))
@@ -1925,21 +1931,81 @@ async fn scan_xbox360_god(library_root: &Path) -> Result<Vec<Game>> {
     Ok(out)
 }
 
-async fn scan_pc_archives(library_root: &Path) -> Result<Vec<Game>> {
-    let archive_root = library_root.join("games").join("PC").join("Steam");
-    if fs::metadata(&archive_root).await.is_err() {
+async fn scan_pc_games(library_root: &Path) -> Result<Vec<Game>> {
+    let pc_root = library_root.join("games").join("PC");
+    if fs::metadata(&pc_root).await.is_err() {
         return Ok(Vec::new());
     }
     let allowed: HashSet<&str> = ["zip", "7z", "rar"].into_iter().collect();
     let mut out = Vec::new();
-    for path in walk_files(&archive_root).await? {
+    for path in walk_files(&pc_root).await? {
         if !allowed.contains(file_ext(&path).as_str()) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
         out.push(game_entry(library_root, &path, "Repacks", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
     }
+    let mut rd = fs::read_dir(&pc_root).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        let meta = entry.metadata().await?;
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        if name.eq_ignore_ascii_case("steam") {
+            let mut steam = fs::read_dir(&path).await?;
+            while let Some(game_dir) = steam.next_entry().await? {
+                let game_path = game_dir.path();
+                if !game_dir.metadata().await?.is_dir() {
+                    continue;
+                }
+                if let Some(game) = pc_folder_entry(library_root, &game_path).await? {
+                    out.push(game);
+                }
+            }
+            continue;
+        }
+        if let Some(game) = pc_folder_entry(library_root, &path).await? {
+            out.push(game);
+        }
+    }
     Ok(out)
+}
+
+async fn pc_folder_entry(library_root: &Path, game_root: &Path) -> Result<Option<Game>> {
+    let Some(title) = game_root.file_name().and_then(|s| s.to_str()).map(clean_title) else {
+        return Ok(None);
+    };
+    let target = find_pc_launch_target(game_root).await?;
+    let game = game_entry(library_root, game_root, "Repacks", &title, &target, "pc_folder", "{exe}").await?;
+    if game.launch.target.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(game))
+}
+
+async fn find_pc_launch_target(game_root: &Path) -> Result<PathBuf> {
+    let mut candidates = Vec::<PathBuf>::new();
+    for path in walk_files(game_root).await? {
+        if file_ext(&path) != "exe" {
+            continue;
+        }
+        let rel = path.strip_prefix(game_root).unwrap_or(&path).to_path_buf();
+        let lower = rel.to_string_lossy().to_ascii_lowercase();
+        if lower.contains("unins") || lower.contains("setup") || lower.contains("redist") ||
+           lower.contains("_commonredist") || lower.contains("crashreport") {
+            continue;
+        }
+        candidates.push(rel);
+    }
+    candidates.sort_by_key(|p| {
+        let s = p.to_string_lossy();
+        let depth = p.components().count();
+        let len = s.len();
+        (depth, len)
+    });
+    Ok(candidates.into_iter().next().unwrap_or_default())
 }
 
 async fn find_god_package(god_dir: &Path) -> Result<Option<PathBuf>> {
