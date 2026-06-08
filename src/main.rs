@@ -948,22 +948,48 @@ async fn create_user(db: &Pool, username: &str, email: &str, password: &str, is_
 }
 
 async fn issue_user_token(db: &Pool, user_id: u64, username: &str) -> Result<String> {
+    let mut c = db.get_conn().await?;
+    // Reuse an existing enabled token instead of minting a fresh one on every
+    // login. The launcher runs several independent ServerClient instances (the
+    // background download worker plus each periodic catalog re-sync), each of
+    // which logs in on its own. Since we keep a single token row per user,
+    // rotating the token here would invalidate an in-flight download the moment
+    // a re-sync logs in — surfacing as a mid-download 401. Returning the stable
+    // existing token lets all concurrent clients share one credential. Admins
+    // can still force rotation via rotate_launcher_token.
+    let existing: Option<(u64, Option<String>, bool)> = c
+        .exec_first(
+            "SELECT id, token_plain, enabled FROM launcher_tokens WHERE user_id = :id LIMIT 1",
+            params! {"id" => user_id},
+        )
+        .await?;
+    if let Some((_, plain_opt, enabled)) = &existing {
+        if *enabled {
+            if let Some(plain) = plain_opt {
+                if !plain.is_empty() {
+                    return Ok(plain.clone());
+                }
+            }
+        }
+    }
+
     let token = random_token(36);
     let token_hash = sha256_hex(token.as_bytes());
-    let mut c = db.get_conn().await?;
-    let existing: Option<u64> = c.exec_first("SELECT id FROM launcher_tokens WHERE user_id = :id LIMIT 1", params! {"id" => user_id}).await?;
-    if let Some(id) = existing {
-        c.exec_drop(
-            "UPDATE launcher_tokens SET name=:n, token_hash=:h, token_plain=:p, enabled=TRUE, created_at=:t WHERE id=:id",
-            params! {"n" => username, "h" => token_hash, "p" => &token, "t" => now(), "id" => id},
-        )
-        .await?;
-    } else {
-        c.exec_drop(
-            "INSERT INTO launcher_tokens (name,user_id,token_hash,token_plain,enabled,created_at) VALUES (:n,:u,:h,:p,TRUE,:t)",
-            params! {"n" => username, "u" => user_id, "h" => token_hash, "p" => &token, "t" => now()},
-        )
-        .await?;
+    match existing {
+        Some((id, _, _)) => {
+            c.exec_drop(
+                "UPDATE launcher_tokens SET name=:n, token_hash=:h, token_plain=:p, enabled=TRUE, created_at=:t WHERE id=:id",
+                params! {"n" => username, "h" => token_hash, "p" => &token, "t" => now(), "id" => id},
+            )
+            .await?;
+        }
+        None => {
+            c.exec_drop(
+                "INSERT INTO launcher_tokens (name,user_id,token_hash,token_plain,enabled,created_at) VALUES (:n,:u,:h,:p,TRUE,:t)",
+                params! {"n" => username, "u" => user_id, "h" => token_hash, "p" => &token, "t" => now()},
+            )
+            .await?;
+        }
     }
     Ok(token)
 }
