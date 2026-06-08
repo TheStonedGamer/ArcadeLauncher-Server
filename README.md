@@ -111,9 +111,15 @@ The admin UI can:
 
 - create, rotate, and delete named launcher/user bearer tokens
 - show library root, catalog paths, and per-platform game counts
-- trigger a catalog rescan
+- trigger a catalog rescan (async, with live per-platform hashing status)
 - sign in with username/email and password
 - request password reset links by email
+- require a user to change their password on next login (force-reset)
+
+Launcher clients additionally get account self-service against this server:
+`GET/POST /api/account` (profile), `/api/account/password` (change password),
+and `/api/account/totp/{setup,enable,disable}` (enable/disable TOTP, returns an
+`otpauth://` URI the client renders as a QR code).
 
 Launcher clients may authenticate with either `ARCADE_AUTH_TOKEN` or a named token created in the admin UI. Keep admin access LAN/VPN-only unless you add TLS and stronger authentication.
 
@@ -129,6 +135,31 @@ ARCADE_SMTP_TLS=1
 ```
 
 If SMTP is not configured, the reset page still creates a temporary reset URL and displays it after request. That fallback is for LAN/recovery use only.
+
+## Game Requests (companion service)
+
+Game requests are handled by a separate binary,
+[**ArcadeLauncher-Requests**](https://github.com/TheStonedGamer/ArcadeLauncher-Requests),
+that runs alongside this server. It lets logged-in launcher users request game
+releases they'd like added to the catalog, search IGDB to pick the exact
+release, and upvote each other's requests; admins triage the board
+(approve / fulfill / decline).
+
+It is intentionally decoupled from this server:
+
+- **Shares the same MariaDB and launcher accounts.** It authenticates against
+  this server's `admin_users` table (same usernames/passwords/TOTP) and reads
+  IGDB credentials from the same `server_settings` table — no duplicated
+  secrets. It owns only three tables (`game_requests`, `request_votes`,
+  `request_sessions`) and never modifies this server's tables.
+- **Runs on its own port** (`8723`) with its own session cookie.
+- **Emails the admin on each brand-new request** (fire-and-forget; configured
+  via its own `ARCADE_REQ_SMTP_*` / `ARCADE_REQ_NOTIFY_TO` env vars). Upvotes of
+  an existing request do not send mail.
+
+Because it shares the database, deploy it on the same host/CT as this server and
+point it at the same DB credentials. See the Requests repo's README for its full
+endpoint list and environment configuration.
 
 ## API
 

@@ -51,6 +51,39 @@ struct AppState {
     scan: Arc<std::sync::Mutex<ScanStatus>>,
     // username -> (nonce, expires_at) for single-use challenge-response login.
     challenges: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
+    // admin-login brute-force throttle: key -> (consecutive_failures, locked_until_epoch).
+    login_throttle: Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>>,
+}
+
+// Admin login lockout policy.
+const LOGIN_MAX_FAILURES: u32 = 5;
+const LOGIN_LOCKOUT_SECS: i64 = 300;
+
+impl AppState {
+    // Returns Some(seconds_remaining) if the key is currently locked out.
+    fn login_locked(&self, key: &str) -> Option<i64> {
+        let guard = self.login_throttle.lock().ok()?;
+        let (fails, until) = guard.get(key)?;
+        if *fails >= LOGIN_MAX_FAILURES && *until > now() {
+            Some(*until - now())
+        } else {
+            None
+        }
+    }
+    fn record_login_failure(&self, key: &str) {
+        if let Ok(mut g) = self.login_throttle.lock() {
+            let entry = g.entry(key.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            if entry.0 >= LOGIN_MAX_FAILURES {
+                entry.1 = now() + LOGIN_LOCKOUT_SECS;
+            }
+        }
+    }
+    fn clear_login_failures(&self, key: &str) {
+        if let Ok(mut g) = self.login_throttle.lock() {
+            g.remove(key);
+        }
+    }
 }
 
 // Live progress for the background catalog scan/hash/enrich task.
@@ -103,6 +136,7 @@ struct Config {
     admin_username: String,
     admin_email: String,
     admin_password: String,
+    admin_secure_cookie: bool,
     db_host: String,
     db_port: u16,
     db_name: String,
@@ -155,6 +189,7 @@ impl Config {
             admin_username: env_string("ARCADE_ADMIN_USERNAME", "admin"),
             admin_email: env_string("ARCADE_ADMIN_EMAIL", ""),
             admin_password: env_string("ARCADE_ADMIN_PASSWORD", ""),
+            admin_secure_cookie: env_string("ARCADE_ADMIN_SECURE_COOKIE", "false") == "true",
             db_host: env_string("ARCADE_DB_HOST", "127.0.0.1"),
             db_port: env_u16("ARCADE_DB_PORT", 3306),
             db_name: env_string("ARCADE_DB_NAME", "arcadelauncher"),
@@ -232,7 +267,25 @@ struct Manifest {
     igdb_id: u64,
     launch: Launch,
     files: Vec<ManifestFile>,
+    // Present for GameCube/Wii games that have a sibling `<rom>.textures.zip`
+    // custom-texture pack on the NAS. The client extracts it into Dolphin's
+    // Load/Textures folder. Omitted entirely when there is no pack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    texture_pack: Option<TexturePack>,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TexturePack {
+    size: u64,
+    sha256: String,
+    url: String,
+}
+
+// Reserved stored-manifest path marking the Dolphin texture-pack zip. It is
+// filtered out of the manifest's `files` (so the client never installs it into
+// the game root) and promoted to the `texture_pack` field instead.
+const TEXTURE_PACK_SENTINEL: &str = "::dolphin-texture-pack::";
 
 #[derive(Serialize)]
 struct ManifestFile {
@@ -321,11 +374,17 @@ async fn main() -> Result<()> {
         db,
         scan: Arc::new(std::sync::Mutex::new(ScanStatus::default())),
         challenges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        login_throttle: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let public_app = Router::new()
         .route("/api/login", post(api_login))
         .route("/api/auth/challenge", get(api_auth_challenge))
         .route("/api/auth/verify", post(api_auth_verify))
+        .route("/api/account", get(api_account))
+        .route("/api/account/password", post(api_account_password))
+        .route("/api/account/totp/setup", post(api_account_totp_setup))
+        .route("/api/account/totp/enable", post(api_account_totp_enable))
+        .route("/api/account/totp/disable", post(api_account_totp_disable))
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
@@ -333,6 +392,7 @@ async fn main() -> Result<()> {
         .route("/emulators/*rel", get(download_emulator))
         .route("/files/:id/*rel", get(download_file))
         .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
+        .route("/textures/:id", get(download_texture))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -412,6 +472,8 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT FALSE").await;
     // Password-derived shared key for client challenge-response auth (hex SHA-256).
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN auth_key CHAR(64) NULL").await;
+    // Admin can force a user to set a new password on next client login.
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS launcher_tokens (
           id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -518,7 +580,10 @@ async fn api_login(State(st): State<AppState>, Form(form): Form<LoginForm>) -> R
         Ok(Some(user)) if verify_password_any(&form.password, &user.password_hash)
             && verify_user_totp(&user, &form.totp_code) => {
             match issue_user_token(&st.db, user.id, &user.username).await {
-                Ok(token) => Json(serde_json::json!({"token": token, "username": user.username, "isAdmin": user.is_admin})).into_response(),
+                Ok(token) => {
+                    let must_change = user_must_change_password(&st.db, user.id).await;
+                    Json(serde_json::json!({"token": token, "username": user.username, "isAdmin": user.is_admin, "mustChangePassword": must_change})).into_response()
+                }
                 Err(e) => server_error(e),
             }
         }
@@ -621,12 +686,161 @@ async fn api_auth_verify(State(st): State<AppState>, Form(form): Form<VerifyForm
     let mut iv = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut iv);
     let ciphertext = hmac_ctr_xor(&key_bytes, &iv, token.as_bytes());
+    let must_change = user_must_change_password(&st.db, user.id).await;
     Json(serde_json::json!({
         "iv": hex::encode(iv),
         "token": hex::encode(ciphertext),
         "username": user.username,
         "isAdmin": user.is_admin,
+        "mustChangePassword": must_change,
     })).into_response()
+}
+
+#[derive(Deserialize)]
+struct PasswordChangeForm {
+    #[serde(alias = "currentPassword", alias = "current_password")]
+    current_password: String,
+    #[serde(alias = "newPassword", alias = "new_password")]
+    new_password: String,
+}
+
+#[derive(Deserialize)]
+struct TotpSetupForm {
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct TotpEnableForm {
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct TotpDisableForm {
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    code: String,
+}
+
+// GET /api/account — current launcher account state for the client UI.
+async fn api_account(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
+    };
+    let must_change = user_must_change_password(&st.db, user.id).await;
+    Json(serde_json::json!({
+        "username": user.username,
+        "email": user.email,
+        "isAdmin": user.is_admin,
+        "totpEnabled": user.totp_enabled,
+        "mustChangePassword": must_change,
+    }))
+    .into_response()
+}
+
+// POST /api/account/password — change own password. Verifies the current
+// password, updates the Argon2 hash + the challenge-response auth_key, and
+// clears any admin-forced must_change flag.
+async fn api_account_password(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<PasswordChangeForm>) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
+    };
+    if !verify_password_any(&form.current_password, &user.password_hash) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "current password is incorrect"}))).into_response();
+    }
+    if form.new_password.len() < 10 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password must be at least 10 characters"}))).into_response();
+    }
+    let hash = match hash_password_argon2(&form.new_password) {
+        Ok(h) => h,
+        Err(e) => return server_error(e),
+    };
+    let auth_key = derive_auth_key(&user.username, &form.new_password);
+    let mut c = match st.db.get_conn().await { Ok(c) => c, Err(e) => return server_error(e) };
+    if let Err(e) = c.exec_drop(
+        "UPDATE admin_users SET password_hash=:p, auth_key=:k, must_change_password=FALSE WHERE id=:id",
+        params! {"p" => hash, "k" => auth_key, "id" => user.id},
+    ).await {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+// POST /api/account/totp/setup — begin enrolling an authenticator. Requires the
+// account password, generates a fresh secret (stored but NOT yet enabled), and
+// returns the base32 secret + otpauth URI so the client can render a QR code.
+async fn api_account_totp_setup(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<TotpSetupForm>) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
+    };
+    if !verify_password_any(&form.password, &user.password_hash) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "password is incorrect"}))).into_response();
+    }
+    let mut secret = [0u8; 20];
+    rand::thread_rng().fill_bytes(&mut secret);
+    let encoded = base32_encode(&secret);
+    let mut c = match st.db.get_conn().await { Ok(c) => c, Err(e) => return server_error(e) };
+    // Store the pending secret but keep 2FA disabled until the user confirms a
+    // code, so a half-finished enrollment never locks them out.
+    if let Err(e) = c.exec_drop(
+        "UPDATE admin_users SET totp_secret=:s, totp_enabled=FALSE WHERE id=:id",
+        params! {"s" => &encoded, "id" => user.id},
+    ).await {
+        return server_error(e);
+    }
+    let account = if user.email.is_empty() { user.username.clone() } else { user.email.clone() };
+    let uri = format!(
+        "otpauth://totp/ArcadeLauncher:{}?secret={}&issuer=ArcadeLauncher&algorithm=SHA1&digits=6&period=30",
+        urlencoding::encode(&account),
+        encoded
+    );
+    Json(serde_json::json!({"secret": encoded, "otpauthUri": uri})).into_response()
+}
+
+// POST /api/account/totp/enable — confirm enrollment by verifying a code
+// against the pending secret, then flip 2FA on.
+async fn api_account_totp_enable(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<TotpEnableForm>) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
+    };
+    let Some(secret) = user.totp_secret.as_deref() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "no pending 2FA enrollment; start setup first"}))).into_response();
+    };
+    // Verify the code against the pending secret directly (the user row still has
+    // totp_enabled=false, so verify_user_totp would short-circuit to true).
+    let digits: String = form.code.chars().filter(|c| c.is_ascii_digit()).collect();
+    let now_step = now() / 30;
+    let ok = digits.len() == 6 && [now_step - 1, now_step, now_step + 1].iter().any(|step| {
+        matches!(totp_code(secret, *step as u64), Ok(expected) if expected == digits)
+    });
+    if !ok {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "incorrect code"}))).into_response();
+    }
+    let mut c = match st.db.get_conn().await { Ok(c) => c, Err(e) => return server_error(e) };
+    if let Err(e) = c.exec_drop(
+        "UPDATE admin_users SET totp_enabled=TRUE WHERE id=:id",
+        params! {"id" => user.id},
+    ).await {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+// POST /api/account/totp/disable — turn 2FA off after verifying either the
+// account password or a current TOTP code.
+async fn api_account_totp_disable(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<TotpDisableForm>) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
+    };
+    let by_password = !form.password.is_empty() && verify_password_any(&form.password, &user.password_hash);
+    let by_code = user.totp_enabled && verify_user_totp(&user, &form.code);
+    if !by_password && !by_code {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "provide your password or a current 2FA code"}))).into_response();
+    }
+    if let Err(e) = disable_user_totp(&st.db, user.id).await {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 async fn user_auth_key(db: &Pool, user_id: u64) -> Result<Option<String>> {
@@ -740,6 +954,36 @@ async fn download_chunk(
     }
 }
 
+// Serve the optional Dolphin custom-texture pack for a GameCube/Wii game as a
+// single resumable ranged GET. The pack lives next to the ROM as
+// `<rom-stem>.textures.zip`; its hash/size are advertised in the manifest's
+// `texture_pack` field. The client extracts it into Dolphin's Load/Textures.
+async fn download_texture(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if !authorized_api(&st, &headers).await {
+        return unauthorized();
+    }
+    let game = match find_game(&st.db, &id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return (StatusCode::NOT_FOUND, "game not found").into_response(),
+        Err(e) => return server_error(e),
+    };
+    let path = match texture_pack_path(&st.cfg, &game).await {
+        Some(p) => p,
+        None => {
+            warn!("download_texture: no texture pack for {}", game.id);
+            return (StatusCode::NOT_FOUND, "no texture pack for this game; ask the admin to rescan the catalog").into_response();
+        }
+    };
+    match stream_file(path, headers.get(header::RANGE)).await {
+        Ok(r) => r,
+        Err(e) => server_error(e),
+    }
+}
+
 async fn admin_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
     match current_admin(&st.db, &headers).await {
         Ok(Some(admin)) => Html(admin_html(&st, Some(admin), "", "", "").await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
@@ -803,13 +1047,22 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
     if form.action == "login" {
         let username = form.username.unwrap_or_default();
         let password = form.password.unwrap_or_default();
+        let throttle_key = username.trim().to_lowercase();
+        if let Some(secs) = st.login_locked(&throttle_key) {
+            return Html(login_html(&format!(
+                "Too many failed attempts. Try again in {} seconds.",
+                secs.max(1)
+            )))
+            .into_response();
+        }
         match find_user(&st.db, &username).await {
             Ok(Some(user)) if user.is_admin && verify_password_any(&password, &user.password_hash)
                 && verify_user_totp(&user, form.totp_code.as_deref().unwrap_or("")) => {
+                st.clear_login_failures(&throttle_key);
                 match create_session(&st.db, user.id).await {
                     Ok(token) => {
                         let mut r = Redirect::to("/admin").into_response();
-                        if let Ok(cookie) = HeaderValue::from_str(&session_cookie_value(&token)) {
+                        if let Ok(cookie) = HeaderValue::from_str(&session_cookie_value(&token, st.cfg.admin_secure_cookie)) {
                             r.headers_mut().insert(header::SET_COOKIE, cookie);
                         }
                         r
@@ -817,7 +1070,10 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     Err(e) => server_error(e),
                 }
             }
-            _ => Html(login_html("Invalid username, password, or 2FA code.")).into_response(),
+            _ => {
+                st.record_login_failure(&throttle_key);
+                Html(login_html("Invalid username, password, or 2FA code.")).into_response()
+            }
         }
     } else {
         let admin = match current_admin(&st.db, &headers).await {
@@ -854,6 +1110,12 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             },
             "disable_totp" => match form.user_id {
                 Some(id) => disable_user_totp(&st.db, id).await.map(|_| "Disabled 2FA.".to_string()).unwrap_or_else(|e| e.to_string()),
+                None => "missing user id".to_string(),
+            },
+            "force_password_change" => match form.user_id {
+                Some(id) => set_must_change_password(&st.db, id, true).await
+                    .map(|_| "User must set a new password on next sign-in.".to_string())
+                    .unwrap_or_else(|e| e.to_string()),
                 None => "missing user id".to_string(),
             },
             "rescan" => spawn_rescan(&st),
@@ -927,6 +1189,44 @@ async fn find_user(db: &Pool, key: &str) -> Result<Option<User>> {
         )
         .await?;
     Ok(row.map(user_from_row))
+}
+
+async fn find_user_by_id(db: &Pool, id: u64) -> Result<Option<User>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<Row> = c
+        .exec_first(
+            "SELECT id, username, email, password_hash, is_admin, enabled, totp_secret, totp_enabled FROM admin_users WHERE id = :id LIMIT 1",
+            params! {"id" => id},
+        )
+        .await?;
+    Ok(row.map(user_from_row))
+}
+
+// Resolve the launcher account behind a Bearer token. Unlike `authorized_api`
+// (which also accepts the static service token), account endpoints require a
+// real per-user token so they can act on that user's row.
+async fn launcher_user(st: &AppState, headers: &HeaderMap) -> Option<User> {
+    let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    let token = auth.strip_prefix("Bearer ").map(str::trim)?;
+    let hash = sha256_hex(token.as_bytes());
+    let mut c = st.db.get_conn().await.ok()?;
+    let uid: Option<u64> = c
+        .exec_first(
+            "SELECT user_id FROM launcher_tokens WHERE token_hash=:h AND enabled=TRUE LIMIT 1",
+            params! {"h" => hash},
+        )
+        .await
+        .ok()
+        .flatten();
+    find_user_by_id(&st.db, uid?).await.ok().flatten()
+}
+
+async fn user_must_change_password(db: &Pool, id: u64) -> bool {
+    let Ok(mut c) = db.get_conn().await else { return false; };
+    let row: Result<Option<bool>, _> = c
+        .exec_first("SELECT must_change_password FROM admin_users WHERE id=:id", params! {"id" => id})
+        .await;
+    row.ok().flatten().unwrap_or(false)
 }
 
 async fn list_users(db: &Pool) -> Result<Vec<User>> {
@@ -1223,8 +1523,27 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
         }
     };
 
+    // Split off the texture-pack sentinel (if any) so it never enters the
+    // installable file list and `file_index` stays aligned with /chunks.
+    let mut texture_pack = None;
+    let real_files: Vec<&StoredFile> = stored
+        .iter()
+        .filter(|sf| {
+            if sf.path == TEXTURE_PACK_SENTINEL {
+                texture_pack = Some(TexturePack {
+                    size: sf.size,
+                    sha256: sf.sha256.clone(),
+                    url: format!("{}/textures/{}", base, urlencoding::encode(&game.id)),
+                });
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     let mut manifest_files = Vec::new();
-    for (file_index, sf) in stored.iter().enumerate() {
+    for (file_index, sf) in real_files.iter().enumerate() {
         let rel = sf.path.clone();
         let chunks = sf
             .chunks
@@ -1265,6 +1584,7 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
         igdb_id: game.igdb_id,
         launch: game.launch.clone(),
         files: manifest_files,
+        texture_pack,
     })
 }
 
@@ -1300,6 +1620,20 @@ async fn compute_stored_files(cfg: &Config, game: &Game) -> Result<Vec<StoredFil
     // buffer_unordered yields in completion order; sort by path so file_index is
     // deterministic across rescans.
     out.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Append an optional Dolphin texture pack as a sentinel entry. It is hashed
+    // here (during scan) so manifest requests stay instant, and promoted to the
+    // manifest's `texture_pack` field rather than the installable file list.
+    if let Some(tp) = texture_pack_path(cfg, game).await {
+        let _permit = hash_semaphore().acquire().await.expect("hash semaphore closed");
+        let rel_root = tp.parent().unwrap_or(&cfg.library_root).to_path_buf();
+        let mut sf = tokio::task::spawn_blocking(move || hash_file_blocking(&tp, &rel_root))
+            .await
+            .map_err(|e| anyhow!("texture-pack hash task panicked: {e}"))??;
+        sf.path = TEXTURE_PACK_SENTINEL.to_string();
+        sf.chunks.clear(); // served as one ranged GET via /textures/<id>, not /chunks
+        out.push(sf);
+    }
     Ok(out)
 }
 
@@ -1458,6 +1792,25 @@ async fn content_path_for(cfg: &Config, game: &Game) -> Result<PathBuf> {
     safe_join(&cfg.library_root, &game.content_path)
 }
 
+// Locate an optional Dolphin custom-texture pack for a GameCube/Wii game. The
+// convention is a zip sitting next to the ROM, named `<rom-stem>.textures.zip`
+// (e.g. `Metroid Prime.iso` -> `Metroid Prime.textures.zip`). Returns the path
+// only when the file exists on disk.
+async fn texture_pack_path(cfg: &Config, game: &Game) -> Option<PathBuf> {
+    if game.platform != "GameCube" && game.platform != "Wii" {
+        return None;
+    }
+    let content = content_path_for(cfg, game).await.ok()?;
+    let dir = content.parent()?;
+    let stem = content.file_stem()?.to_str()?;
+    let candidate = dir.join(format!("{stem}.textures.zip"));
+    if fs::metadata(&candidate).await.ok()?.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 async fn file_path_for(cfg: &Config, game: &Game, rel: &str) -> Result<PathBuf> {
     let root = content_path_for(cfg, game).await?;
     if fs::metadata(&root).await?.is_file() {
@@ -1597,6 +1950,39 @@ async fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+// Resolve a relative path (e.g. "Nintendo/Gamecube") under `root` matching each
+// component case-insensitively. The production server runs on a case-sensitive
+// Linux filesystem, so a folder named "GameCube" on disk would not match a
+// hard-coded "Gamecube" spec. Returns the real on-disk path if every component
+// resolves, else None.
+async fn resolve_subdir_ci(root: &Path, relative: &str) -> Option<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.split('/').filter(|c| !c.is_empty()) {
+        // Fast path: exact match exists.
+        let exact = current.join(component);
+        if fs::metadata(&exact).await.is_ok() {
+            current = exact;
+            continue;
+        }
+        // Slow path: scan the directory for a case-insensitive match.
+        let mut rd = match fs::read_dir(&current).await {
+            Ok(rd) => rd,
+            Err(_) => return None,
+        };
+        let mut matched: Option<PathBuf> = None;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.eq_ignore_ascii_case(component) {
+                    matched = Some(entry.path());
+                    break;
+                }
+            }
+        }
+        current = matched?;
+    }
+    Some(current)
 }
 
 async fn walk_dirs(root: &Path) -> Result<Vec<PathBuf>> {
@@ -1882,6 +2268,15 @@ async fn disable_user_totp(db: &Pool, user_id: u64) -> Result<()> {
     Ok(())
 }
 
+async fn set_must_change_password(db: &Pool, user_id: u64, value: bool) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        "UPDATE admin_users SET must_change_password=:v WHERE id=:id",
+        params! {"v" => value, "id" => user_id},
+    ).await?;
+    Ok(())
+}
+
 fn verify_scrypt(password: &str, stored: &str) -> bool {
     let parts: Vec<&str> = stored.split('$').collect();
     if parts.len() != 4 || parts[0] != "scrypt" {
@@ -1931,8 +2326,9 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-fn session_cookie_value(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}")
+fn session_cookie_value(token: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}; Max-Age={SESSION_TTL_SECONDS}")
 }
 
 fn base_url(headers: &HeaderMap, cfg: &Config) -> String {
@@ -2424,10 +2820,9 @@ async fn scan_single_file_platforms(library_root: &Path) -> Result<Vec<Game>> {
     let mut out = Vec::new();
     let games_root = library_root.join("games");
     for (relative_dir, platform, extensions) in specs {
-        let platform_root = games_root.join(relative_dir);
-        if fs::metadata(&platform_root).await.is_err() {
+        let Some(platform_root) = resolve_subdir_ci(&games_root, relative_dir).await else {
             continue;
-        }
+        };
         let allowed: HashSet<&str> = extensions.iter().copied().collect();
         for path in walk_files(&platform_root).await? {
             let suffix = file_ext(&path);
@@ -2925,7 +3320,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
             let action = if u.totp_enabled { "disable_totp" } else { "enable_totp" };
             let label = if u.totp_enabled { "Disable 2FA" } else { "Enable 2FA" };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method='post' class='inline'><input type='hidden' name='user_id' value='{}'><button name='action' value='{}'>{}</button></form></td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method='post' class='inline'><input type='hidden' name='user_id' value='{}'><button name='action' value='{}'>{}</button><button name='action' value='force_password_change'>Require password change</button></form></td></tr>",
                 esc(&u.username), esc(&u.email), if u.is_admin { "Admin" } else { "Client" }, if u.enabled { "Enabled" } else { "Disabled" }, twofa, u.id, action, label
             )
         })
