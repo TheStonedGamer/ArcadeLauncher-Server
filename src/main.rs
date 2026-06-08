@@ -96,6 +96,7 @@ struct Config {
     admin_host: String,
     admin_port: u16,
     library_root: PathBuf,
+    auto_rescan_secs: u64,
     auth_token: String,
     admin_username: String,
     admin_email: String,
@@ -147,6 +148,7 @@ impl Config {
             admin_host,
             admin_port,
             library_root,
+            auto_rescan_secs: env_u64("ARCADE_AUTO_RESCAN_SECS", 1800),
             auth_token: env_string("ARCADE_AUTH_TOKEN", ""),
             admin_username: env_string("ARCADE_ADMIN_USERNAME", "admin"),
             admin_email: env_string("ARCADE_ADMIN_EMAIL", ""),
@@ -332,6 +334,7 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    let auto_rescan_state = state.clone();
     let admin_app = Router::new()
         .route("/", get(admin_page))
         .route("/admin", get(admin_page).post(admin_post))
@@ -349,6 +352,25 @@ async fn main() -> Result<()> {
     info!("ArcadeLauncher admin listening on http://{}", admin_addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+    // Periodic auto-rescan so moving/renaming folders can't leave stale catalog
+    // rows for long. spawn_rescan() no-ops while a scan is already running, so an
+    // in-progress manual rescan is never disturbed. 0 disables the timer.
+    if auto_rescan_state.cfg.auto_rescan_secs > 0 {
+        let st = auto_rescan_state;
+        let period = st.cfg.auto_rescan_secs;
+        info!("auto-rescan enabled every {}s", period);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period));
+            // Skip the immediate first tick so startup isn't slammed with a scan.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let msg = spawn_rescan(&st);
+                info!("auto-rescan tick: {msg}");
+            }
+        });
+    }
+
     let public_server = axum::serve(listener, public_app);
     let admin_server = axum::serve(admin_listener, admin_app);
     tokio::try_join!(public_server, admin_server)?;
@@ -1969,6 +1991,10 @@ fn env_string(name: &str, default: &str) -> String {
 }
 
 fn env_u16(name: &str, default: u16) -> u16 {
+    env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 

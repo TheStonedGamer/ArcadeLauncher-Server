@@ -25,7 +25,12 @@ rendered via `format!` (literal braces are doubled `{{`/`}}`). Read
 ## Important behaviors
 - **Game IDs**: `<platform_lower>-<sha1_short(relative_path)>` (`stable_id`).
   Renaming a platform changes IDs; `sync_catalog_db` **prunes orphan rows** not
-  present in a fresh scan, so a manual rescan clears stale entries.
+  present in a fresh scan, so a rescan clears stale entries.
+- **Auto-rescan**: a background tokio task runs `spawn_rescan` every
+  `ARCADE_AUTO_RESCAN_SECS` (default 1800; `0` disables). It no-ops while a scan
+  is already running (the `st.scan` guard), so manual rescans are never
+  disturbed. This means moved/renamed folders self-heal within one interval —
+  stale catalog rows can't linger indefinitely.
 - `rescan_catalog` order: scan → `sync_catalog_db` (prunes) → `ensure_manifests`
   (hashing; per-platform progress reported to the admin scan-status UI; hash
   errors are logged, don't abort) → IGDB enrich.
@@ -41,7 +46,8 @@ rendered via `format!` (literal braces are doubled `{{`/`}}`). Read
   fix was removing those two headers from the site config and reloading nginx.
 
 ## Conventions
-- The user runs scans/rescans **manually** — do not trigger them.
+- Rescans run automatically on an interval (see Auto-rescan above) and can also
+  be kicked manually from the admin UI.
 - Catalog content paths are stored **relative** to the library root; never store
   absolute NAS/server paths.
 - Do not read production `*.env` files or query MariaDB for credentials/tokens
