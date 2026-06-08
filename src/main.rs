@@ -640,7 +640,25 @@ async fn api_manifest(State(st): State<AppState>, headers: HeaderMap, AxumPath(i
     };
     match manifest_for(&st, &headers, &game).await {
         Ok(m) => Json(m).into_response(),
-        Err(e) => server_error(e),
+        Err(e) => {
+            // A stale catalog row whose files moved/were deleted surfaces as an
+            // io NotFound while hashing on demand. Return a clear 404 (not a raw
+            // 500) so the client can tell the user to ask for a rescan.
+            if e.downcast_ref::<std::io::Error>()
+                .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false)
+            {
+                warn!("manifest_for: content missing on disk for {} -> {e}", game.id);
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "game files are missing on the server; ask the admin to rescan the catalog"
+                    })),
+                )
+                    .into_response();
+            }
+            server_error(e)
+        }
     }
 }
 
