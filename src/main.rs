@@ -10,7 +10,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use bytes::Bytes;
 use cookie::Cookie;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use mysql_async::{params, prelude::Queryable, Pool, Row};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
@@ -1250,40 +1250,87 @@ async fn compute_stored_files(cfg: &Config, game: &Game) -> Result<Vec<StoredFil
     } else {
         (walk_files(&root).await?, root.clone())
     };
-    let mut out = Vec::new();
-    for path in files {
-        let rel = path.strip_prefix(&rel_root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-        let meta = fs::metadata(&path).await?;
-        let size = meta.len();
-        let mut file = File::open(&path).await?;
-        let mut file_hasher = Sha256::new();
-        let mut chunks = Vec::new();
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut offset = 0u64;
-        let mut index = 0usize;
-        while offset < size {
-            let want = ((size - offset).min(CHUNK_SIZE as u64)) as usize;
-            file.read_exact(&mut buf[..want]).await?;
-            file_hasher.update(&buf[..want]);
-            let mut ch = Sha256::new();
-            ch.update(&buf[..want]);
-            chunks.push(StoredChunk {
-                index,
-                offset,
-                size: want as u64,
-                sha256: hex::encode(ch.finalize()),
-            });
-            offset += want as u64;
-            index += 1;
+    // Hash files in parallel across blocking threads. SHA-256 over many GB is
+    // CPU-bound, so we fan out one spawn_blocking task per file instead of
+    // hashing every file serially on one core. A process-wide semaphore
+    // (`hash_semaphore`) caps the total in-flight hashes to the host's
+    // parallelism, so this composes safely with the game-level fan-out in
+    // `ensure_manifests` without oversubscribing the CPU.
+    let concurrency = hash_concurrency();
+    let mut out: Vec<StoredFile> = futures_util::stream::iter(files.into_iter().map(|path| {
+        let rel_root = rel_root.clone();
+        async move {
+            let _permit = hash_semaphore().acquire().await.expect("hash semaphore closed");
+            tokio::task::spawn_blocking(move || hash_file_blocking(&path, &rel_root))
+                .await
+                .map_err(|e| anyhow!("hash task panicked: {e}"))?
         }
-        out.push(StoredFile {
-            path: rel,
-            size,
-            sha256: hex::encode(file_hasher.finalize()),
-            chunks,
-        });
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .try_collect()
+    .await?;
+    // buffer_unordered yields in completion order; sort by path so file_index is
+    // deterministic across rescans.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+// Number of files to hash concurrently. Capped so a giant single library scan
+// can't oversubscribe the box; falls back to 4 if parallelism is unknown.
+fn hash_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+// Process-wide cap on concurrent file hashes. Shared by the per-file fan-out in
+// `compute_stored_files` and the per-game fan-out in `ensure_manifests` so the
+// two nested layers never schedule more CPU-bound hashes than the box has cores.
+fn hash_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(hash_concurrency()))
+}
+
+// Synchronous single-file hash: full-file sha256 plus per-chunk sha256 in one
+// sequential read pass. Runs inside spawn_blocking so it never stalls the async
+// runtime. Missing files surface as io::Error(NotFound), which callers map to a
+// 404 "rescan" hint rather than a 500.
+fn hash_file_blocking(path: &Path, rel_root: &Path) -> Result<StoredFile> {
+    use std::io::Read;
+    let rel = path
+        .strip_prefix(rel_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut file_hasher = Sha256::new();
+    let mut chunks = Vec::new();
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut offset = 0u64;
+    let mut index = 0usize;
+    while offset < size {
+        let want = ((size - offset).min(CHUNK_SIZE as u64)) as usize;
+        file.read_exact(&mut buf[..want])?;
+        file_hasher.update(&buf[..want]);
+        let mut ch = Sha256::new();
+        ch.update(&buf[..want]);
+        chunks.push(StoredChunk {
+            index,
+            offset,
+            size: want as u64,
+            sha256: hex::encode(ch.finalize()),
+        });
+        offset += want as u64;
+        index += 1;
+    }
+    Ok(StoredFile {
+        path: rel,
+        size,
+        sha256: hex::encode(file_hasher.finalize()),
+        chunks,
+    })
 }
 
 async fn load_stored_manifest(db: &Pool, game_id: &str, version: &str) -> Result<Option<Vec<StoredFile>>> {
@@ -1327,25 +1374,31 @@ async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
         s.message = "Generating file hashes…".to_string();
         s.per_platform = platform_totals.clone();
     });
-    for game in games {
-        st.set_scan(|s| { s.current = game.title.clone(); });
-        match load_stored_manifest(&st.db, &game.id, &game.version).await {
-            Ok(Some(_)) => {}
-            _ => match compute_stored_files(&st.cfg, game).await {
-                Ok(files) => {
-                    if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
-                        error!("failed to persist manifest for {}: {e}", game.id);
+    // Hash games concurrently. The shared `hash_semaphore` bounds total CPU work,
+    // so single-file ISOs (one file each) still saturate every core because
+    // multiple games hash at once, while multi-file repacks fan out internally.
+    let game_concurrency = hash_concurrency();
+    futures_util::stream::iter(games.iter())
+        .for_each_concurrent(game_concurrency, |game| async move {
+            st.set_scan(|s| { s.current = game.title.clone(); });
+            match load_stored_manifest(&st.db, &game.id, &game.version).await {
+                Ok(Some(_)) => {}
+                _ => match compute_stored_files(&st.cfg, game).await {
+                    Ok(files) => {
+                        if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
+                            error!("failed to persist manifest for {}: {e}", game.id);
+                        }
                     }
-                }
-                Err(e) => error!("failed to hash files for {}: {e}", game.id),
-            },
-        }
-        let platform = game.platform.clone();
-        st.set_scan(|s| {
-            s.processed += 1;
-            s.per_platform.entry(platform).or_default().processed += 1;
-        });
-    }
+                    Err(e) => error!("failed to hash files for {}: {e}", game.id),
+                },
+            }
+            let platform = game.platform.clone();
+            st.set_scan(|s| {
+                s.processed += 1;
+                s.per_platform.entry(platform).or_default().processed += 1;
+            });
+        })
+        .await;
     // Drop stale manifests for games no longer present.
     let ids: HashSet<&str> = games.iter().map(|g| g.id.as_str()).collect();
     let mut c = st.db.get_conn().await?;
