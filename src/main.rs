@@ -35,7 +35,7 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const SESSION_COOKIE: &str = "AL_ADMIN_SESSION";
@@ -48,6 +48,45 @@ const PUBLIC_BASE_URL_KEY: &str = "server.public_base_url";
 struct AppState {
     cfg: Arc<Config>,
     db: Pool,
+    scan: Arc<std::sync::Mutex<ScanStatus>>,
+    // username -> (nonce, expires_at) for single-use challenge-response login.
+    challenges: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
+}
+
+// Live progress for the background catalog scan/hash/enrich task.
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ScanStatus {
+    running: bool,
+    phase: String, // idle | scanning | hashing | igdb | done | error
+    message: String,
+    total: usize,
+    processed: usize,
+    current: String,
+    started_at: i64, // epoch seconds when the current/last run began (0 = never)
+    updated_at: i64, // epoch seconds of the last progress update
+    #[serde(default)]
+    per_platform: BTreeMap<String, PlatformProgress>, // hashing progress per platform
+}
+
+// Per-platform hashing progress, surfaced live in the admin scan-status UI.
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlatformProgress {
+    total: usize,
+    processed: usize,
+}
+
+impl AppState {
+    fn set_scan<F: FnOnce(&mut ScanStatus)>(&self, f: F) {
+        if let Ok(mut s) = self.scan.lock() {
+            f(&mut s);
+            s.updated_at = now();
+        }
+    }
+    fn scan_snapshot(&self) -> ScanStatus {
+        self.scan.lock().map(|s| s.clone()).unwrap_or_default()
+    }
 }
 
 #[derive(Clone)]
@@ -212,6 +251,24 @@ struct ManifestChunk {
     url: String,
 }
 
+// Precomputed, URL-free manifest data persisted in `game_manifests` during scan.
+// URLs depend on the request's Host header, so they are filled in at request time.
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredChunk {
+    index: usize,
+    offset: u64,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredFile {
+    path: String,
+    size: u64,
+    sha256: String,
+    chunks: Vec<StoredChunk>,
+}
+
 #[derive(Deserialize)]
 struct LoginForm {
     username: String,
@@ -255,9 +312,16 @@ async fn main() -> Result<()> {
     ensure_schema(&db).await?;
     ensure_bootstrap_admin(&db, &cfg).await?;
 
-    let state = AppState { cfg: cfg.clone(), db };
+    let state = AppState {
+        cfg: cfg.clone(),
+        db,
+        scan: Arc::new(std::sync::Mutex::new(ScanStatus::default())),
+        challenges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
     let public_app = Router::new()
         .route("/api/login", post(api_login))
+        .route("/api/auth/challenge", get(api_auth_challenge))
+        .route("/api/auth/verify", post(api_auth_verify))
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
@@ -274,6 +338,7 @@ async fn main() -> Result<()> {
         .route("/admin/metadata", get(admin_metadata_page).post(admin_metadata_post))
         .route("/admin/login", get(admin_page).post(admin_post))
         .route("/admin/logout", get(admin_logout))
+        .route("/admin/scan-status", get(admin_scan_status))
         .route("/art/:id", get(download_art))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -321,6 +386,8 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT TRUE").await;
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN totp_secret VARCHAR(64) NULL").await;
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT FALSE").await;
+    // Password-derived shared key for client challenge-response auth (hex SHA-256).
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN auth_key CHAR(64) NULL").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS launcher_tokens (
           id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -388,6 +455,15 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_manifests (
+          game_id VARCHAR(96) NOT NULL PRIMARY KEY,
+          version VARCHAR(80) NOT NULL,
+          files_json LONGTEXT NOT NULL,
+          updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -399,9 +475,10 @@ async fn ensure_bootstrap_admin(db: &Pool, cfg: &Config) -> Result<()> {
     let count: Option<u64> = c.query_first("SELECT COUNT(*) FROM admin_users").await?;
     if count.unwrap_or(0) == 0 {
         let hash = hash_password_argon2(&cfg.admin_password)?;
+        let auth_key = derive_auth_key(&cfg.admin_username, &cfg.admin_password);
         c.exec_drop(
-            "INSERT INTO admin_users (username,email,password_hash,is_admin,enabled,created_at) VALUES (:u,:e,:p,TRUE,TRUE,:t)",
-            params! {"u" => &cfg.admin_username, "e" => &cfg.admin_email, "p" => hash, "t" => now()},
+            "INSERT INTO admin_users (username,email,password_hash,is_admin,enabled,created_at,auth_key) VALUES (:u,:e,:p,TRUE,TRUE,:t,:k)",
+            params! {"u" => &cfg.admin_username, "e" => &cfg.admin_email, "p" => hash, "t" => now(), "k" => auth_key},
         )
         .await?;
     }
@@ -423,6 +500,117 @@ async fn api_login(State(st): State<AppState>, Form(form): Form<LoginForm>) -> R
         }
         _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid username, password, or 2FA code"}))).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct ChallengeQuery {
+    username: String,
+}
+
+#[derive(Deserialize)]
+struct VerifyForm {
+    username: String,
+    proof: String,
+    #[serde(default, alias = "totpCode")]
+    totp_code: String,
+}
+
+// Password-derived shared secret, identical on client and server.
+// key = SHA-256( lowercase(username) || 0x1f || password )
+fn derive_auth_key(username: &str, password: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(username.trim().to_lowercase().as_bytes());
+    h.update([0x1fu8]);
+    h.update(password.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("hmac key");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+// HMAC-SHA256 counter-mode keystream XOR. Symmetric: encrypt == decrypt.
+fn hmac_ctr_xor(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut counter: u32 = 0;
+    let mut block: Vec<u8> = Vec::new();
+    let mut bi = 32usize;
+    for &b in data {
+        if bi >= 32 {
+            let mut msg = Vec::with_capacity(iv.len() + 4);
+            msg.extend_from_slice(iv);
+            msg.extend_from_slice(&counter.to_be_bytes());
+            block = hmac_sha256(key, &msg);
+            counter = counter.wrapping_add(1);
+            bi = 0;
+        }
+        out.push(b ^ block[bi]);
+        bi += 1;
+    }
+    out
+}
+
+async fn api_auth_challenge(State(st): State<AppState>, Query(q): Query<ChallengeQuery>) -> Response {
+    let nonce = random_token(24);
+    let username = q.username.trim().to_lowercase();
+    if let Ok(mut map) = st.challenges.lock() {
+        let cutoff = now();
+        map.retain(|_, (_, exp)| *exp > cutoff);
+        map.insert(username, (nonce.clone(), now() + 120));
+    }
+    Json(serde_json::json!({"nonce": nonce})).into_response()
+}
+
+async fn api_auth_verify(State(st): State<AppState>, Form(form): Form<VerifyForm>) -> Response {
+    let username = form.username.trim().to_lowercase();
+    // Pop the nonce (single use).
+    let nonce = match st.challenges.lock() {
+        Ok(mut map) => match map.remove(&username) {
+            Some((n, exp)) if exp > now() => n,
+            _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "challenge expired; request a new one"}))).into_response(),
+        },
+        Err(_) => return server_error(anyhow!("challenge store poisoned")),
+    };
+    let user = match find_user(&st.db, &form.username).await {
+        Ok(Some(u)) => u,
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials"}))).into_response(),
+    };
+    let auth_key_hex = match user_auth_key(&st.db, user.id).await {
+        Ok(Some(k)) if !k.is_empty() => k,
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "challenge-response not available for this account; use password login"}))).into_response(),
+    };
+    let Ok(key_bytes) = hex::decode(&auth_key_hex) else {
+        return server_error(anyhow!("corrupt auth key"));
+    };
+    let expected = hex::encode(hmac_sha256(&key_bytes, nonce.as_bytes()));
+    if !constant_eq(expected.as_bytes(), form.proof.trim().as_bytes()) || !verify_user_totp(&user, &form.totp_code) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials or 2FA code"}))).into_response();
+    }
+    let token = match issue_user_token(&st.db, user.id, &user.username).await {
+        Ok(t) => t,
+        Err(e) => return server_error(e),
+    };
+    // Encrypt the token so it never travels in cleartext: HMAC-CTR keyed by the
+    // password-derived secret, with a fresh random IV per response.
+    let mut iv = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut iv);
+    let ciphertext = hmac_ctr_xor(&key_bytes, &iv, token.as_bytes());
+    Json(serde_json::json!({
+        "iv": hex::encode(iv),
+        "token": hex::encode(ciphertext),
+        "username": user.username,
+        "isAdmin": user.is_admin,
+    })).into_response()
+}
+
+async fn user_auth_key(db: &Pool, user_id: u64) -> Result<Option<String>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<Option<String>> = c
+        .exec_first("SELECT auth_key FROM admin_users WHERE id=:id", params! {"id" => user_id})
+        .await?;
+    Ok(row.flatten())
 }
 
 async fn api_catalog(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -473,6 +661,10 @@ async fn download_file(
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    if !fs::metadata(&file_path).await.map(|m| m.is_file()).unwrap_or(false) {
+        warn!("download_file: missing on disk for {} -> {}", game.id, file_path.display());
+        return (StatusCode::NOT_FOUND, "file no longer exists on the server; ask the admin to rescan the catalog").into_response();
+    }
     match stream_file(file_path, headers.get(header::RANGE)).await {
         Ok(r) => r,
         Err(e) => server_error(e),
@@ -496,6 +688,10 @@ async fn download_chunk(
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    if !fs::metadata(&file_path).await.map(|m| m.is_file()).unwrap_or(false) {
+        warn!("download_chunk: missing on disk for {} -> {}", game.id, file_path.display());
+        return (StatusCode::NOT_FOUND, "file no longer exists on the server; ask the admin to rescan the catalog").into_response();
+    }
     match stream_chunk(file_path, file_index, chunk_index).await {
         Ok(r) => r,
         Err(e) => server_error(e),
@@ -618,10 +814,7 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 Some(id) => disable_user_totp(&st.db, id).await.map(|_| "Disabled 2FA.".to_string()).unwrap_or_else(|e| e.to_string()),
                 None => "missing user id".to_string(),
             },
-            "rescan" => match rescan_catalog(&st).await {
-                Ok(out) => format!("Catalog rescan complete.\n{out}"),
-                Err(e) => e.to_string(),
-            },
+            "rescan" => spawn_rescan(&st),
             "igdb_enrich" => match enrich_catalog_from_igdb(&st, false).await {
                 Ok(out) => out,
                 Err(e) => e.to_string(),
@@ -703,9 +896,10 @@ async fn list_users(db: &Pool) -> Result<Vec<User>> {
 async fn create_user(db: &Pool, username: &str, email: &str, password: &str, is_admin: bool) -> Result<()> {
     let mut c = db.get_conn().await?;
     let hash = hash_password_argon2(password)?;
+    let auth_key = derive_auth_key(username, password);
     c.exec_drop(
-        "INSERT INTO admin_users (username,email,password_hash,is_admin,enabled,created_at) VALUES (:u,:e,:p,:a,TRUE,:t)",
-        params! {"u" => username, "e" => email, "p" => hash, "a" => is_admin, "t" => now()},
+        "INSERT INTO admin_users (username,email,password_hash,is_admin,enabled,created_at,auth_key) VALUES (:u,:e,:p,:a,TRUE,:t,:k)",
+        params! {"u" => username, "e" => email, "p" => hash, "a" => is_admin, "t" => now(), "k" => auth_key},
     )
     .await?;
     Ok(())
@@ -946,21 +1140,47 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
     let mut game = game.clone();
     let base = public_base_url(st, headers).await;
     hydrate_server_art_url(st, &base, &mut game).await;
-    let root = content_path_for(&st.cfg, &game).await?;
-    let (files, rel_root) = if fs::metadata(&root).await?.is_file() {
-        (vec![root.clone()], root.parent().unwrap_or(&st.cfg.library_root).to_path_buf())
-    } else {
-        (walk_files(&root).await?, root.clone())
+
+    // Use precomputed hashes from the DB when they match the current version.
+    // Fall back to hashing on demand (and persist) only when missing/stale —
+    // this avoids re-hashing tens of GB on every manifest request.
+    let stored = match load_stored_manifest(&st.db, &game.id, &game.version).await {
+        Ok(Some(files)) => files,
+        _ => {
+            let files = compute_stored_files(&st.cfg, &game).await?;
+            if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
+                error!("failed to persist manifest for {}: {e}", game.id);
+            }
+            files
+        }
     };
+
     let mut manifest_files = Vec::new();
-    for (file_index, path) in files.into_iter().enumerate() {
-        let rel = path.strip_prefix(&rel_root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-        let meta = fs::metadata(&path).await?;
-        let chunks = chunks_for_file(&path, &base, &game.id, file_index, &rel, meta.len()).await?;
+    for (file_index, sf) in stored.iter().enumerate() {
+        let rel = sf.path.clone();
+        let chunks = sf
+            .chunks
+            .iter()
+            .map(|c| ManifestChunk {
+                index: c.index,
+                offset: c.offset,
+                size: c.size,
+                sha256: c.sha256.clone(),
+                compression: "none".into(),
+                url: format!(
+                    "{}/chunks/{}/{}/{}/{}",
+                    base,
+                    urlencoding::encode(&game.id),
+                    file_index,
+                    c.index,
+                    encode_path(&rel)
+                ),
+            })
+            .collect();
         manifest_files.push(ManifestFile {
             path: rel.clone(),
-            size: meta.len(),
-            sha256: sha256_file(&path).await?,
+            size: sf.size,
+            sha256: sf.sha256.clone(),
             url: format!("{}/files/{}/{}", base, urlencoding::encode(&game.id), encode_path(&rel)),
             chunk_size: CHUNK_SIZE,
             chunks,
@@ -978,6 +1198,124 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
         launch: game.launch.clone(),
         files: manifest_files,
     })
+}
+
+// Hash every file of a game once, producing the full-file sha256 and per-chunk
+// hashes in a single read pass. This is the expensive work that must happen
+// during scan/sync, never inside a manifest request.
+async fn compute_stored_files(cfg: &Config, game: &Game) -> Result<Vec<StoredFile>> {
+    let root = content_path_for(cfg, game).await?;
+    let (files, rel_root) = if fs::metadata(&root).await?.is_file() {
+        (vec![root.clone()], root.parent().unwrap_or(&cfg.library_root).to_path_buf())
+    } else {
+        (walk_files(&root).await?, root.clone())
+    };
+    let mut out = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(&rel_root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let meta = fs::metadata(&path).await?;
+        let size = meta.len();
+        let mut file = File::open(&path).await?;
+        let mut file_hasher = Sha256::new();
+        let mut chunks = Vec::new();
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut offset = 0u64;
+        let mut index = 0usize;
+        while offset < size {
+            let want = ((size - offset).min(CHUNK_SIZE as u64)) as usize;
+            file.read_exact(&mut buf[..want]).await?;
+            file_hasher.update(&buf[..want]);
+            let mut ch = Sha256::new();
+            ch.update(&buf[..want]);
+            chunks.push(StoredChunk {
+                index,
+                offset,
+                size: want as u64,
+                sha256: hex::encode(ch.finalize()),
+            });
+            offset += want as u64;
+            index += 1;
+        }
+        out.push(StoredFile {
+            path: rel,
+            size,
+            sha256: hex::encode(file_hasher.finalize()),
+            chunks,
+        });
+    }
+    Ok(out)
+}
+
+async fn load_stored_manifest(db: &Pool, game_id: &str, version: &str) -> Result<Option<Vec<StoredFile>>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<(String, String)> = c
+        .exec_first(
+            "SELECT version, files_json FROM game_manifests WHERE game_id=:id",
+            params! {"id" => game_id},
+        )
+        .await?;
+    match row {
+        Some((v, json)) if v == version => Ok(Some(serde_json::from_str(&json)?)),
+        _ => Ok(None),
+    }
+}
+
+async fn store_manifest(db: &Pool, game_id: &str, version: &str, files: &[StoredFile]) -> Result<()> {
+    let json = serde_json::to_string(files)?;
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        r#"INSERT INTO game_manifests (game_id, version, files_json, updated_at)
+           VALUES (:id, :version, :json, :ts)
+           ON DUPLICATE KEY UPDATE version=VALUES(version), files_json=VALUES(files_json), updated_at=VALUES(updated_at)"#,
+        params! {"id" => game_id, "version" => version, "json" => json, "ts" => now()},
+    )
+    .await?;
+    Ok(())
+}
+
+// Precompute (or refresh) stored manifests for every game whose version changed.
+// Called from the scan/sync path so manifest requests are instant.
+async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
+    let mut platform_totals = BTreeMap::<String, PlatformProgress>::new();
+    for game in games {
+        platform_totals.entry(game.platform.clone()).or_default().total += 1;
+    }
+    st.set_scan(|s| {
+        s.phase = "hashing".to_string();
+        s.total = games.len();
+        s.processed = 0;
+        s.message = "Generating file hashes…".to_string();
+        s.per_platform = platform_totals.clone();
+    });
+    for game in games {
+        st.set_scan(|s| { s.current = game.title.clone(); });
+        match load_stored_manifest(&st.db, &game.id, &game.version).await {
+            Ok(Some(_)) => {}
+            _ => match compute_stored_files(&st.cfg, game).await {
+                Ok(files) => {
+                    if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
+                        error!("failed to persist manifest for {}: {e}", game.id);
+                    }
+                }
+                Err(e) => error!("failed to hash files for {}: {e}", game.id),
+            },
+        }
+        let platform = game.platform.clone();
+        st.set_scan(|s| {
+            s.processed += 1;
+            s.per_platform.entry(platform).or_default().processed += 1;
+        });
+    }
+    // Drop stale manifests for games no longer present.
+    let ids: HashSet<&str> = games.iter().map(|g| g.id.as_str()).collect();
+    let mut c = st.db.get_conn().await?;
+    let existing: Vec<String> = c.query("SELECT game_id FROM game_manifests").await?;
+    for id in existing {
+        if !ids.contains(id.as_str()) {
+            c.exec_drop("DELETE FROM game_manifests WHERE game_id=:id", params! {"id" => id}).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn content_path_for(cfg: &Config, game: &Game) -> Result<PathBuf> {
@@ -1046,6 +1384,7 @@ async fn stream_chunk(path: PathBuf, _file_index: usize, chunk_index: usize) -> 
         .body(Body::from_stream(stream))?)
 }
 
+#[allow(dead_code)]
 async fn chunks_for_file(
     path: &Path,
     base: &str,
@@ -1142,6 +1481,7 @@ async fn walk_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 async fn sha256_file(path: &Path) -> Result<String> {
     let mut f = File::open(path).await?;
     let mut h = Sha256::new();
@@ -1502,6 +1842,8 @@ fn admin_cover_src(game: &Game) -> String {
 fn igdb_platform_ids(platform: &str) -> &'static [i32] {
     match platform {
         "Dolphin" => &[21, 5],
+        "GameCube" => &[21],
+        "Wii" => &[5],
         "Ryujinx" => &[130],
         "RPCS3" => &[9],
         "N64" => &[4],
@@ -1621,9 +1963,54 @@ fn server_error(e: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
 }
 
+// Kick off a catalog rescan on a background task. Returns immediately; progress
+// is tracked in `st.scan` and exposed via GET /admin/scan-status.
+fn spawn_rescan(st: &AppState) -> String {
+    {
+        let mut guard = match st.scan.lock() {
+            Ok(g) => g,
+            Err(_) => return "Scan status unavailable.".to_string(),
+        };
+        if guard.running {
+            return "A rescan is already in progress.".to_string();
+        }
+        *guard = ScanStatus {
+            running: true,
+            phase: "scanning".to_string(),
+            message: "Starting catalog scan…".to_string(),
+            started_at: now(),
+            updated_at: now(),
+            ..Default::default()
+        };
+    }
+    let st = st.clone();
+    tokio::spawn(async move {
+        match rescan_catalog(&st).await {
+            Ok(msg) => st.set_scan(|s| {
+                s.running = false;
+                s.phase = "done".to_string();
+                s.current = String::new();
+                s.message = msg;
+            }),
+            Err(e) => st.set_scan(|s| {
+                s.running = false;
+                s.phase = "error".to_string();
+                s.current = String::new();
+                s.message = format!("Rescan failed: {e}");
+            }),
+        }
+    });
+    "Catalog rescan started in the background.".to_string()
+}
+
 async fn rescan_catalog(st: &AppState) -> Result<String> {
+    st.set_scan(|s| { s.phase = "scanning".to_string(); s.message = "Scanning library…".to_string(); });
     let games = scan_catalog(&st.cfg.library_root).await?;
     sync_catalog_db(&st.db, &games).await?;
+    if let Err(e) = ensure_manifests(st, &games).await {
+        error!("manifest precompute failed: {e}");
+    }
+    st.set_scan(|s| { s.phase = "igdb".to_string(); s.current = String::new(); s.message = "Enriching metadata…".to_string(); });
     let enrichment = enrich_catalog_from_igdb(st, false).await.unwrap_or_else(|e| format!("IGDB enrichment skipped: {e}"));
 
     let mut by_platform = BTreeMap::<String, usize>::new();
@@ -1639,6 +2026,13 @@ async fn rescan_catalog(st: &AppState) -> Result<String> {
     }
     msg.push_str(&format!("\n{enrichment}"));
     Ok(msg)
+}
+
+async fn admin_scan_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match current_admin(&st.db, &headers).await {
+        Ok(Some(_)) => Json(st.scan_snapshot()).into_response(),
+        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not signed in"}))).into_response(),
+    }
 }
 
 async fn enrich_catalog_from_igdb(st: &AppState, force: bool) -> Result<String> {
@@ -1883,8 +2277,8 @@ async fn scan_single_file_platforms(library_root: &Path) -> Result<Vec<Game>> {
         ("Nintendo/SNES", "SNES", &["sfc", "smc", "fig", "bs", "st", "zip", "7z"]),
         ("Nintendo/N64", "N64", &["z64", "n64", "v64", "rom"]),
         ("Nintendo/Switch", "Ryujinx", &["nsp", "xci", "nca", "nro"]),
-        ("Nintendo/Gamecube", "Dolphin", &["iso", "gcm", "rvz", "gcz"]),
-        ("Nintendo/Wii", "Dolphin", &["iso", "rvz", "gcz", "wbfs", "dol", "elf"]),
+        ("Nintendo/Gamecube", "GameCube", &["iso", "gcm", "rvz", "gcz"]),
+        ("Nintendo/Wii", "Wii", &["iso", "rvz", "gcz", "wbfs", "dol", "elf"]),
     ];
     let skip: HashSet<&str> = ["sqlite", "db", "txt", "nfo", "jpg", "jpeg", "png", "webp"].into_iter().collect();
     let mut out = Vec::new();
@@ -1942,24 +2336,54 @@ async fn scan_xbox360_god(library_root: &Path) -> Result<Vec<Game>> {
     Ok(out)
 }
 
+// True if `path` is the *primary* part of a repack archive that should become its
+// own game. Recognises plain .zip/.7z/.rar and the first part of multi-part sets
+// (.partN.rar where N==1, and split archives like name.7z.001 / name.rar.001).
+// Crucially, a bare ".001" with no archive extension before it is NOT an archive —
+// ".001" is a very common split-data extension inside installed game folders, and
+// matching it blindly turned thousands of internal files into phantom games.
+fn is_pc_primary_archive(path: &Path) -> bool {
+    let name_l = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n.to_ascii_lowercase(),
+        None => return false,
+    };
+    let ext = file_ext(path);
+    let is_archive_ext = matches!(ext.as_str(), "zip" | "7z" | "rar");
+    // Split archive first part: name.<7z|zip|rar>.001
+    let is_split_first = ext == "001"
+        && (name_l.ends_with(".7z.001") || name_l.ends_with(".zip.001") || name_l.ends_with(".rar.001"));
+    if !is_archive_ext && !is_split_first {
+        return false;
+    }
+    // Skip continuation parts of multi-part RAR sets (.partN.rar, N>1).
+    if let Some(idx) = name_l.find(".part") {
+        let digits: String = name_l[idx + 5..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.parse::<u32>().map(|n| n > 1).unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
 async fn scan_pc_games(library_root: &Path) -> Result<Vec<Game>> {
     let pc_root = library_root.join("games").join("PC");
     if fs::metadata(&pc_root).await.is_err() {
         return Ok(Vec::new());
     }
-    let allowed: HashSet<&str> = ["zip", "7z", "rar"].into_iter().collect();
     let mut out = Vec::new();
-    for path in walk_files(&pc_root).await? {
-        if !allowed.contains(file_ext(&path).as_str()) {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
-        out.push(game_entry(library_root, &path, "Repacks", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
-    }
     let mut rd = fs::read_dir(&pc_root).await?;
     while let Some(entry) = rd.next_entry().await? {
         let path = entry.path();
         let meta = entry.metadata().await?;
+        if meta.is_file() {
+            // Loose repack archive sitting directly in games/PC.
+            if is_pc_primary_archive(&path) {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    out.push(game_entry(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
+                }
+            }
+            continue;
+        }
         if !meta.is_dir() {
             continue;
         }
@@ -1968,20 +2392,58 @@ async fn scan_pc_games(library_root: &Path) -> Result<Vec<Game>> {
             let mut steam = fs::read_dir(&path).await?;
             while let Some(game_dir) = steam.next_entry().await? {
                 let game_path = game_dir.path();
-                if !game_dir.metadata().await?.is_dir() {
-                    continue;
-                }
-                if let Some(game) = pc_folder_entry(library_root, &game_path).await? {
-                    out.push(game);
+                if game_dir.metadata().await?.is_dir() {
+                    if let Some(game) = pc_folder_entry(library_root, &game_path).await? {
+                        out.push(game);
+                    }
                 }
             }
             continue;
         }
-        if let Some(game) = pc_folder_entry(library_root, &path).await? {
-            out.push(game);
-        }
+        // Recurse up to two levels so games nested under category folders aren't
+        // missed — but stop the moment a folder is itself a game.
+        collect_pc_folder_games(library_root, &path, 2, &mut out).await?;
     }
     Ok(out)
+}
+
+// Resolve `dir` as either ONE game (it has a launchable exe → the whole folder is
+// the game; never descend into it) or a category folder (recurse into subfolders
+// and pick up any loose repack archives sitting directly inside it).
+async fn collect_pc_folder_games(library_root: &Path, dir: &Path, max_depth: usize, out: &mut Vec<Game>) -> Result<()> {
+    // A folder with a launchable exe is a single game. Its internal archives and
+    // subfolders are part of that game and must NOT be scanned as separate games.
+    if let Some(game) = pc_folder_entry(library_root, dir).await? {
+        out.push(game);
+        return Ok(());
+    }
+    // Not a game itself — treat as a category. Collect loose archives here, then
+    // recurse into subfolders.
+    let mut subdirs = Vec::<PathBuf>::new();
+    let mut rd = fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        let meta = entry.metadata().await?;
+        if meta.is_file() {
+            if is_pc_primary_archive(&path) {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    out.push(game_entry(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
+                }
+            }
+        } else if meta.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    if max_depth == 0 {
+        if !subdirs.is_empty() {
+            info!("PC scan: reached depth limit, not descending into {} subfolder(s) of {}", subdirs.len(), dir.display());
+        }
+        return Ok(());
+    }
+    for sub in subdirs {
+        Box::pin(collect_pc_folder_games(library_root, &sub, max_depth - 1, out)).await?;
+    }
+    Ok(())
 }
 
 async fn pc_folder_entry(library_root: &Path, game_root: &Path) -> Result<Option<Game>> {
@@ -1989,7 +2451,7 @@ async fn pc_folder_entry(library_root: &Path, game_root: &Path) -> Result<Option
         return Ok(None);
     };
     let target = find_pc_launch_target(game_root).await?;
-    let game = game_entry(library_root, game_root, "Repacks", &title, &target, "pc_folder", "{exe}").await?;
+    let game = game_entry(library_root, game_root, "PC", &title, &target, "pc_folder", "{exe}").await?;
     if game.launch.target.is_empty() {
         return Ok(None);
     }
@@ -1998,25 +2460,29 @@ async fn pc_folder_entry(library_root: &Path, game_root: &Path) -> Result<Option
 
 async fn find_pc_launch_target(game_root: &Path) -> Result<PathBuf> {
     let mut candidates = Vec::<PathBuf>::new();
+    let mut fallback = Vec::<PathBuf>::new();
     for path in walk_files(game_root).await? {
         if file_ext(&path) != "exe" {
             continue;
         }
         let rel = path.strip_prefix(game_root).unwrap_or(&path).to_path_buf();
         let lower = rel.to_string_lossy().to_ascii_lowercase();
+        fallback.push(rel.clone());
         if lower.contains("unins") || lower.contains("setup") || lower.contains("redist") ||
            lower.contains("_commonredist") || lower.contains("crashreport") {
             continue;
         }
         candidates.push(rel);
     }
-    candidates.sort_by_key(|p| {
-        let s = p.to_string_lossy();
+    // Prefer a "real" game exe, but fall back to any exe so a folder is never
+    // silently dropped just because every exe matched an installer heuristic.
+    let pick = if candidates.is_empty() { &mut fallback } else { &mut candidates };
+    pick.sort_by_key(|p| {
         let depth = p.components().count();
-        let len = s.len();
+        let len = p.to_string_lossy().len();
         (depth, len)
     });
-    Ok(candidates.into_iter().next().unwrap_or_default())
+    Ok(pick.first().cloned().unwrap_or_default())
 }
 
 async fn find_god_package(god_dir: &Path) -> Result<Option<PathBuf>> {
@@ -2363,7 +2829,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
-            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
+            <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form><div id="scan-status" class="scanbox"><div class="scanhead"><span id="sc-phase" class="scanphase idle"><span id="sc-spin" class="scanspin"></span><span id="sc-phtext">Idle</span></span><span class="scanmeta"><strong id="sc-count">0/0</strong> &middot; <span id="sc-pct">0%</span> &middot; elapsed <span id="sc-elapsed">0s</span></span></div><div id="sc-bar" class="scanbar"><i id="sc-fill"></i></div><div id="sc-cur" class="scancur"></div><div id="sc-plat" class="scanplat"></div><div id="sc-msg" class="scanmsg"></div></div><script>(function(){{var box=document.getElementById('scan-status');if(!box)return;var phEl=document.getElementById('sc-phase'),phTx=document.getElementById('sc-phtext'),spin=document.getElementById('sc-spin'),cnt=document.getElementById('sc-count'),pctEl=document.getElementById('sc-pct'),elEl=document.getElementById('sc-elapsed'),bar=document.getElementById('sc-bar'),fill=document.getElementById('sc-fill'),cur=document.getElementById('sc-cur'),plat=document.getElementById('sc-plat'),msg=document.getElementById('sc-msg');var names={{scanning:'Scanning library',hashing:'Hashing files',igdb:'Enriching metadata',done:'Completed',error:'Failed',idle:'Idle'}};function fmt(sec){{if(sec<60)return sec+'s';var m=Math.floor(sec/60),s=sec%60;return m+'m '+(s<10?'0':'')+s+'s';}}function render(s){{var phase=s.phase||'idle';box.classList.add('active');phEl.className='scanphase '+(phase==='done'?'done':phase==='error'?'error':phase==='idle'?'idle':'');phTx.textContent=names[phase]||phase;spin.style.display=s.running?'inline-block':'none';var total=s.total||0,proc=s.processed||0;var pct=total?Math.floor(proc*100/total):0;cnt.textContent=proc+'/'+total;pctEl.textContent=pct+'%';var nowSec=Math.floor(Date.now()/1000);var srv=s.startedAt?((s.updatedAt||nowSec)-s.startedAt):0;var elapsed=s.running?Math.max(srv,nowSec-(s.startedAt||nowSec)):srv;elEl.textContent=fmt(Math.max(0,elapsed));if(s.running&&!total){{bar.className='scanbar indet';fill.style.width='40%';}}else{{bar.className='scanbar';fill.style.width=pct+'%';}}cur.textContent=s.current?('Current: '+s.current):'';var pp=s.perPlatform||{{}};var keys=Object.keys(pp).sort();var ph='';for(var i=0;i<keys.length;i++){{var k=keys[i],v=pp[k]||{{}},t=v.total||0,p=v.processed||0,w=t?Math.floor(p*100/t):0,dn=(t&&p>=t);ph+='<div class="scanplat-row"><span class="scanplat-name">'+k+'</span><span class="scanplat-bar'+(dn?' done':'')+'"><i style="width:'+w+'%"></i></span><span class="scanplat-num">'+p+'/'+t+'</span></div>';}}plat.innerHTML=((phase==='hashing'||phase==='done')&&keys.length)?ph:'';msg.textContent=(phase==='done'||phase==='error')?(s.message||''):'';}}function poll(){{fetch('/admin/scan-status').then(function(r){{return r.json();}}).then(function(s){{if(!s)return;if(s.running||s.phase==='done'||s.phase==='error'){{render(s);}}else{{box.classList.remove('active');}}}}).catch(function(){{}});setTimeout(poll,1000);}}poll();}})();</script>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
             <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Backend URL</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="server.public_base_url"><input name="setting_value" type="url" placeholder="https://arcade.orlandoaio.net" value="{}"><button name="action" value="save_setting">Save Backend URL</button></form><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
@@ -2733,7 +3199,7 @@ fn notice(message: &str) -> String {
 
 fn shell(body: &str) -> String {
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ArcadeLauncher Server</title><style>{}</style></head><body><main>{}</main></body></html>"#,
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ArcadeLauncher Server</title><link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%237c5cff'/><text x='50' y='72' font-size='64' text-anchor='middle' fill='white'>%F0%9F%8E%AE</text></svg>"><style>{}</style></head><body><main>{}</main></body></html>"#,
         CSS, body
     )
 }
@@ -2746,4 +3212,140 @@ static CSS: &str = r#"
 :root{color-scheme:dark;--bg:#0f1115;--panel:#171b21;--panel2:#1d232b;--line:#2c3540;--text:#e8edf2;--muted:#9aa7b5;--accent:#4cc2ff;--bad:#ff6b6b}
 *{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",sans-serif;background:var(--bg);color:var(--text)}main{width:100%;min-height:100vh}h1,h2,h3{margin:0;letter-spacing:0}h1{font-size:28px}h2{font-size:19px}h3{font-size:15px;margin:18px 0 10px}.admin-layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}.sidebar{background:#11161d;border-right:1px solid var(--line);padding:24px 18px}.brand-block{display:flex;gap:12px;align-items:center;margin-bottom:28px}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--accent);color:#041019;font-weight:800;border-radius:8px}.brand-title{font-weight:700}.brand-subtitle,.muted,.eyebrow{color:var(--muted)}nav{display:flex;flex-direction:column;gap:6px}nav a,.buttonlink{color:var(--text);text-decoration:none;padding:9px 10px;border-radius:6px;border:1px solid transparent}nav a:hover,.buttonlink:hover{border-color:var(--line);background:var(--panel)}.content{padding:24px;min-width:0}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.account-box{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.section-heading{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.metric span{display:block;color:var(--muted)}.metric strong{font-size:26px}.split,.two-col{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}.two-col{grid-template-columns:repeat(2,minmax(0,1fr))}.platform-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px}.platform-row{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}.kv{display:grid;grid-template-columns:120px minmax(0,1fr);gap:8px 12px}.kv dt{color:var(--muted)}.kv dd{margin:0;min-width:0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:flex;gap:10px;flex-direction:column;align-items:flex-start}.inline{display:flex;gap:8px;flex-wrap:wrap}.new-setting{margin-top:12px}.matcher-form{margin:10px 0}.matcher-form select{max-width:420px}.matcher-results{margin-bottom:14px}.checkline{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}input,select{background:#0c1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px;min-width:180px}button{background:var(--accent);color:#041019;border:0;border-radius:6px;padding:9px 12px;font-weight:700;cursor:pointer}.danger{background:var(--bad);color:#180406}table{width:100%;border-collapse:collapse;background:var(--panel2);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px;vertical-align:top}th{color:var(--muted);font-weight:600}code,.token{overflow-wrap:anywhere;white-space:pre-wrap}.status{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-weight:700;font-size:12px}.status.ok{background:#10351f;color:#74e19a}.status.bad{background:#3d1518;color:#ff8b8b}.notice{white-space:pre-wrap;background:#102033;border:1px solid #285b86;padding:12px;border-radius:8px}@media(max-width:900px){.admin-layout{grid-template-columns:1fr}.sidebar{position:static}.metric-grid,.split,.two-col{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
 .metadata-shell{overflow:hidden}.current-game{display:grid;grid-template-columns:180px minmax(0,1fr);gap:18px;align-items:start}.current-cover,.match-cover{width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:8px;background:#0c1015;border:1px solid var(--line)}.current-cover.placeholder,.match-cover.placeholder{display:grid;place-items:center;color:var(--muted);font-weight:700}.match-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px}.match-card{display:grid;grid-template-columns:104px minmax(0,1fr);gap:14px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px}.match-title{font-weight:800;font-size:16px}.match-meta{color:var(--muted);margin:3px 0 8px}.match-body p{margin:0 0 12px;color:#c9d3dd}.empty-state{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:16px;color:var(--muted)}@media(max-width:900px){.current-game,.match-card{grid-template-columns:1fr}.match-grid{grid-template-columns:1fr}}
+.scanbox{margin:12px 0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:14px;display:none}.scanbox.active{display:block}.scanhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.scanphase{display:inline-flex;align-items:center;gap:7px;border-radius:999px;padding:4px 11px;font-weight:700;font-size:12px;background:#11283a;color:var(--accent)}.scanphase.done{background:#10351f;color:#74e19a}.scanphase.error{background:#3d1518;color:#ff8b8b}.scanphase.idle{background:#22282f;color:var(--muted)}.scanspin{width:11px;height:11px;border-radius:50%;border:2px solid rgba(76,194,255,.35);border-top-color:var(--accent);animation:scanspin .8s linear infinite}@keyframes scanspin{to{transform:rotate(360deg)}}.scanmeta{color:var(--muted);font-size:13px}.scanmeta strong{color:var(--text)}.scanbar{height:10px;border-radius:999px;background:#0c1015;border:1px solid var(--line);overflow:hidden;margin:8px 0}.scanbar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4cc2ff,#7c5cff);transition:width .4s ease}.scanbar.indet>i{width:40%;animation:scanindet 1.2s ease-in-out infinite}@keyframes scanindet{0%{margin-left:-40%}100%{margin-left:100%}}.scancur{font-size:13px;color:#c9d3dd;overflow-wrap:anywhere;min-height:18px}.scanmsg{margin-top:8px;color:var(--muted);white-space:pre-wrap;font-size:13px}.scanplat{margin-top:10px;display:flex;flex-direction:column;gap:6px}.scanplat-row{display:grid;grid-template-columns:120px minmax(0,1fr) 74px;gap:10px;align-items:center;font-size:12px}.scanplat-name{color:var(--text);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scanplat-bar{height:8px;border-radius:999px;background:#0c1015;border:1px solid var(--line);overflow:hidden}.scanplat-bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4cc2ff,#7c5cff);transition:width .4s ease}.scanplat-bar.done>i{background:linear-gradient(90deg,#39d98a,#74e19a)}.scanplat-num{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn parse_range_none_when_absent() {
+        assert!(parse_range(None, 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_range_open_ended() {
+        assert_eq!(parse_range(Some("bytes=0-"), 100).unwrap(), Some((0, 99)));
+    }
+
+    #[test]
+    fn parse_range_closed() {
+        assert_eq!(parse_range(Some("bytes=10-19"), 100).unwrap(), Some((10, 19)));
+    }
+
+    #[test]
+    fn parse_range_suffix() {
+        assert_eq!(parse_range(Some("bytes=-20"), 100).unwrap(), Some((80, 99)));
+    }
+
+    #[test]
+    fn parse_range_clamps_end_to_size() {
+        assert_eq!(parse_range(Some("bytes=10-9999"), 100).unwrap(), Some((10, 99)));
+    }
+
+    #[test]
+    fn parse_range_uses_first_of_multiple() {
+        assert_eq!(parse_range(Some("bytes=0-9,20-29"), 100).unwrap(), Some((0, 9)));
+    }
+
+    #[test]
+    fn parse_range_rejects_bad_unit() {
+        assert!(parse_range(Some("items=0-9"), 100).is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_start_past_end_of_file() {
+        assert!(parse_range(Some("bytes=200-300"), 100).is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_inverted() {
+        assert!(parse_range(Some("bytes=50-10"), 100).is_err());
+    }
+
+    #[test]
+    fn parse_range_rejects_zero_suffix() {
+        assert!(parse_range(Some("bytes=-0"), 100).is_err());
+    }
+
+    #[test]
+    fn constant_eq_basics() {
+        assert!(constant_eq(b"abc", b"abc"));
+        assert!(!constant_eq(b"abc", b"abd"));
+        assert!(!constant_eq(b"abc", b"ab"));
+        assert!(constant_eq(b"", b""));
+    }
+
+    #[test]
+    fn encode_path_preserves_separators_and_escapes() {
+        assert_eq!(encode_path("games/PC/Half Life 2"), "games/PC/Half%20Life%202");
+        assert_eq!(encode_path("a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn clean_igdb_title_strips_brackets_and_separators() {
+        assert_eq!(clean_igdb_title("Halo (USA) [Disc 1]"), "Halo");
+        assert_eq!(clean_igdb_title("Some_Game-Title"), "Some Game Title");
+    }
+
+    #[test]
+    fn normalize_title_lowercases_and_strips_punct() {
+        assert_eq!(normalize_title("Grand Theft Auto: V!"), "grand theft auto v");
+        assert_eq!(normalize_title("  Mega   Man  "), "mega man");
+    }
+
+    #[test]
+    fn is_pc_primary_archive_accepts_archives() {
+        assert!(is_pc_primary_archive(Path::new("Game.zip")));
+        assert!(is_pc_primary_archive(Path::new("Game.7z")));
+        assert!(is_pc_primary_archive(Path::new("Game.rar")));
+        assert!(is_pc_primary_archive(Path::new("Game.7z.001")));
+    }
+
+    #[test]
+    fn is_pc_primary_archive_rejects_non_archives_and_continuations() {
+        assert!(!is_pc_primary_archive(Path::new("Game.exe")));
+        assert!(!is_pc_primary_archive(Path::new("Game.7z.002")));
+        assert!(!is_pc_primary_archive(Path::new("Game.part2.rar")));
+        assert!(is_pc_primary_archive(Path::new("Game.part1.rar")));
+    }
+
+    #[test]
+    fn stable_id_is_deterministic_and_platform_lowercased() {
+        let a = stable_id("Xbox360", Path::new("games/Xbox360/Halo.iso"));
+        let b = stable_id("Xbox360", Path::new("games/Xbox360/Halo.iso"));
+        assert_eq!(a, b);
+        assert!(a.starts_with("xbox360-"));
+    }
+
+    #[test]
+    fn stable_id_normalizes_backslashes() {
+        let fwd = stable_id("PC", Path::new("games/PC/Doom"));
+        let back = stable_id("PC", Path::new(r"games\PC\Doom"));
+        assert_eq!(fwd, back);
+    }
+
+    #[test]
+    fn sha1_short_is_twelve_hex_chars() {
+        let h = sha1_short("hello");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(sha1_short("hello"), sha1_short("hello"));
+    }
+
+    #[test]
+    fn clean_title_strips_tags_and_underscores() {
+        assert_eq!(clean_title("Super_Mario_64 [USA] (v1.0).z64"), "Super Mario 64");
+        assert_eq!(clean_title("Plain Name.iso"), "Plain Name");
+    }
+
+    #[test]
+    fn igdb_platform_ids_known_and_unknown() {
+        assert_eq!(igdb_platform_ids("GameCube"), &[21]);
+        assert_eq!(igdb_platform_ids("Wii"), &[5]);
+        assert_eq!(igdb_platform_ids("Xbox360"), &[12]);
+        assert!(igdb_platform_ids("Unknown").is_empty());
+    }
+}
