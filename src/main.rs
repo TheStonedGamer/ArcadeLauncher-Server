@@ -349,6 +349,11 @@ struct AdminForm {
     game_id: Option<String>,
     search_query: Option<String>,
     igdb_id: Option<u64>,
+    // Changelog authoring fields (add_changelog / delete_changelog actions).
+    changelog_id: Option<u64>,
+    changelog_version: Option<String>,
+    changelog_title: Option<String>,
+    changelog_body: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -388,6 +393,7 @@ async fn main() -> Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
+        .route("/api/games/:id/changelogs", get(api_changelogs))
         .route("/art/:id", get(download_art))
         .route("/emulators/*rel", get(download_emulator))
         .route("/files/:id/*rel", get(download_file))
@@ -414,23 +420,26 @@ async fn main() -> Result<()> {
     info!("ArcadeLauncher admin listening on http://{}", admin_addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-    // Periodic auto-rescan so moving/renaming folders can't leave stale catalog
-    // rows for long. spawn_rescan() no-ops while a scan is already running, so an
-    // in-progress manual rescan is never disturbed. 0 disables the timer.
-    if auto_rescan_state.cfg.auto_rescan_secs > 0 {
-        let st = auto_rescan_state;
-        let period = st.cfg.auto_rescan_secs;
-        info!("auto-rescan enabled every {}s", period);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period));
-            // Skip the immediate first tick so startup isn't slammed with a scan.
-            ticker.tick().await;
-            loop {
+    // Event-driven catalog refresh via a filesystem watcher (replaces interval
+    // polling). spawn_rescan() no-ops while a scan is already running, so an
+    // in-progress manual rescan is never disturbed. If the watcher can't be set
+    // up we fall back to the old interval poll (auto_rescan_secs; 0 disables).
+    if !start_library_watcher(auto_rescan_state.clone()) {
+        if auto_rescan_state.cfg.auto_rescan_secs > 0 {
+            let st = auto_rescan_state;
+            let period = st.cfg.auto_rescan_secs;
+            info!("filesystem watcher unavailable; auto-rescan fallback every {}s", period);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period));
+                // Skip the immediate first tick so startup isn't slammed with a scan.
                 ticker.tick().await;
-                let msg = spawn_rescan(&st);
-                info!("auto-rescan tick: {msg}");
-            }
-        });
+                loop {
+                    ticker.tick().await;
+                    let msg = spawn_rescan(&st);
+                    info!("auto-rescan tick: {msg}");
+                }
+            });
+        }
     }
 
     let public_server = axum::serve(listener, public_app);
@@ -547,6 +556,24 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
           version VARCHAR(80) NOT NULL,
           files_json LONGTEXT NOT NULL,
           updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Per-game changelog / patch-notes entries shown in the client's game
+    // dashboard. Linked to games.id; rows are removed when the game row is
+    // deleted (ON DELETE CASCADE). `version` is the optional version label the
+    // note applies to; `body` is markdown/plain text authored in the admin UI.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_changelogs (
+          id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          game_id VARCHAR(96) NOT NULL,
+          version VARCHAR(120) NOT NULL DEFAULT '',
+          title VARCHAR(255) NOT NULL DEFAULT '',
+          body MEDIUMTEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_changelogs_game (game_id, created_at),
+          CONSTRAINT fk_changelogs_game FOREIGN KEY (game_id)
+            REFERENCES games(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
@@ -1157,6 +1184,30 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     Err(e) => e.to_string(),
                 }
             },
+            "add_changelog" => {
+                let game_id = form.game_id.clone().unwrap_or_default();
+                let body = form.changelog_body.clone().unwrap_or_default();
+                if game_id.is_empty() || body.trim().is_empty() {
+                    "A game and a non-empty changelog body are required.".to_string()
+                } else {
+                    match add_changelog(
+                        &st.db,
+                        &game_id,
+                        form.changelog_version.as_deref().unwrap_or(""),
+                        form.changelog_title.as_deref().unwrap_or(""),
+                        &body,
+                    ).await {
+                        Ok(_) => "Added changelog entry.".to_string(),
+                        Err(e) => e.to_string(),
+                    }
+                }
+            },
+            "delete_changelog" => match form.changelog_id {
+                Some(id) => delete_changelog(&st.db, id).await
+                    .map(|_| "Deleted changelog entry.".to_string())
+                    .unwrap_or_else(|e| e.to_string()),
+                None => "missing changelog id".to_string(),
+            },
             _ => "No action taken.".to_string(),
         };
         Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response()
@@ -1720,6 +1771,89 @@ async fn store_manifest(db: &Pool, game_id: &str, version: &str, files: &[Stored
     )
     .await?;
     Ok(())
+}
+
+// ── Game changelogs ─────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Changelog {
+    id: i64,
+    version: String,
+    title: String,
+    body: String,
+    created_at: i64,
+}
+
+async fn load_changelogs(db: &Pool, game_id: &str) -> Result<Vec<Changelog>> {
+    let mut c = db.get_conn().await?;
+    let rows: Vec<(i64, String, String, String, i64)> = c
+        .exec(
+            "SELECT id, version, title, body, created_at FROM game_changelogs \
+             WHERE game_id=:g ORDER BY created_at DESC, id DESC",
+            params! {"g" => game_id},
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, version, title, body, created_at)| Changelog { id, version, title, body, created_at })
+        .collect())
+}
+
+// Recent changelog entries joined with their game title, for the admin table.
+async fn list_changelogs_admin(db: &Pool) -> Result<Vec<(i64, String, String, String)>> {
+    let mut c = db.get_conn().await?;
+    let rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT c.id, g.title, c.version, c.title \
+             FROM game_changelogs c JOIN games g ON g.id = c.game_id \
+             ORDER BY c.created_at DESC, c.id DESC LIMIT 100",
+        )
+        .await?;
+    Ok(rows)
+}
+
+async fn add_changelog(db: &Pool, game_id: &str, version: &str, title: &str, body: &str) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    // Guard the FK: reject notes for games that don't exist.
+    let exists: Option<String> =
+        c.exec_first("SELECT id FROM games WHERE id=:id", params! {"id" => game_id}).await?;
+    if exists.is_none() {
+        return Err(anyhow!("unknown game id"));
+    }
+    c.exec_drop(
+        r#"INSERT INTO game_changelogs (game_id, version, title, body, created_at)
+           VALUES (:g, :v, :t, :b, :ts)"#,
+        params! {
+            "g" => game_id,
+            "v" => version,
+            "t" => title,
+            "b" => body,
+            "ts" => now(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_changelog(db: &Pool, id: u64) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop("DELETE FROM game_changelogs WHERE id=:id", params! {"id" => id}).await?;
+    Ok(())
+}
+
+async fn api_changelogs(State(st): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<String>) -> Response {
+    if !authorized_api(&st, &headers).await {
+        return unauthorized();
+    }
+    match load_changelogs(&st.db, &id).await {
+        Ok(entries) => Json(serde_json::json!({
+            "gameId": id,
+            "changelogs": entries,
+        }))
+        .into_response(),
+        Err(e) => server_error(e),
+    }
 }
 
 // Precompute (or refresh) stored manifests for every game whose version changed.
@@ -2413,8 +2547,39 @@ fn clean_igdb_title(title: &str) -> String {
         .next()
         .unwrap_or(title)
         .replace('_', " ")
-        .replace('-', " ");
+        .replace('-', " ")
+        // Dot-separated scene names (Super.Mario.64) become spaced words so the
+        // IGDB search and similarity pass treat them as real word boundaries.
+        .replace('.', " ");
     without_brackets.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Tokens commonly appended to ROM/repack filenames (region, dump, and scene-group
+// markers) that never appear in an IGDB game name. Dropping them before the
+// Jaccard comparison stops them from dragging the similarity score below the
+// match threshold for otherwise-correct titles.
+fn is_noise_token(t: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "usa", "eur", "europe", "jpn", "jap", "japan", "ntsc", "pal", "world",
+        "proper", "repack", "readnfo", "multi", "disc", "disk", "cd", "dvd",
+        "iso", "decrypted", "encrypted", "demo", "beta", "unl", "rev", "fitgirl",
+        "dodi", "elamigos", "razor1911", "codex", "plaza", "skidrow",
+    ];
+    if NOISE.contains(&t) {
+        return true;
+    }
+    // Pure version markers like v1, v10, v1_0 -> "v1", "v10".
+    t.len() > 1 && t.starts_with('v') && t[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+// Normalized, noise-filtered token string used for fuzzy title matching. Built on
+// normalize_title (lowercase + punctuation->space) then strips the noise tokens.
+fn match_key(title: &str) -> String {
+    normalize_title(title)
+        .split_whitespace()
+        .filter(|t| !is_noise_token(t))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalize_title(title: &str) -> String {
@@ -2519,6 +2684,72 @@ fn server_error(e: impl std::fmt::Display) -> Response {
 
 // Kick off a catalog rescan on a background task. Returns immediately; progress
 // is tracked in `st.scan` and exposed via GET /admin/scan-status.
+// Quiet-period (seconds) the filesystem watcher waits after the last change
+// before kicking a rescan, so a multi-file copy collapses into one rescan.
+const LIBRARY_WATCH_DEBOUNCE_SECS: u64 = 5;
+
+// Event-driven catalog refresh that replaces fixed-interval polling. A `notify`
+// watcher on <library_root>/games fires on Create/Modify/Remove/Rename events; a
+// debounced async task collapses bursts into a single incremental rescan once
+// the filesystem goes quiet. Because manifests are cached per (id, version),
+// unchanged games are no-ops, so the triggered rescan only re-hashes what
+// actually changed. Returns false if the watcher couldn't be initialised, so the
+// caller can fall back to interval polling.
+fn start_library_watcher(st: AppState) -> bool {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    let watch_dir = {
+        let games = st.cfg.library_root.join("games");
+        if games.is_dir() { games } else { st.cfg.library_root.clone() }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(64);
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            // Content/structure changes only; ignore Access (atime) noise.
+            let relevant = matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            );
+            if relevant {
+                // Non-blocking: a full channel already has a pending wake-up.
+                let _ = tx.try_send(());
+            }
+        }
+    });
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("filesystem watcher init failed: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
+        warn!("filesystem watch on {} failed: {e}", watch_dir.display());
+        return false;
+    }
+    // Keep the watcher alive for the lifetime of the process without holding it
+    // across an await (RecommendedWatcher owns an OS-level handle/thread).
+    Box::leak(Box::new(watcher));
+    info!("filesystem watcher active on {}", watch_dir.display());
+
+    let debounce = std::time::Duration::from_secs(LIBRARY_WATCH_DEBOUNCE_SECS);
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            // Drain until the library goes quiet for `debounce`, so a big copy
+            // doesn't trigger a rescan per file.
+            loop {
+                match tokio::time::timeout(debounce, rx.recv()).await {
+                    Ok(Some(())) => continue,
+                    Ok(None) => return,
+                    Err(_) => break,
+                }
+            }
+            let msg = spawn_rescan(&st);
+            info!("fs-watch: library change detected -> {msg}");
+        }
+    });
+    true
+}
+
 fn spawn_rescan(st: &AppState) -> String {
     {
         let mut guard = match st.scan.lock() {
@@ -2661,10 +2892,10 @@ async fn igdb_best_match(http: &Client, client_id: &str, token: &str, game: &Gam
     if candidates.is_empty() && !igdb_platform_ids(&game.platform).is_empty() {
         candidates = igdb_search(http, client_id, token, &title, &[]).await?;
     }
-    let norm_title = normalize_title(&title);
+    let norm_title = match_key(&title);
     let mut best: Option<(f64, IgdbMatch)> = None;
     for candidate in candidates {
-        let score = title_similarity(&norm_title, &normalize_title(&candidate.name));
+        let score = title_similarity(&norm_title, &match_key(&candidate.name));
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, candidate));
         }
@@ -2817,6 +3048,7 @@ async fn scan_catalog(library_root: &Path) -> Result<Vec<Game>> {
     let mut games = Vec::new();
     games.extend(scan_single_file_platforms(library_root).await?);
     games.extend(scan_xbox360_god(library_root).await?);
+    games.extend(scan_xbox_original(library_root).await?);
     games.extend(scan_pc_games(library_root).await?);
     games.sort_by(|a, b| {
         (a.platform.as_str(), a.title.to_lowercase(), a.id.as_str())
@@ -2885,6 +3117,63 @@ async fn scan_xbox360_god(library_root: &Path) -> Result<Vec<Game>> {
         let target = package.strip_prefix(&game_root).unwrap_or(&package).to_path_buf();
         let title = game_root.file_name().and_then(|s| s.to_str()).map(clean_title).unwrap_or_else(|| "Xbox 360 Game".into());
         out.push(game_entry(library_root, &game_root, "Xbox360", &title, &target, "emulator_rom", "{rom}").await?);
+    }
+    Ok(out)
+}
+
+// Scan original Xbox games under games/Microsoft/Xbox. Recognises three layouts:
+//   * a top-level `.iso`/`.xiso` image (one game per file),
+//   * a game folder containing `default.xbe` (an extracted game — the .xbe is the
+//     canonical executable; the whole folder is the content),
+//   * a game folder containing a single `.iso`/`.xiso` (a per-game ISO folder).
+// All are tagged platform "Xbox" so they surface in the admin UI and catalog.
+async fn scan_xbox_original(library_root: &Path) -> Result<Vec<Game>> {
+    let games_root = library_root.join("games");
+    let Some(xbox_root) = resolve_subdir_ci(&games_root, "Microsoft/Xbox").await else {
+        return Ok(Vec::new());
+    };
+    let iso_exts: HashSet<&str> = ["iso", "xiso"].into_iter().collect();
+    let mut out = Vec::new();
+    let mut rd = fs::read_dir(&xbox_root).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_file() {
+            if iso_exts.contains(file_ext(&path).as_str()) {
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+                out.push(game_entry(
+                    library_root, &path, "Xbox", &clean_title(name),
+                    Path::new(name), "emulator_rom", "{rom}",
+                ).await?);
+            }
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let title = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(clean_title)
+            .unwrap_or_else(|| "Xbox Game".into());
+        let files = walk_files(&path).await?;
+        // Prefer an extracted game keyed off default.xbe.
+        if let Some(xbe) = files.iter().find(|f| {
+            f.file_name().and_then(|s| s.to_str())
+                .map(|n| n.eq_ignore_ascii_case("default.xbe")).unwrap_or(false)
+        }) {
+            let target = xbe.strip_prefix(&path).unwrap_or(xbe).to_path_buf();
+            out.push(game_entry(library_root, &path, "Xbox", &title, &target, "emulator_rom", "{rom}").await?);
+            continue;
+        }
+        // Otherwise fall back to a single ISO inside the folder.
+        if let Some(iso) = files.iter().find(|f| iso_exts.contains(file_ext(f).as_str())) {
+            let target = iso.strip_prefix(&path).unwrap_or(iso).to_path_buf();
+            out.push(game_entry(library_root, &path, "Xbox", &title, &target, "emulator_rom", "{rom}").await?);
+        }
     }
     Ok(out)
 }
@@ -3381,17 +3670,44 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
     let igdb_client_secret = settings.iter().find(|(k, _)| k == IGDB_CLIENT_SECRET_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
     let public_base_url = settings.iter().find(|(k, _)| k == PUBLIC_BASE_URL_KEY).map(|(_, v)| v.as_str()).unwrap_or("");
     let matcher_html = metadata_matcher_html(st, &games, matcher_game_id, matcher_query).await;
+
+    // Changelog authoring panel: a game picker + note form, and a table of the
+    // most recent entries with delete buttons.
+    let cl_game_options = games
+        .iter()
+        .map(|g| format!("<option value='{}'>{}</option>", esc(&g.id), esc(&g.title)))
+        .collect::<String>();
+    let cl_admin_rows = list_changelogs_admin(&st.db).await.unwrap_or_default();
+    let cl_rows = cl_admin_rows
+        .iter()
+        .map(|(id, game_title, version, title)| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td><form method='post' class='inline'><input type='hidden' name='changelog_id' value='{}'><button name='action' value='delete_changelog' class='danger'>Delete</button></form></td></tr>",
+                esc(game_title),
+                if version.is_empty() { "&mdash;".into() } else { esc(version) },
+                if title.is_empty() { "&mdash;".into() } else { esc(title) },
+                id
+            )
+        })
+        .collect::<String>();
+    let changelog_section = format!(
+        r#"<section id="changelogs" class="section"><div class="section-heading"><h2>Changelogs</h2><span class="muted">Patch notes surfaced in the client game dashboard.</span></div><div class="two-col"><div><h3>Add Entry</h3><form method="post" class="stack"><select name="game_id">{}</select><input name="changelog_version" placeholder="Version (optional, e.g. 1.2.0)"><input name="changelog_title" placeholder="Title (optional)"><textarea name="changelog_body" rows="6" placeholder="Markdown / plain text release notes"></textarea><button name="action" value="add_changelog">Publish Entry</button></form></div><div><h3>Recent Entries</h3><table><thead><tr><th>Game</th><th>Version</th><th>Title</th><th>Action</th></tr></thead><tbody>{}</tbody></table></div></div></section>"#,
+        if cl_game_options.is_empty() { "<option value=''>No games cataloged</option>".into() } else { cl_game_options },
+        if cl_rows.is_empty() { "<tr><td colspan='4'>No changelog entries yet.</td></tr>".into() } else { cl_rows },
+    );
+
     let signed = admin.map(|a| a.username).unwrap_or_default();
     Ok(shell(&format!(
         r##"
         <div class="admin-layout">
-          <aside class="sidebar"><div class="brand-block"><div class="brand-mark">AL</div><div><div class="brand-title">ArcadeLauncher</div><div class="brand-subtitle">Rust Server</div></div></div><nav><a href="#overview">Overview</a><a href="#services">Services</a><a href="#library">Library</a><a href="/admin/metadata">Metadata</a><a href="#auth">Auth</a><a href="#config">Configuration</a></nav></aside>
+          <aside class="sidebar"><div class="brand-block"><div class="brand-mark">AL</div><div><div class="brand-title">ArcadeLauncher</div><div class="brand-subtitle">Rust Server</div></div></div><nav><a href="#overview">Overview</a><a href="#services">Services</a><a href="#library">Library Setup</a><a href="#changelogs">Changelogs</a><a href="/admin/metadata">Metadata</a><a href="#auth">Auth</a><a href="#config">Configuration</a></nav></aside>
           <div class="content">
             <section class="topbar"><div><div class="eyebrow">Private library server</div><h1>Server Administration</h1></div><div class="account-box"><span>Signed in as <strong>{}</strong></span><a class="buttonlink" href="/admin/logout">Sign Out</a></div></section>
             {}
             <section id="overview" class="section"><div class="section-heading"><h2>Overview</h2><span class="muted">Rust backend, MariaDB catalog, local file delivery</span></div><div class="metric-grid"><div class="metric"><span>Total Games</span><strong>{}</strong></div><div class="metric"><span>Platforms</span><strong>{}</strong></div><div class="metric"><span>Issued Tokens</span><strong>{}</strong></div><div class="metric"><span>Users</span><strong>{}</strong></div></div></section>
             <section id="services" class="section"><div class="section-heading"><h2>Backend Services</h2><span class="muted">Live checks from the running server process</span></div><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Action</th></tr></thead><tbody>{}</tbody></table></section>
             <section id="library" class="section split"><div><div class="section-heading"><h2>Library Setup</h2><span class="muted">Filesystem stores files; MariaDB stores lookup metadata and IGDB art.</span></div><dl class="kv"><dt>Library Root</dt><dd><code>{}</code></dd><dt>Backend</dt><dd><code>rust/axum</code></dd><dt>Art Cache</dt><dd><code>{}</code></dd></dl><form method="post" class="row"><button name="action" value="rescan">Rescan Filesystem and Sync DB</button><button name="action" value="igdb_enrich">Sync IGDB Metadata</button><button name="action" value="igdb_refresh">Force Refresh IGDB Metadata</button><button name="action" value="validate_games">Validate Games</button></form><div id="scan-status" class="scanbox"><div class="scanhead"><span id="sc-phase" class="scanphase idle"><span id="sc-spin" class="scanspin"></span><span id="sc-phtext">Idle</span></span><span class="scanmeta"><strong id="sc-count">0/0</strong> &middot; <span id="sc-pct">0%</span> &middot; elapsed <span id="sc-elapsed">0s</span></span></div><div id="sc-bar" class="scanbar"><i id="sc-fill"></i></div><div id="sc-cur" class="scancur"></div><div id="sc-plat" class="scanplat"></div><div id="sc-msg" class="scanmsg"></div></div><script>(function(){{var box=document.getElementById('scan-status');if(!box)return;var phEl=document.getElementById('sc-phase'),phTx=document.getElementById('sc-phtext'),spin=document.getElementById('sc-spin'),cnt=document.getElementById('sc-count'),pctEl=document.getElementById('sc-pct'),elEl=document.getElementById('sc-elapsed'),bar=document.getElementById('sc-bar'),fill=document.getElementById('sc-fill'),cur=document.getElementById('sc-cur'),plat=document.getElementById('sc-plat'),msg=document.getElementById('sc-msg');var names={{scanning:'Scanning library',hashing:'Hashing files',igdb:'Enriching metadata',done:'Completed',error:'Failed',idle:'Idle'}};function fmt(sec){{if(sec<60)return sec+'s';var m=Math.floor(sec/60),s=sec%60;return m+'m '+(s<10?'0':'')+s+'s';}}function render(s){{var phase=s.phase||'idle';box.classList.add('active');phEl.className='scanphase '+(phase==='done'?'done':phase==='error'?'error':phase==='idle'?'idle':'');phTx.textContent=names[phase]||phase;spin.style.display=s.running?'inline-block':'none';var total=s.total||0,proc=s.processed||0;var pct=total?Math.floor(proc*100/total):0;cnt.textContent=proc+'/'+total;pctEl.textContent=pct+'%';var nowSec=Math.floor(Date.now()/1000);var srv=s.startedAt?((s.updatedAt||nowSec)-s.startedAt):0;var elapsed=s.running?Math.max(srv,nowSec-(s.startedAt||nowSec)):srv;elEl.textContent=fmt(Math.max(0,elapsed));if(s.running&&!total){{bar.className='scanbar indet';fill.style.width='40%';}}else{{bar.className='scanbar';fill.style.width=pct+'%';}}var act=s.active||0;cur.textContent=s.current?('Hashing: '+s.current+(act>1?(' (+'+(act-1)+' more in parallel)'):'')):(act>0?(act+' hashing in parallel'):'');var pp=s.perPlatform||{{}};var keys=Object.keys(pp).sort();var ph='';for(var i=0;i<keys.length;i++){{var k=keys[i],v=pp[k]||{{}},t=v.total||0,p=v.processed||0,w=t?Math.floor(p*100/t):0,dn=(t&&p>=t);ph+='<div class="scanplat-row"><span class="scanplat-name">'+k+'</span><span class="scanplat-bar'+(dn?' done':'')+'"><i style="width:'+w+'%"></i></span><span class="scanplat-num">'+p+'/'+t+'</span></div>';}}plat.innerHTML=((phase==='hashing'||phase==='done')&&keys.length)?ph:'';msg.textContent=(phase==='done'||phase==='error')?(s.message||''):'';}}function poll(){{fetch('/admin/scan-status').then(function(r){{return r.json();}}).then(function(s){{if(!s)return;if(s.running||s.phase==='done'||s.phase==='error'){{render(s);}}else{{box.classList.remove('active');}}}}).catch(function(){{}});setTimeout(poll,1000);}}poll();}})();</script>{}<h3>Game Validation</h3><table><thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead><tbody>{}</tbody></table></div><div class="platform-card"><h3>Platform Counts</h3>{}</div></section>
+            {}
             <section id="auth" class="section"><div class="section-heading"><h2>Auth Management</h2><span class="muted">All users sign in with username/password; bearer tokens are issued behind the scenes.</span></div><div class="two-col"><div><h3>Create User</h3><form method="post" class="row"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form><h3>Users</h3><table><thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div><div><h3>Issued Tokens</h3><table><thead><tr><th>Name</th><th>Bearer Token</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div></div></section>
             <section id="config" class="section"><div class="section-heading"><h2>Configuration</h2><span class="muted">Runtime env is read-only here; managed settings are stored in MariaDB.</span></div><div class="two-col"><div><h3>Runtime</h3><dl class="kv"><dt>API Listen</dt><dd><code>{}:{}</code></dd><dt>Admin Listen</dt><dd><code>{}:{}</code></dd><dt>Library</dt><dd><code>{}</code></dd><dt>Database</dt><dd><code>{}:{} / {}</code></dd><dt>Chunking</dt><dd><code>{} byte raw chunks; full-file fallback retained</code></dd></dl></div><div><h3>Backend URL</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="server.public_base_url"><input name="setting_value" type="url" placeholder="https://arcade.orlandoaio.net" value="{}"><button name="action" value="save_setting">Save Backend URL</button></form><h3>IGDB Credentials</h3><form method="post" class="stack"><input type="hidden" name="setting_key" value="igdb.client_id"><input name="setting_value" placeholder="IGDB/Twitch Client ID" value="{}"><button name="action" value="save_setting">Save Client ID</button></form><form method="post" class="stack credential-form"><input type="hidden" name="setting_key" value="igdb.client_secret"><input name="setting_value" type="password" placeholder="{}"><button name="action" value="save_setting">Save Client Secret</button></form><form method="post" class="row new-setting"><button name="action" value="igdb_enrich">Sync IGDB Metadata</button></form><h3>Managed Settings</h3><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{}</tbody></table><form method="post" class="row new-setting"><input name="setting_key" placeholder="setting.key"><input name="setting_value" placeholder="value"><button name="action" value="save_setting">Add / Save</button></form></div></div></section>
           </div>
@@ -3409,6 +3725,7 @@ async fn admin_html(st: &AppState, admin: Option<User>, message: &str, matcher_g
         matcher_html,
         validation_summary,
         if platform_rows.is_empty() { "<p class='muted'>No cataloged platforms yet.</p>".into() } else { platform_rows },
+        changelog_section,
         if user_rows.is_empty() { "<tr><td colspan='6'>No users yet.</td></tr>".into() } else { user_rows },
         if token_rows.is_empty() { "<tr><td colspan='4'>No issued tokens yet.</td></tr>".into() } else { token_rows },
         esc(&st.cfg.host),
@@ -3891,6 +4208,15 @@ mod tests {
         let fwd = stable_id("PC", Path::new("games/PC/Doom"));
         let back = stable_id("PC", Path::new(r"games\PC\Doom"));
         assert_eq!(fwd, back);
+    }
+
+    #[test]
+    fn match_key_drops_noise_and_normalizes_separators() {
+        // Dot/underscore separators and scene/region tags collapse to the core
+        // title so the Jaccard pass scores a clean hit against the IGDB name.
+        assert_eq!(match_key("Super.Mario.64 USA v1"), "super mario 64");
+        assert_eq!(match_key("Halo_Combat_Evolved (PAL) REPACK"), "halo combat evolved");
+        assert!(title_similarity(&match_key("Super.Mario.64 (USA)"), &match_key("Super Mario 64")) >= 0.60);
     }
 
     #[test]
