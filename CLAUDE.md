@@ -1,9 +1,31 @@
 # ArcadeLauncher Server — working notes for Claude
 
-Single-file **Rust / axum 0.7 / tokio** backend (`src/main.rs`, ~3300 lines) with
-a **MariaDB** (`mysql_async`) catalog, Argon2/TOTP auth, and an admin HTML UI
-rendered via `format!` (literal braces are doubled `{{`/`}}`). Read
-[`README.md`](README.md) for deployment.
+**Rust / axum 0.7 / tokio** backend with a **MariaDB** (`mysql_async`) catalog,
+Argon2/TOTP auth, and an admin HTML UI rendered via `format!` (literal braces are
+doubled `{{`/`}}`). Read [`README.md`](README.md) for deployment.
+
+### Source layout (split via `include!`)
+`src/main.rs` keeps only the top-level `use` block, the shared `const`s, `fn main`,
+and `#[cfg(test)] mod tests`, then `include!`s the rest. Every included file lives
+in the **crate-root scope** — there are no `mod`/`use`/`pub` boundaries between
+them, so an item defined in one file is callable from any other with no qualifier,
+exactly as when it was one file. To find code, open the file by topic:
+- `models.rs` — structs, impls, constants (`AppState`, `Config`, `Game`, …)
+- `db_setup.rs` — `ensure_database` / `ensure_schema` / bootstrap admin
+- `auth.rs` — login, challenge/verify, account, TOTP HTTP handlers
+- `handlers.rs` — `api_catalog`/`api_manifest`/download + admin POST handlers
+- `db.rs` — user/token/session/settings/games DB queries
+- `manifest.rs` — manifest build, stored-file hashing, changelogs, `ensure_manifests`
+- `files.rs` — content paths, byte-range streaming, dir walks, `safe_join`
+- `crypto.rs` — password/TOTP/scrypt/base32, art helpers, small util fns
+- `scan_jobs.rs` — filesystem watcher, `spawn_rescan`, `rescan_catalog`, scan-status
+- `igdb.rs` — IGDB auth/search/match/enrich
+- `scan.rs` — catalog scanners, `game_entry`, `sync_catalog_db`, validation
+- `admin_html.rs` — admin/metadata HTML builders + `CSS`
+
+When editing, prefer the relevant file; only edits to the `use` block, shared
+consts, `main`, or tests touch `main.rs`. The compiled binary is identical to the
+former single-file build.
 
 ## Build & test
 - `cargo build --release` — single binary.
