@@ -35,6 +35,12 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN auth_key CHAR(64) NULL").await;
     // Admin can force a user to set a new password on next client login.
     let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE").await;
+    // Per-user profile picture (server-synced avatar). Bytes + mime stored
+    // inline; avatar_updated is a version stamp the client polls to know when to
+    // refetch. Capped client-side to a small re-encoded image.
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN avatar MEDIUMBLOB NULL").await;
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN avatar_mime VARCHAR(64) NULL").await;
+    let _ = c.query_drop("ALTER TABLE admin_users ADD COLUMN avatar_updated BIGINT NOT NULL DEFAULT 0").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS launcher_tokens (
           id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -90,6 +90,13 @@ async fn main() -> Result<()> {
         .route("/api/account/totp/setup", post(api_account_totp_setup))
         .route("/api/account/totp/enable", post(api_account_totp_enable))
         .route("/api/account/totp/disable", post(api_account_totp_disable))
+        .route(
+            "/api/account/avatar",
+            get(api_account_avatar)
+                .post(api_account_avatar_upload)
+                .delete(api_account_avatar_delete)
+                .layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
+        )
         .route("/api/health", get(api_health))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))

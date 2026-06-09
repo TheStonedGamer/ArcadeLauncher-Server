@@ -58,6 +58,50 @@ async fn launcher_user(st: &AppState, headers: &HeaderMap) -> Option<User> {
     find_user_by_id(&st.db, uid?).await.ok().flatten()
 }
 
+// Profile picture (avatar) accessors. Stored inline on the user row; bytes are
+// only loaded on demand by the avatar GET endpoint, never in the hot user fetch.
+async fn get_user_avatar(db: &Pool, user_id: u64) -> Result<Option<(Vec<u8>, String)>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<(Option<Vec<u8>>, Option<String>)> = c
+        .exec_first(
+            "SELECT avatar, avatar_mime FROM admin_users WHERE id=:id",
+            params! {"id" => user_id},
+        )
+        .await?;
+    Ok(row.and_then(|(bytes, mime)| match (bytes, mime) {
+        (Some(b), Some(m)) if !b.is_empty() => Some((b, m)),
+        _ => None,
+    }))
+}
+
+async fn get_user_avatar_version(db: &Pool, user_id: u64) -> i64 {
+    let Ok(mut c) = db.get_conn().await else { return 0; };
+    let row: Result<Option<i64>, _> = c
+        .exec_first("SELECT avatar_updated FROM admin_users WHERE id=:id", params! {"id" => user_id})
+        .await;
+    row.ok().flatten().unwrap_or(0)
+}
+
+async fn set_user_avatar(db: &Pool, user_id: u64, bytes: &[u8], mime: &str) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        "UPDATE admin_users SET avatar=:a, avatar_mime=:m, avatar_updated=:t WHERE id=:id",
+        params! {"a" => bytes.to_vec(), "m" => mime, "t" => now(), "id" => user_id},
+    )
+    .await?;
+    Ok(())
+}
+
+async fn clear_user_avatar(db: &Pool, user_id: u64) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        "UPDATE admin_users SET avatar=NULL, avatar_mime=NULL, avatar_updated=:t WHERE id=:id",
+        params! {"t" => now(), "id" => user_id},
+    )
+    .await?;
+    Ok(())
+}
+
 async fn user_must_change_password(db: &Pool, id: u64) -> bool {
     let Ok(mut c) = db.get_conn().await else { return false; };
     let row: Result<Option<bool>, _> = c

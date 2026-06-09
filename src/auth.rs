@@ -157,14 +157,81 @@ async fn api_account(State(st): State<AppState>, headers: HeaderMap) -> Response
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "not authenticated"}))).into_response();
     };
     let must_change = user_must_change_password(&st.db, user.id).await;
+    let avatar_version = get_user_avatar_version(&st.db, user.id).await;
     Json(serde_json::json!({
         "username": user.username,
         "email": user.email,
         "isAdmin": user.is_admin,
         "totpEnabled": user.totp_enabled,
         "mustChangePassword": must_change,
+        "avatarVersion": avatar_version,
     }))
     .into_response()
+}
+
+// Sniff a supported raster image type from magic bytes, falling back to a
+// declared image/* content type. Returns None for anything we won't store.
+fn detect_image_mime(data: &[u8], content_type: &str) -> Option<String> {
+    if data.len() >= 8 && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Some("image/png".into());
+    }
+    if data.len() >= 3 && data[..3] == [0xFF, 0xD8, 0xFF] {
+        return Some("image/jpeg".into());
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("image/webp".into());
+    }
+    if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        return Some("image/gif".into());
+    }
+    let ct = content_type.split(';').next().unwrap_or("").trim();
+    if ct.starts_with("image/") && ct.len() <= 64 {
+        return Some(ct.to_string());
+    }
+    None
+}
+
+// GET /api/account/avatar — the current user's profile picture bytes.
+async fn api_account_avatar(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    match get_user_avatar(&st.db, user.id).await {
+        Ok(Some((bytes, mime))) => (
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no avatar").into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+// POST /api/account/avatar — upload/replace the profile picture. Raw image bytes
+// in the body; type is sniffed from magic bytes (Content-Type is only a hint).
+async fn api_account_avatar_upload(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    if body.is_empty() || body.len() > 4 * 1024 * 1024 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "image must be 1 byte..4 MB"}))).into_response();
+    }
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let Some(mime) = detect_image_mime(&body, ct) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unsupported image type"}))).into_response();
+    };
+    if let Err(e) = set_user_avatar(&st.db, user.id, &body, &mime).await {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+// DELETE /api/account/avatar — remove the profile picture.
+async fn api_account_avatar_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    if let Err(e) = clear_user_avatar(&st.db, user.id).await {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 // POST /api/account/password — change own password. Verifies the current
