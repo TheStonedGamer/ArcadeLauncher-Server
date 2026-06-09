@@ -2006,6 +2006,16 @@ async fn walk_dirs(root: &Path) -> Result<Vec<PathBuf>> {
 #[allow(dead_code)]
 async fn sha256_file(path: &Path) -> Result<String> {
     let mut f = File::open(path).await?;
+    // File-lock / stability safety: snapshot size+mtime before hashing so we can
+    // confirm the file was not being actively rewritten while we read it. The
+    // open handle `f` is held for the whole hash (the "lock-safety closure"), so
+    // the file can't be deleted out from under us; bracketing with metadata then
+    // rejects a hash computed over a file that changed mid-read (e.g. an
+    // in-progress copy onto the NAS). A rejected file simply has no stored
+    // manifest this round and is retried on the next scan once it settles.
+    let before = f.metadata().await?;
+    let (before_len, before_mtime) = (before.len(), before.modified().ok());
+
     let mut h = Sha256::new();
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
@@ -2014,6 +2024,14 @@ async fn sha256_file(path: &Path) -> Result<String> {
             break;
         }
         h.update(&buf[..n]);
+    }
+
+    let after = f.metadata().await?;
+    if after.len() != before_len || after.modified().ok() != before_mtime {
+        return Err(anyhow!(
+            "file changed while hashing (still being written?): {}",
+            path.display()
+        ));
     }
     Ok(hex::encode(h.finalize()))
 }
@@ -3124,16 +3142,33 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
 async fn version_for(path: &Path) -> Result<String> {
     let meta = fs::metadata(path).await?;
     if meta.is_file() {
-        let modified = modified_secs(&meta);
-        return Ok(sha1_short(&format!("{}:{}:{}", path.file_name().and_then(|s| s.to_str()).unwrap_or(""), meta.len(), modified)));
+        return Ok(sha1_short(&format!(
+            "{}:{}",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            stable_sig(&meta)
+        )));
     }
     let mut h = Sha1::new();
     for file_path in walk_files(path).await? {
         let meta = fs::metadata(&file_path).await?;
         let rel = file_path.strip_prefix(path).unwrap_or(&file_path).to_string_lossy().replace('\\', "/");
-        h.update(format!("{}:{}:{}\n", rel, meta.len(), modified_secs(&meta)).as_bytes());
+        h.update(format!("{}:{}\n", rel, stable_sig(&meta)).as_bytes());
     }
     Ok(hex::encode(h.finalize())[..12].to_string())
+}
+
+// Stable per-file fingerprint component for change detection. Uses size plus a
+// coarse (whole-second) mtime, but — crucially — omits mtime entirely when the
+// platform can't report it instead of substituting 0. The old code used
+// `mtime.unwrap_or(0)`, so a filesystem that intermittently failed to return
+// mtime (common on NAS/NFS mounts) would oscillate the fingerprint between a
+// real value and 0 on alternating scans, flagging the game as perpetually
+// modified and forcing an endless re-hash loop.
+fn stable_sig(meta: &std::fs::Metadata) -> String {
+    match meta.modified().ok().and_then(|m| m.duration_since(UNIX_EPOCH).ok()) {
+        Some(d) => format!("{}:{}", meta.len(), d.as_secs()),
+        None => format!("{}:-", meta.len()),
+    }
 }
 
 fn stable_id(platform: &str, relative: &Path) -> String {
@@ -3144,14 +3179,6 @@ fn sha1_short(text: &str) -> String {
     let mut h = Sha1::new();
     h.update(text.as_bytes());
     hex::encode(h.finalize())[..12].to_string()
-}
-
-fn modified_secs(meta: &std::fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn file_ext(path: &Path) -> String {
