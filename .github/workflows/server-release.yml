@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# Opt every JavaScript action into the Node.js 24 runtime now, ahead of the
+# 2026-06-16 forced cutover that retires Node.js 20 on GitHub-hosted runners.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   package:
     name: Package Server
@@ -19,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
