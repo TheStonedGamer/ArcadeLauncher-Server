@@ -3146,7 +3146,7 @@ async fn scan_xbox_original(library_root: &Path) -> Result<Vec<Game>> {
                 let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
                 out.push(game_entry(
                     library_root, &path, "Xbox", &clean_title(name),
-                    Path::new(name), "emulator_rom", "{rom}",
+                    Path::new(name), "emulator_rom", "-dvd_path {rom}",
                 ).await?);
             }
             continue;
@@ -3172,7 +3172,7 @@ async fn scan_xbox_original(library_root: &Path) -> Result<Vec<Game>> {
         // Otherwise fall back to a single ISO inside the folder.
         if let Some(iso) = files.iter().find(|f| iso_exts.contains(file_ext(f).as_str())) {
             let target = iso.strip_prefix(&path).unwrap_or(iso).to_path_buf();
-            out.push(game_entry(library_root, &path, "Xbox", &title, &target, "emulator_rom", "{rom}").await?);
+            out.push(game_entry(library_root, &path, "Xbox", &title, &target, "emulator_rom", "-dvd_path {rom}").await?);
         }
     }
     Ok(out)
