@@ -254,6 +254,11 @@ fn hash_file_blocking(path: &Path, rel_root: &Path) -> Result<StoredFile> {
     })
 }
 
+// Largest manifest segment written per row. Kept well under MariaDB's default
+// `max_allowed_packet` (16 MB) so a single game — however large — never produces
+// an oversized wire packet on insert or read.
+const MANIFEST_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
+
 async fn load_stored_manifest(db: &Pool, game_id: &str, version: &str) -> Result<Option<Vec<StoredFile>>> {
     let mut c = db.get_conn().await?;
     let row: Option<(String, String)> = c
@@ -262,22 +267,79 @@ async fn load_stored_manifest(db: &Pool, game_id: &str, version: &str) -> Result
             params! {"id" => game_id},
         )
         .await?;
-    match row {
-        Some((v, json)) if v == version => Ok(Some(serde_json::from_str(&json)?)),
-        _ => Ok(None),
+    let Some((v, legacy_json)) = row else { return Ok(None); };
+    if v != version {
+        return Ok(None);
     }
+    // Prefer segmented storage; fall back to the legacy inline column for rows
+    // written before segmenting (they migrate to segments on next store).
+    let segments: Vec<String> = c
+        .exec(
+            "SELECT body FROM game_manifest_segments WHERE game_id=:id ORDER BY seq",
+            params! {"id" => game_id},
+        )
+        .await?;
+    let json = if segments.is_empty() { legacy_json } else { segments.concat() };
+    if json.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&json)?))
+}
+
+// Split a string into ordered ≤`max` byte pieces on UTF-8 char boundaries.
+// Concatenating the result reproduces the input exactly.
+fn split_segments(s: &str, max: usize) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let max = max.max(1);
+    while start < s.len() {
+        let mut end = (start + max).min(s.len());
+        while end < s.len() && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        // If `max` is smaller than the next char, backoff reaches `start`; take
+        // the whole next char so we always make progress (can't happen at the
+        // 4 MB production size, but keeps the helper total).
+        if end == start {
+            end = start + 1;
+            while end < s.len() && !s.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        segments.push(&s[start..end]);
+        start = end;
+    }
+    segments
 }
 
 async fn store_manifest(db: &Pool, game_id: &str, version: &str, files: &[StoredFile]) -> Result<()> {
     let json = serde_json::to_string(files)?;
+    let segments = split_segments(&json, MANIFEST_SEGMENT_BYTES);
+
     let mut c = db.get_conn().await?;
-    c.exec_drop(
+    let mut tx = c.start_transaction(mysql_async::TxOpts::default()).await?;
+    // Metadata row: keep version/updated_at; clear the legacy inline column so
+    // segments are the single source of truth going forward.
+    tx.exec_drop(
         r#"INSERT INTO game_manifests (game_id, version, files_json, updated_at)
-           VALUES (:id, :version, :json, :ts)
-           ON DUPLICATE KEY UPDATE version=VALUES(version), files_json=VALUES(files_json), updated_at=VALUES(updated_at)"#,
-        params! {"id" => game_id, "version" => version, "json" => json, "ts" => now()},
+           VALUES (:id, :version, '', :ts)
+           ON DUPLICATE KEY UPDATE version=VALUES(version), files_json='', updated_at=VALUES(updated_at)"#,
+        params! {"id" => game_id, "version" => version, "ts" => now()},
     )
     .await?;
+    tx.exec_drop(
+        "DELETE FROM game_manifest_segments WHERE game_id=:id",
+        params! {"id" => game_id},
+    )
+    .await?;
+    for (seq, body) in segments.iter().enumerate() {
+        tx.exec_drop(
+            "INSERT INTO game_manifest_segments (game_id, seq, body) VALUES (:id, :seq, :body)",
+            params! {"id" => game_id, "seq" => seq as i32, "body" => *body},
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -426,7 +488,8 @@ async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
     let existing: Vec<String> = c.query("SELECT game_id FROM game_manifests").await?;
     for id in existing {
         if !ids.contains(id.as_str()) {
-            c.exec_drop("DELETE FROM game_manifests WHERE game_id=:id", params! {"id" => id}).await?;
+            c.exec_drop("DELETE FROM game_manifests WHERE game_id=:id", params! {"id" => &id}).await?;
+            c.exec_drop("DELETE FROM game_manifest_segments WHERE game_id=:id", params! {"id" => id}).await?;
         }
     }
     Ok(())

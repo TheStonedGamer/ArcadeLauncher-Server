@@ -254,6 +254,24 @@ mod tests {
     }
 
     #[test]
+    fn split_segments_round_trips_and_bounds_size() {
+        // Mixed ASCII + multibyte so boundary backoff is exercised.
+        let s = "héllo wörld ".repeat(5000);
+        // At realistic sizes (>= max UTF-8 char width) the byte bound holds exactly.
+        for max in [4usize, 7, 64, 4096] {
+            let segs = split_segments(&s, max);
+            assert!(segs.iter().all(|seg| seg.len() <= max), "segment exceeded max={max}");
+            assert_eq!(segs.concat(), s, "round-trip failed for max={max}");
+        }
+        // Degenerate max smaller than a char must still terminate and round-trip.
+        let tiny = split_segments(&s, 1);
+        assert_eq!(tiny.concat(), s);
+        assert!(tiny.iter().all(|seg| !seg.is_empty()));
+        // Empty input yields no segments.
+        assert!(split_segments("", 16).is_empty());
+    }
+
+    #[test]
     fn stable_id_is_deterministic_and_platform_lowercased() {
         let a = stable_id("Xbox360", Path::new("games/Xbox360/Halo.iso"));
         let b = stable_id("Xbox360", Path::new("games/Xbox360/Halo.iso"));

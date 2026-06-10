@@ -117,6 +117,20 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Manifest payloads for large games (e.g. 145 GB repacks at 1 MiB chunks)
+    // can exceed MariaDB's `max_allowed_packet`, so files_json is stored split
+    // into ordered ≤4 MB segments here and reassembled on read. The `files_json`
+    // column above is retained for legacy rows and read as a fallback when a
+    // game has no segments yet (smooth migration — no forced re-hash).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_manifest_segments (
+          game_id VARCHAR(96) NOT NULL,
+          seq INT NOT NULL,
+          body LONGTEXT NOT NULL,
+          PRIMARY KEY (game_id, seq)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     // Per-game changelog / patch-notes entries shown in the client's game
     // dashboard. Linked to games.id; rows are removed when the game row is
     // deleted (ON DELETE CASCADE). `version` is the optional version label the
