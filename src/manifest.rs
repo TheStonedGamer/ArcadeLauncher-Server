@@ -65,7 +65,7 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
     let stored = match load_stored_manifest(&st.db, &game.id, &game.version).await {
         Ok(Some(files)) => files,
         _ => {
-            let files = compute_stored_files(&st.cfg, &game).await?;
+            let files = compute_stored_files(st, &game).await?;
             if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
                 error!("failed to persist manifest for {}: {e}", game.id);
             }
@@ -141,7 +141,8 @@ async fn manifest_for(st: &AppState, headers: &HeaderMap, game: &Game) -> Result
 // Hash every file of a game once, producing the full-file sha256 and per-chunk
 // hashes in a single read pass. This is the expensive work that must happen
 // during scan/sync, never inside a manifest request.
-async fn compute_stored_files(cfg: &Config, game: &Game) -> Result<Vec<StoredFile>> {
+async fn compute_stored_files(st: &AppState, game: &Game) -> Result<Vec<StoredFile>> {
+    let cfg = &st.cfg;
     let root = content_path_for(cfg, game).await?;
     let (files, rel_root) = if fs::metadata(&root).await?.is_file() {
         (vec![root.clone()], root.parent().unwrap_or(&cfg.library_root).to_path_buf())
@@ -159,6 +160,14 @@ async fn compute_stored_files(cfg: &Config, game: &Game) -> Result<Vec<StoredFil
         let rel_root = rel_root.clone();
         async move {
             let _permit = hash_semaphore().acquire().await.expect("hash semaphore closed");
+            // Report the file about to be hashed. With concurrent files in flight
+            // this reflects the most recently started one — a live "current file".
+            let name = path
+                .strip_prefix(&rel_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            st.set_scan(|s| { s.current_file = name; });
             tokio::task::spawn_blocking(move || hash_file_blocking(&path, &rel_root))
                 .await
                 .map_err(|e| anyhow!("hash task panicked: {e}"))?
@@ -368,6 +377,7 @@ async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
         s.processed = 0;
         s.active = 0;
         s.current = String::new();
+        s.current_file = String::new();
         s.message = "Generating file hashes…".to_string();
         s.per_platform = platform_totals.clone();
     });
@@ -389,7 +399,7 @@ async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
                     s.active += 1;
                     s.current = game.title.clone();
                 });
-                match compute_stored_files(&st.cfg, game).await {
+                match compute_stored_files(st, game).await {
                     Ok(files) => {
                         if let Err(e) = store_manifest(&st.db, &game.id, &game.version, &files).await {
                             error!("failed to persist manifest for {}: {e}", game.id);
@@ -405,6 +415,7 @@ async fn ensure_manifests(st: &AppState, games: &[Game]) -> Result<()> {
                 s.per_platform.entry(platform).or_default().processed += 1;
                 if s.active == 0 {
                     s.current = String::new();
+                    s.current_file = String::new();
                 }
             });
         })

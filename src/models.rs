@@ -55,6 +55,8 @@ struct ScanStatus {
     #[serde(default)]
     active: usize, // games currently being hashed in parallel (hashing phase)
     current: String,
+    #[serde(default)]
+    current_file: String, // file currently being hashed within `current`
     started_at: i64, // epoch seconds when the current/last run began (0 = never)
     updated_at: i64, // epoch seconds of the last progress update
     #[serde(default)]
