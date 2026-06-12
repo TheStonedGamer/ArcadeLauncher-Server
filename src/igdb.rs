@@ -20,7 +20,9 @@ async fn enrich_catalog_from_igdb(st: &AppState, force: bool) -> Result<String> 
             continue;
         }
         match igdb_best_match(&http, &client_id, &token, &game).await {
-            Ok(Some(meta)) => {
+            // Strictly validate the payload before committing: a usable match must
+            // carry a real IGDB id and a non-empty name.
+            Ok(Some(meta)) if meta.id > 0 && !meta.name.trim().is_empty() => {
                 let cover_art_url = if !meta.cover_image_id.is_empty() {
                     match cache_igdb_cover(&http, st, &game.id, &meta.cover_image_id).await {
                         Ok(true) => "local".to_string(),
@@ -33,13 +35,22 @@ async fn enrich_catalog_from_igdb(st: &AppState, force: bool) -> Result<String> 
                 matched += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(260)).await;
             }
-            Ok(None) => {
+            // Matched something but it failed validation, or no match at all:
+            // fall back to local folder scraping so the queue never stalls.
+            Ok(_) => {
                 failed += 1;
+                warn!("IGDB no valid match for id={} platform={} title={}", game.id, game.platform, game.title);
+                if let Err(e) = apply_local_metadata_fallback(st, &game).await {
+                    warn!("local metadata fallback failed for id={}: {e}", game.id);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(260)).await;
             }
             Err(e) => {
                 failed += 1;
-                error!("IGDB metadata failed for {}: {e}", game.title);
+                error!("IGDB metadata failed for id={} platform={} title={}: {e}", game.id, game.platform, game.title);
+                if let Err(fe) = apply_local_metadata_fallback(st, &game).await {
+                    warn!("local metadata fallback failed for id={}: {fe}", game.id);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
@@ -47,19 +58,169 @@ async fn enrich_catalog_from_igdb(st: &AppState, force: bool) -> Result<String> 
     Ok(format!("IGDB enrichment complete. matched: {matched}, skipped: {skipped}, unmatched/failed: {failed}"))
 }
 
+// Exponential backoff (1,2,4,8,16s, capped at 30) with ±1s jitter for IGDB/Twitch
+// retries. Attempt is 1-based.
+fn igdb_backoff_secs(attempt: u32) -> u64 {
+    let base = 1u64 << attempt.saturating_sub(1).min(5);
+    base.min(30) + rand::thread_rng().gen_range(0..=1)
+}
+
+// Whether a reqwest transport error is worth retrying (timeout / connect /
+// transient request failure) rather than a permanent client error.
+fn is_transient(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+const IGDB_MAX_ATTEMPTS: u32 = 5;
+
+// POST to the IGDB games endpoint with exponential-backoff retries. Retries on
+// HTTP 429 (honoring Retry-After when present) and 5xx / transient transport
+// errors; surfaces the raw status + body on a permanent failure so callers can
+// log the API error code.
+async fn igdb_post_json(http: &Client, client_id: &str, token: &str, body: String) -> Result<serde_json::Value> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let sent = http
+            .post("https://api.igdb.com/v4/games")
+            .header("Client-ID", client_id)
+            .bearer_auth(token)
+            .body(body.clone())
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp.json().await?);
+                }
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                if retryable && attempt < IGDB_MAX_ATTEMPTS {
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let delay = retry_after.unwrap_or_else(|| igdb_backoff_secs(attempt));
+                    warn!("IGDB API {status} (attempt {attempt}/{IGDB_MAX_ATTEMPTS}); retrying in {delay}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "IGDB API returned {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                ));
+            }
+            Err(e) if attempt < IGDB_MAX_ATTEMPTS && is_transient(&e) => {
+                let delay = igdb_backoff_secs(attempt);
+                warn!("IGDB transport error (attempt {attempt}/{IGDB_MAX_ATTEMPTS}): {e}; retrying in {delay}s");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+// Local-folder metadata fallback used when IGDB can't match, times out, or errors
+// out — so the sync queue keeps moving instead of leaving a game blank. Scrapes a
+// sibling `.nfo` sidecar (Genre/Description lines) and a local cover image, then
+// commits whatever it found.
+async fn apply_local_metadata_fallback(st: &AppState, game: &Game) -> Result<()> {
+    let root = content_path_for(&st.cfg, game).await?;
+    let dir = match fs::metadata(&root).await {
+        Ok(m) if m.is_file() => root.parent().map(Path::to_path_buf),
+        Ok(_) => Some(root.clone()),
+        Err(_) => None,
+    };
+    let mut summary = String::new();
+    let mut genres = String::new();
+    if let Some(dir) = &dir {
+        if let Ok(mut entries) = fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let is_nfo = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("nfo"))
+                    .unwrap_or(false);
+                if !is_nfo {
+                    continue;
+                }
+                if let Ok(text) = fs::read_to_string(&path).await {
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        let Some(colon) = trimmed.find(':') else { continue; };
+                        let (label, value) = trimmed.split_at(colon);
+                        let value = value[1..].trim();
+                        if value.is_empty() {
+                            continue;
+                        }
+                        match label.trim().to_ascii_lowercase().as_str() {
+                            "genre" | "genres" if genres.is_empty() => genres = value.to_string(),
+                            "summary" | "description" | "plot" if summary.is_empty() => summary = value.to_string(),
+                            _ => {}
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let cover = if find_local_cover(&root).await.is_some() { "local".to_string() } else { String::new() };
+    if summary.is_empty() && genres.is_empty() && cover.is_empty() {
+        return Ok(());
+    }
+    let mut c = st.db.get_conn().await?;
+    c.exec_drop(
+        r#"UPDATE games
+           SET summary=IF(:summary='',summary,:summary),
+               genres=IF(:genres='',genres,:genres),
+               cover_art_url=IF(:cover='',cover_art_url,:cover),
+               updated_at=:t
+           WHERE id=:id"#,
+        params! {"summary" => &summary, "genres" => &genres, "cover" => &cover, "t" => now(), "id" => &game.id},
+    )
+    .await?;
+    info!("local metadata fallback applied for id={} platform={}", game.id, game.platform);
+    Ok(())
+}
+
 async fn igdb_authenticate(http: &Client, client_id: &str, client_secret: &str) -> Result<String> {
-    let json: serde_json::Value = http
-        .post("https://id.twitch.tv/oauth2/token")
-        .form(&[
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("grant_type", "client_credentials"),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut attempt = 0u32;
+    let resp = loop {
+        attempt += 1;
+        let sent = http
+            .post("https://id.twitch.tv/oauth2/token")
+            .form(&[
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("grant_type", "client_credentials"),
+            ])
+            .send()
+            .await;
+        match sent {
+            Ok(r) => {
+                let status = r.status();
+                if (status.as_u16() == 429 || status.is_server_error()) && attempt < IGDB_MAX_ATTEMPTS {
+                    let delay = igdb_backoff_secs(attempt);
+                    warn!("Twitch auth {status} (attempt {attempt}/{IGDB_MAX_ATTEMPTS}); retrying in {delay}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+                break r.error_for_status()?;
+            }
+            Err(e) if attempt < IGDB_MAX_ATTEMPTS && is_transient(&e) => {
+                let delay = igdb_backoff_secs(attempt);
+                warn!("Twitch auth transport error (attempt {attempt}/{IGDB_MAX_ATTEMPTS}): {e}; retrying in {delay}s");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let json: serde_json::Value = resp.json().await?;
     json.get("access_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -108,16 +269,7 @@ async fn igdb_fetch_by_id(http: &Client, client_id: &str, token: &str, igdb_id: 
     let body = format!(
         "fields id,name,summary,rating,first_release_date,cover.image_id,genres.name;where id = {igdb_id};limit 1;"
     );
-    let value: serde_json::Value = http
-        .post("https://api.igdb.com/v4/games")
-        .header("Client-ID", client_id)
-        .bearer_auth(token)
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let value = igdb_post_json(http, client_id, token, body).await?;
     value
         .as_array()
         .and_then(|arr| arr.first())
@@ -154,16 +306,7 @@ async fn igdb_search(http: &Client, client_id: &str, token: &str, title: &str, p
         body.push_str(");");
     }
     body.push_str("limit 8;");
-    let value: serde_json::Value = http
-        .post("https://api.igdb.com/v4/games")
-        .header("Client-ID", client_id)
-        .bearer_auth(token)
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let value = igdb_post_json(http, client_id, token, body).await?;
     let Some(items) = value.as_array() else { return Ok(Vec::new()); };
     Ok(items.iter().filter_map(parse_igdb_match).collect())
 }

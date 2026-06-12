@@ -96,7 +96,11 @@ fn spawn_rescan(st: &AppState) -> String {
 async fn rescan_catalog(st: &AppState) -> Result<String> {
     st.set_scan(|s| { s.phase = "scanning".to_string(); s.message = "Scanning library…".to_string(); });
     let games = scan_catalog(&st.cfg.library_root).await?;
-    sync_catalog_db(&st.db, &games).await?;
+    let new_games = sync_catalog_db(&st.db, &games).await?;
+    // Announce genuinely new catalog entries to Discord (no-op without a webhook).
+    for game in &new_games {
+        notify_new_game(st, game.clone());
+    }
     if let Err(e) = ensure_manifests(st, &games).await {
         error!("manifest precompute failed: {e}");
     }

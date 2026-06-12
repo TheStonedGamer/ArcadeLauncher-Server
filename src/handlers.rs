@@ -306,6 +306,10 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     Err(e) => e.to_string(),
                 }
             },
+            "test_webhook" => match test_discord_webhook(&st.db).await {
+                Ok(msg) => msg,
+                Err(e) => e.to_string(),
+            },
             "add_changelog" => {
                 let game_id = form.game_id.clone().unwrap_or_default();
                 let body = form.changelog_body.clone().unwrap_or_default();

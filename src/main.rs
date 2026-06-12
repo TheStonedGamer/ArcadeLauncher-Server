@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Form, Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE, Engine};
@@ -43,6 +43,7 @@ const SESSION_TTL_SECONDS: i64 = 12 * 60 * 60;
 const IGDB_CLIENT_ID_KEY: &str = "igdb.client_id";
 const IGDB_CLIENT_SECRET_KEY: &str = "igdb.client_secret";
 const PUBLIC_BASE_URL_KEY: &str = "server.public_base_url";
+const DISCORD_WEBHOOK_KEY: &str = "discord.webhook_url";
 
 // ============================================================================
 // Source split into modules and re-assembled via include! macros below. Each
@@ -61,6 +62,8 @@ include!("scan_jobs.rs");
 include!("igdb.rs");
 include!("scan.rs");
 include!("admin_html.rs");
+include!("discord.rs");
+include!("users_api.rs");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,6 +86,10 @@ async fn main() -> Result<()> {
     };
     let public_app = Router::new()
         .route("/api/login", post(api_login))
+        .route("/api/auth/login", post(api_auth_login))
+        .route("/api/auth/logout", post(api_auth_logout))
+        .route("/api/users", get(api_users_list).post(api_users_create))
+        .route("/api/users/:id", put(api_users_update).delete(api_users_delete))
         .route("/api/auth/challenge", get(api_auth_challenge))
         .route("/api/auth/verify", post(api_auth_verify))
         .route("/api/account", get(api_account))
@@ -307,6 +314,29 @@ mod tests {
     fn clean_title_strips_tags_and_underscores() {
         assert_eq!(clean_title("Super_Mario_64 [USA] (v1.0).z64"), "Super Mario 64");
         assert_eq!(clean_title("Plain Name.iso"), "Plain Name");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(45_412_745_543), "42.3 GB");
+    }
+
+    #[test]
+    fn role_str_maps_admin_flag() {
+        assert_eq!(role_str(true), "Admin");
+        assert_eq!(role_str(false), "User");
+    }
+
+    #[test]
+    fn igdb_backoff_grows_and_caps() {
+        // Monotonic-ish growth ignoring the ±1s jitter, capped near 30s.
+        assert!(igdb_backoff_secs(1) <= 2);
+        assert!(igdb_backoff_secs(3) >= 4 && igdb_backoff_secs(3) <= 5);
+        assert!(igdb_backoff_secs(10) <= 31);
     }
 
     #[test]

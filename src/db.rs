@@ -128,6 +128,77 @@ async fn create_user(db: &Pool, username: &str, email: &str, password: &str, is_
     Ok(())
 }
 
+// Apply a partial update to an account. Each field is optional; password changes
+// also refresh the challenge-response auth_key and clear must_change_password.
+async fn update_user(
+    db: &Pool,
+    target: &User,
+    email: Option<&str>,
+    password: Option<&str>,
+    is_admin: Option<bool>,
+    enabled: Option<bool>,
+) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    if let Some(email) = email {
+        let email = email.trim();
+        if !email.is_empty() {
+            c.exec_drop(
+                "UPDATE admin_users SET email=:e WHERE id=:id",
+                params! {"e" => email, "id" => target.id},
+            )
+            .await?;
+        }
+    }
+    if let Some(pw) = password {
+        let hash = hash_password_argon2(pw)?;
+        let auth_key = derive_auth_key(&target.username, pw);
+        c.exec_drop(
+            "UPDATE admin_users SET password_hash=:p, auth_key=:k, must_change_password=FALSE WHERE id=:id",
+            params! {"p" => hash, "k" => auth_key, "id" => target.id},
+        )
+        .await?;
+    }
+    if let Some(is_admin) = is_admin {
+        c.exec_drop(
+            "UPDATE admin_users SET is_admin=:a WHERE id=:id",
+            params! {"a" => is_admin, "id" => target.id},
+        )
+        .await?;
+    }
+    if let Some(enabled) = enabled {
+        c.exec_drop(
+            "UPDATE admin_users SET enabled=:e WHERE id=:id",
+            params! {"e" => enabled, "id" => target.id},
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// Delete a user account and its dependent token/session rows. Refuses to remove
+// the final enabled admin so the admin panel can never be locked out.
+async fn delete_user_account(db: &Pool, id: u64) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    let target_is_admin: Option<bool> = c
+        .exec_first("SELECT is_admin FROM admin_users WHERE id=:id", params! {"id" => id})
+        .await?;
+    if target_is_admin.is_none() {
+        return Err(anyhow!("user not found"));
+    }
+    if target_is_admin == Some(true) {
+        let admin_count: Option<u64> = c
+            .query_first("SELECT COUNT(*) FROM admin_users WHERE is_admin=TRUE AND enabled=TRUE")
+            .await?;
+        if admin_count.unwrap_or(0) <= 1 {
+            return Err(anyhow!("cannot delete the last remaining admin account"));
+        }
+    }
+    c.exec_drop("DELETE FROM launcher_tokens WHERE user_id=:id", params! {"id" => id}).await?;
+    c.exec_drop("DELETE FROM admin_sessions WHERE admin_id=:id", params! {"id" => id}).await?;
+    c.exec_drop("DELETE FROM admin_users WHERE id=:id", params! {"id" => id}).await?;
+    Ok(())
+}
+
 async fn issue_user_token(db: &Pool, user_id: u64, username: &str) -> Result<String> {
     let mut c = db.get_conn().await?;
     // Reuse an existing enabled token instead of minting a fresh one on every

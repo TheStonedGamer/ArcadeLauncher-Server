@@ -331,10 +331,24 @@ async fn game_entry(
     Ok(game)
 }
 
-async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
+// Upserts the scanned games into the catalog and prunes orphaned rows. Returns
+// the games that were newly added (so the caller can fire new-game notifications).
+// The very first population of an empty catalog returns an empty list so a fresh
+// import doesn't blast a notification per game.
+async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<Vec<Game>> {
     let mut c = db.get_conn().await?;
     let ts = now();
+    let existing_ids: HashSet<String> = c
+        .query::<String, _>("SELECT id FROM games")
+        .await?
+        .into_iter()
+        .collect();
+    let initial_import = existing_ids.is_empty();
+    let mut new_games: Vec<Game> = Vec::new();
     for game in games {
+        if !initial_import && !existing_ids.contains(&game.id) {
+            new_games.push(game.clone());
+        }
         c.exec_drop(
             r#"INSERT INTO games
               (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,summary,genres,igdb_rating,release_date,updated_at)
@@ -375,13 +389,12 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<()> {
         .await?;
     }
     let ids: HashSet<&str> = games.iter().map(|g| g.id.as_str()).collect();
-    let existing: Vec<String> = c.query("SELECT id FROM games").await?;
-    for id in existing {
+    for id in &existing_ids {
         if !ids.contains(id.as_str()) {
             c.exec_drop("DELETE FROM games WHERE id=:id", params! {"id" => id}).await?;
         }
     }
-    Ok(())
+    Ok(new_games)
 }
 
 async fn version_for(path: &Path) -> Result<String> {
