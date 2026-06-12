@@ -40,7 +40,10 @@ former single-file build.
   kept in sync). `/api/health` reports it via `SERVER_VERSION`
   (`include_str!("../VERSION")` in `auth.rs`).
 - **Pushing to `main` triggers GitHub Actions**, which auto-bumps `VERSION`
-  (patch by default; `[minor]`/`[major]` in the commit subject for bigger bumps),
+  (patch by default; `[minor]`/`[major]` in the commit subject for bigger bumps —
+  **rule: `[minor]` for any change that breaks client↔server compatibility**,
+  e.g. API shape, auth flow, or manifest/catalog format; compatible changes stay
+  patch),
   tags `server-vX.Y.Z`, and publishes a GitHub release. The bot's bump commit
   means local pushes often need `git pull --rebase origin main` first.
 - **Version lockstep**: the client refuses to connect unless **major.minor**
