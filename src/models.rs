@@ -190,6 +190,14 @@ struct Game {
     // client as a JSON string array.
     #[serde(default)]
     screenshots: Vec<String>,
+    // Company / franchise metadata (IGDB). Stored in the developer/publisher/
+    // franchise TEXT columns; surfaced to the client as plain strings.
+    #[serde(default)]
+    developer: String,
+    #[serde(default)]
+    publisher: String,
+    #[serde(default)]
+    franchise: String,
     launch: Launch,
 }
 
@@ -209,6 +217,9 @@ struct IgdbMatch {
     release_date: i64,
     cover_image_id: String,
     screenshots: Vec<String>,
+    developer: String,
+    publisher: String,
+    franchise: String,
 }
 
 #[derive(Serialize)]

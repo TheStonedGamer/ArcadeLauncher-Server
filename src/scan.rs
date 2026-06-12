@@ -408,6 +408,9 @@ async fn game_entry(
         igdb_rating: 0.0,
         release_date: 0,
         screenshots: Vec::new(),
+        developer: String::new(),
+        publisher: String::new(),
+        franchise: String::new(),
         launch: Launch {
             target: target.to_string_lossy().replace('\\', "/"),
             arguments: arguments.to_string(),

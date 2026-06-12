@@ -101,6 +101,9 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN igdb_rating DOUBLE NOT NULL DEFAULT 0").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN release_date BIGINT NOT NULL DEFAULT 0").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN screenshots TEXT NULL").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN developer VARCHAR(255) NULL").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN publisher VARCHAR(255) NULL").await;
+    let _ = c.query_drop("ALTER TABLE games ADD COLUMN franchise VARCHAR(255) NULL").await;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS server_settings (
           setting_key VARCHAR(120) NOT NULL PRIMARY KEY,

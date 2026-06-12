@@ -267,7 +267,7 @@ async fn igdb_search_for_game(st: &AppState, game: &Game, query: &str) -> Result
 
 async fn igdb_fetch_by_id(http: &Client, client_id: &str, token: &str, igdb_id: u64) -> Result<IgdbMatch> {
     let body = format!(
-        "fields id,name,summary,rating,first_release_date,cover.image_id,genres.name,screenshots.image_id,artworks.image_id;where id = {igdb_id};limit 1;"
+        "fields id,name,summary,rating,first_release_date,cover.image_id,genres.name,screenshots.image_id,artworks.image_id,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,franchises.name;where id = {igdb_id};limit 1;"
     );
     let value = igdb_post_json(http, client_id, token, body).await?;
     value
@@ -298,7 +298,7 @@ async fn apply_manual_igdb_match(st: &AppState, game_id: &str, igdb_id: u64) -> 
 async fn igdb_search(http: &Client, client_id: &str, token: &str, title: &str, platforms: &[i32]) -> Result<Vec<IgdbMatch>> {
     let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
     let mut body = format!(
-        "search \"{escaped}\";fields id,name,summary,rating,first_release_date,cover.image_id,genres.name,screenshots.image_id,artworks.image_id;"
+        "search \"{escaped}\";fields id,name,summary,rating,first_release_date,cover.image_id,genres.name,screenshots.image_id,artworks.image_id,involved_companies.company.name,involved_companies.developer,involved_companies.publisher,franchises.name;"
     );
     if !platforms.is_empty() {
         body.push_str("where release_dates.platform = (");
@@ -337,6 +337,31 @@ fn parse_igdb_match(v: &serde_json::Value) -> Option<IgdbMatch> {
     screenshots.extend(collect("artworks", "t_1080p"));
     screenshots.truncate(12); // plenty for a gallery; keeps the row/JSON bounded
 
+    // involved_companies is a list of {company:{name}, developer:bool, publisher:bool}.
+    // Join the names per role; a company can hold both roles.
+    let companies = |role: &str| -> String {
+        v.get("involved_companies")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|c| c.get(role).and_then(|b| b.as_bool()).unwrap_or(false))
+                    .filter_map(|c| c.get("company").and_then(|co| co.get("name")).and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    let developer = companies("developer");
+    let publisher = companies("publisher");
+    let franchise = v
+        .get("franchises")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or_default()
+        .to_string();
+
     Some(IgdbMatch {
         id,
         name,
@@ -346,6 +371,9 @@ fn parse_igdb_match(v: &serde_json::Value) -> Option<IgdbMatch> {
         release_date: v.get("first_release_date").and_then(|d| d.as_i64()).unwrap_or_default(),
         cover_image_id: v.get("cover").and_then(|c| c.get("image_id")).and_then(|i| i.as_str()).unwrap_or_default().to_string(),
         screenshots,
+        developer,
+        publisher,
+        franchise,
     })
 }
 
@@ -370,6 +398,9 @@ async fn save_game_metadata(db: &Pool, game_id: &str, meta: &IgdbMatch, cover_ar
                release_date=:release_date,
                cover_art_url=IF(:cover_art_url='',cover_art_url,:cover_art_url),
                screenshots=IF(:screenshots='',screenshots,:screenshots),
+               developer=IF(:developer='',developer,:developer),
+               publisher=IF(:publisher='',publisher,:publisher),
+               franchise=IF(:franchise='',franchise,:franchise),
                updated_at=:updated_at
            WHERE id=:id"#,
         params! {
@@ -381,6 +412,9 @@ async fn save_game_metadata(db: &Pool, game_id: &str, meta: &IgdbMatch, cover_ar
             "release_date" => meta.release_date,
             "cover_art_url" => cover_art_url,
             "screenshots" => meta.screenshots.join("\n"),
+            "developer" => &meta.developer,
+            "publisher" => &meta.publisher,
+            "franchise" => &meta.franchise,
             "updated_at" => now(),
         },
     )
