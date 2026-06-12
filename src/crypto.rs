@@ -328,6 +328,12 @@ fn igdb_cover_url(image_id: &str) -> String {
     format!("https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg")
 }
 
+// Full-resolution screenshot / artwork URL for the in-app gallery. `size` is an
+// IGDB image size token, e.g. "t_screenshot_big" or "t_1080p".
+fn igdb_image_url(size: &str, image_id: &str) -> String {
+    format!("https://images.igdb.com/igdb/image/upload/{size}/{image_id}.jpg")
+}
+
 fn admin_cover_src(game: &Game) -> String {
     if game.cover_art_url == "local" {
         format!("/art/{}", urlencoding::encode(&game.id))

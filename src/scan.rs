@@ -163,21 +163,50 @@ fn is_pc_primary_archive(path: &Path) -> bool {
     true
 }
 
+// Deepest category nesting we descend through before treating leftover folders as
+// undecided. PC libraries are often organised A-Z / by-genre / by-source, so the
+// old cap of 2 dropped games filed a few levels down. Raised generously; the
+// "is this folder itself a game?" check still stops descent at the first game.
+const PC_MAX_DEPTH: usize = 6;
+
 async fn scan_pc_games(library_root: &Path) -> Result<Vec<Game>> {
     let pc_root = library_root.join("games").join("PC");
     if fs::metadata(&pc_root).await.is_err() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let mut rd = fs::read_dir(&pc_root).await?;
-    while let Some(entry) = rd.next_entry().await? {
+    let mut rd = match fs::read_dir(&pc_root).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            warn!("PC scan: cannot read {}: {e}", pc_root.display());
+            return Ok(out);
+        }
+    };
+    // A single unreadable folder / NAS hiccup must not abort the whole PC scan and
+    // make every game after it look orphaned (and get pruned). Log and skip
+    // per-entry instead of propagating with `?`.
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                warn!("PC scan: error iterating {}: {e}", pc_root.display());
+                break;
+            }
+        };
         let path = entry.path();
-        let meta = entry.metadata().await?;
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("PC scan: cannot stat {}: {e}", path.display());
+                continue;
+            }
+        };
         if meta.is_file() {
             // Loose repack archive sitting directly in games/PC.
             if is_pc_primary_archive(&path) {
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    out.push(game_entry(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
+                    push_pc_game(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}", &mut out).await;
                 }
             }
             continue;
@@ -187,45 +216,102 @@ async fn scan_pc_games(library_root: &Path) -> Result<Vec<Game>> {
         }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
         if name.eq_ignore_ascii_case("steam") {
-            let mut steam = fs::read_dir(&path).await?;
-            while let Some(game_dir) = steam.next_entry().await? {
+            let mut steam = match fs::read_dir(&path).await {
+                Ok(rd) => rd,
+                Err(e) => {
+                    warn!("PC scan: cannot read steam dir {}: {e}", path.display());
+                    continue;
+                }
+            };
+            while let Ok(Some(game_dir)) = steam.next_entry().await {
                 let game_path = game_dir.path();
-                if game_dir.metadata().await?.is_dir() {
-                    if let Some(game) = pc_folder_entry(library_root, &game_path).await? {
+                if game_dir.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
+                    if let Some(game) = pc_folder_entry_safe(library_root, &game_path).await {
                         out.push(game);
                     }
                 }
             }
             continue;
         }
-        // Recurse up to two levels so games nested under category folders aren't
+        // Recurse through category folders so games nested under them aren't
         // missed — but stop the moment a folder is itself a game.
-        collect_pc_folder_games(library_root, &path, 2, &mut out).await?;
+        collect_pc_folder_games(library_root, &path, PC_MAX_DEPTH, &mut out).await;
     }
     Ok(out)
+}
+
+// Build a game_entry and push it, logging and skipping on error rather than
+// aborting the whole scan if (e.g.) a NAS read of one file fails mid-fingerprint.
+async fn push_pc_game(
+    library_root: &Path,
+    content_path: &Path,
+    platform: &str,
+    title: &str,
+    target: &Path,
+    install_type: &str,
+    arguments: &str,
+    out: &mut Vec<Game>,
+) {
+    match game_entry(library_root, content_path, platform, title, target, install_type, arguments).await {
+        Ok(game) => out.push(game),
+        Err(e) => warn!("PC scan: skipping {} ({title}): {e}", content_path.display()),
+    }
+}
+
+// Error-isolating wrapper around pc_folder_entry: a failure to inspect one folder
+// must not abort the surrounding scan.
+async fn pc_folder_entry_safe(library_root: &Path, game_root: &Path) -> Option<Game> {
+    match pc_folder_entry(library_root, game_root).await {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("PC scan: skipping folder {}: {e}", game_root.display());
+            None
+        }
+    }
 }
 
 // Resolve `dir` as either ONE game (it has a launchable exe → the whole folder is
 // the game; never descend into it) or a category folder (recurse into subfolders
 // and pick up any loose repack archives sitting directly inside it).
-async fn collect_pc_folder_games(library_root: &Path, dir: &Path, max_depth: usize, out: &mut Vec<Game>) -> Result<()> {
+async fn collect_pc_folder_games(library_root: &Path, dir: &Path, max_depth: usize, out: &mut Vec<Game>) {
     // A folder with a launchable exe is a single game. Its internal archives and
     // subfolders are part of that game and must NOT be scanned as separate games.
-    if let Some(game) = pc_folder_entry(library_root, dir).await? {
+    if let Some(game) = pc_folder_entry_safe(library_root, dir).await {
         out.push(game);
-        return Ok(());
+        return;
     }
     // Not a game itself — treat as a category. Collect loose archives here, then
-    // recurse into subfolders.
+    // recurse into subfolders. Errors on individual entries are logged and skipped
+    // so one bad child can't make this category (and everything below it) vanish.
     let mut subdirs = Vec::<PathBuf>::new();
-    let mut rd = fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            warn!("PC scan: cannot read {}: {e}", dir.display());
+            return;
+        }
+    };
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                warn!("PC scan: error iterating {}: {e}", dir.display());
+                break;
+            }
+        };
         let path = entry.path();
-        let meta = entry.metadata().await?;
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("PC scan: cannot stat {}: {e}", path.display());
+                continue;
+            }
+        };
         if meta.is_file() {
             if is_pc_primary_archive(&path) {
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    out.push(game_entry(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}").await?);
+                    push_pc_game(library_root, &path, "PC", &clean_title(name), Path::new(""), "pc_archive", "{exe}", out).await;
                 }
             }
         } else if meta.is_dir() {
@@ -236,12 +322,11 @@ async fn collect_pc_folder_games(library_root: &Path, dir: &Path, max_depth: usi
         if !subdirs.is_empty() {
             info!("PC scan: reached depth limit, not descending into {} subfolder(s) of {}", subdirs.len(), dir.display());
         }
-        return Ok(());
+        return;
     }
     for sub in subdirs {
-        Box::pin(collect_pc_folder_games(library_root, &sub, max_depth - 1, out)).await?;
+        Box::pin(collect_pc_folder_games(library_root, &sub, max_depth - 1, out)).await;
     }
-    Ok(())
 }
 
 async fn pc_folder_entry(library_root: &Path, game_root: &Path) -> Result<Option<Game>> {
@@ -322,6 +407,7 @@ async fn game_entry(
         genres: String::new(),
         igdb_rating: 0.0,
         release_date: 0,
+        screenshots: Vec::new(),
         launch: Launch {
             target: target.to_string_lossy().replace('\\', "/"),
             arguments: arguments.to_string(),
@@ -351,8 +437,8 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<Vec<Game>> {
         }
         c.exec_drop(
             r#"INSERT INTO games
-              (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,summary,genres,igdb_rating,release_date,updated_at)
-              VALUES (:id,:title,:platform,:install_type,:version,:content_path,:launch_target,:launch_arguments,:cover_art_url,:igdb_id,:summary,:genres,:igdb_rating,:release_date,:updated_at)
+              (id,title,platform,install_type,version,content_path,launch_target,launch_arguments,cover_art_url,igdb_id,summary,genres,igdb_rating,release_date,screenshots,updated_at)
+              VALUES (:id,:title,:platform,:install_type,:version,:content_path,:launch_target,:launch_arguments,:cover_art_url,:igdb_id,:summary,:genres,:igdb_rating,:release_date,:screenshots,:updated_at)
               ON DUPLICATE KEY UPDATE
                 title=VALUES(title),
                 platform=VALUES(platform),
@@ -367,6 +453,7 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<Vec<Game>> {
                 genres=IF(VALUES(genres)='',genres,VALUES(genres)),
                 igdb_rating=IF(VALUES(igdb_rating)=0,igdb_rating,VALUES(igdb_rating)),
                 release_date=IF(VALUES(release_date)=0,release_date,VALUES(release_date)),
+                screenshots=IF(VALUES(screenshots)='',screenshots,VALUES(screenshots)),
                 updated_at=VALUES(updated_at)"#,
             params! {
                 "id" => &game.id,
@@ -383,6 +470,7 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<Vec<Game>> {
                 "genres" => &game.genres,
                 "igdb_rating" => game.igdb_rating,
                 "release_date" => game.release_date,
+                "screenshots" => game.screenshots.join("\n"),
                 "updated_at" => ts,
             },
         )

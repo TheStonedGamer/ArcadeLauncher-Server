@@ -185,6 +185,11 @@ struct Game {
     genres: String,
     igdb_rating: f64,
     release_date: i64,
+    // Screenshot / artwork image URLs (IGDB), newest-first as returned by IGDB.
+    // Stored newline-joined in the `screenshots` TEXT column; surfaced to the
+    // client as a JSON string array.
+    #[serde(default)]
+    screenshots: Vec<String>,
     launch: Launch,
 }
 
@@ -203,6 +208,7 @@ struct IgdbMatch {
     rating: f64,
     release_date: i64,
     cover_image_id: String,
+    screenshots: Vec<String>,
 }
 
 #[derive(Serialize)]

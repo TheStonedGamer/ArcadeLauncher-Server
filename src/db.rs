@@ -363,7 +363,7 @@ async fn list_games(db: &Pool) -> Result<Vec<Game>> {
     let mut c = db.get_conn().await?;
     let rows: Vec<Row> = c
         .query(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date FROM games ORDER BY platform,title,id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,'') FROM games ORDER BY platform,title,id",
         )
         .await?;
     Ok(rows.into_iter().map(game_from_row).collect())
@@ -373,7 +373,7 @@ async fn find_game(db: &Pool, id: &str) -> Result<Option<Game>> {
     let mut c = db.get_conn().await?;
     let row: Option<Row> = c
         .exec_first(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date FROM games WHERE id=:id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,'') FROM games WHERE id=:id",
             params! {"id" => id},
         )
         .await?;
@@ -395,6 +395,11 @@ fn game_from_row(row: Row) -> Game {
     let genres = row.get::<String, _>(11).unwrap_or_default();
     let igdb_rating = row.get::<f64, _>(12).unwrap_or_default();
     let release_date = row.get::<i64, _>(13).unwrap_or_default();
+    let screenshots = row.get::<String, _>(14).unwrap_or_default()
+        .lines()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<_>>();
     Game {
         id,
         title,
@@ -408,6 +413,7 @@ fn game_from_row(row: Row) -> Game {
         genres,
         igdb_rating,
         release_date,
+        screenshots,
         launch: Launch { target: launch_target, arguments: if launch_arguments.is_empty() { "{rom}".into() } else { launch_arguments } },
     }
 }
