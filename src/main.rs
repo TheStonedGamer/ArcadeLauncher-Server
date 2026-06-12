@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
         )
         .route("/api/health", get(api_health))
+        .route("/api/saves/:id", get(api_saves_list))
+        .route("/api/saves/:id/file", get(api_saves_get).put(api_saves_put))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/api/games/:id/changelogs", get(api_changelogs))

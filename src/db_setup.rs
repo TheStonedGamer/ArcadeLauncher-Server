@@ -104,6 +104,20 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN developer VARCHAR(255) NULL").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN publisher VARCHAR(255) NULL").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN franchise VARCHAR(255) NULL").await;
+    // Cloud saves: one row per user+game+file. Files are small (emulator/PC
+    // save data); the client enforces per-file and per-folder caps.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_saves (
+            user_id BIGINT UNSIGNED NOT NULL,
+            game_id VARCHAR(128) NOT NULL,
+            rel_path VARCHAR(400) NOT NULL,
+            data LONGBLOB NOT NULL,
+            mtime BIGINT NOT NULL DEFAULT 0,
+            updated_at BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, game_id, rel_path(191))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS server_settings (
           setting_key VARCHAR(120) NOT NULL PRIMARY KEY,

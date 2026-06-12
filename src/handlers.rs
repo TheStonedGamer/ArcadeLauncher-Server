@@ -368,3 +368,82 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
     }
 }
 
+
+// ── Cloud saves (per-user, per-game) ─────────────────────────────────────────
+
+const SAVE_FILE_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+/// Forward-slash relative paths only — no traversal, no absolute paths.
+fn valid_save_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 400
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.contains('\0')
+        && !p.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+}
+
+#[derive(Deserialize)]
+struct SaveFileQuery {
+    path: String,
+    #[serde(default)]
+    mtime: i64,
+}
+
+// GET /api/saves/:game_id — list this user's stored save files for a game.
+async fn api_saves_list(State(st): State<AppState>, AxumPath(game_id): AxumPath<String>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    match list_game_saves(&st.db, user.id, &game_id).await {
+        Ok(files) => {
+            let list: Vec<serde_json::Value> = files
+                .into_iter()
+                .map(|(path, mtime, size)| serde_json::json!({"path": path, "mtime": mtime, "size": size}))
+                .collect();
+            Json(serde_json::json!({"files": list})).into_response()
+        }
+        Err(e) => server_error(e),
+    }
+}
+
+// GET /api/saves/:game_id/file?path=rel — raw bytes of one stored save file.
+async fn api_saves_get(
+    State(st): State<AppState>,
+    AxumPath(game_id): AxumPath<String>,
+    Query(q): Query<SaveFileQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    if !valid_save_path(&q.path) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid path"}))).into_response();
+    }
+    match get_game_save(&st.db, user.id, &game_id, &q.path).await {
+        Ok(Some(bytes)) => (
+            [(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no such save file"}))).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+// PUT /api/saves/:game_id/file?path=rel&mtime=N — upsert one save file.
+async fn api_saves_put(
+    State(st): State<AppState>,
+    AxumPath(game_id): AxumPath<String>,
+    Query(q): Query<SaveFileQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else { return unauthorized(); };
+    if !valid_save_path(&q.path) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid path"}))).into_response();
+    }
+    if body.is_empty() || body.len() > SAVE_FILE_MAX_BYTES {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "save file must be 1 byte..50 MB"}))).into_response();
+    }
+    match put_game_save(&st.db, user.id, &game_id, &q.path, q.mtime, &body).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => server_error(e),
+    }
+}

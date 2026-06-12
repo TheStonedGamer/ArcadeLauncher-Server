@@ -424,3 +424,49 @@ fn game_from_row(row: Row) -> Game {
     }
 }
 
+
+// ── Cloud saves ──────────────────────────────────────────────────────────────
+
+/// List a user's stored save files for one game: (rel_path, mtime, size).
+async fn list_game_saves(db: &Pool, user_id: u64, game_id: &str) -> Result<Vec<(String, i64, u64)>> {
+    let mut c = db.get_conn().await?;
+    let rows: Vec<Row> = c
+        .exec(
+            "SELECT rel_path, mtime, LENGTH(data) FROM game_saves WHERE user_id=:u AND game_id=:g ORDER BY rel_path",
+            params! {"u" => user_id, "g" => game_id},
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>(0).unwrap_or_default(),
+                row.get::<i64, _>(1).unwrap_or_default(),
+                row.get::<u64, _>(2).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+async fn get_game_save(db: &Pool, user_id: u64, game_id: &str, rel_path: &str) -> Result<Option<Vec<u8>>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<Row> = c
+        .exec_first(
+            "SELECT data FROM game_saves WHERE user_id=:u AND game_id=:g AND rel_path=:p",
+            params! {"u" => user_id, "g" => game_id, "p" => rel_path},
+        )
+        .await?;
+    Ok(row.and_then(|mut r| r.take::<Vec<u8>, _>(0)))
+}
+
+async fn put_game_save(db: &Pool, user_id: u64, game_id: &str, rel_path: &str, mtime: i64, bytes: &[u8]) -> Result<()> {
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        r#"INSERT INTO game_saves (user_id, game_id, rel_path, data, mtime, updated_at)
+           VALUES (:u, :g, :p, :d, :m, :t)
+           ON DUPLICATE KEY UPDATE data=VALUES(data), mtime=VALUES(mtime), updated_at=VALUES(updated_at)"#,
+        params! {"u" => user_id, "g" => game_id, "p" => rel_path, "d" => bytes.to_vec(), "m" => mtime, "t" => now()},
+    )
+    .await?;
+    Ok(())
+}
