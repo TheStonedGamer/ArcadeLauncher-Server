@@ -35,6 +35,19 @@ former single-file build.
   `stable_id`, `sha1_short`, `clean_title`, `igdb_platform_ids`).
 - Repo: `github.com/TheStonedGamer/ArcadeLauncher-Server`.
 
+## Versioning & releases
+- The `VERSION` file is the single source of truth (Cargo.toml's version is NOT
+  kept in sync). `/api/health` reports it via `SERVER_VERSION`
+  (`include_str!("../VERSION")` in `auth.rs`).
+- **Pushing to `main` triggers GitHub Actions**, which auto-bumps `VERSION`
+  (patch by default; `[minor]`/`[major]` in the commit subject for bigger bumps),
+  tags `server-vX.Y.Z`, and publishes a GitHub release. The bot's bump commit
+  means local pushes often need `git pull --rebase origin main` first.
+- **Version lockstep**: the client refuses to connect unless **major.minor**
+  matches its own (patch floats). After a minor/major bump, deploy the server
+  before clients update or they are locked out. Coordinated releases = push
+  matching `[minor]`/`[major]` commits to BOTH repos.
+
 ## Deployment (production)
 - Runs in a Proxmox CT at **`10.0.0.210`** (root login) as systemd service
   `arcadelauncher-server` on port `8721`. Deploy artifacts in `deploy/`.
