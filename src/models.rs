@@ -300,6 +300,7 @@ struct AdminForm {
     email: Option<String>,
     password: Option<String>,
     is_admin: Option<String>,
+    enabled: Option<String>,
     user_id: Option<u64>,
     setting_key: Option<String>,
     setting_value: Option<String>,

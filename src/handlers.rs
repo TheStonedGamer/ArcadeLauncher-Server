@@ -267,6 +267,34 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     .unwrap_or_else(|e| e.to_string()),
                 None => "missing user id".to_string(),
             },
+            "update_user" => match form.user_id {
+                Some(id) => match find_user_by_id(&st.db, id).await {
+                    Ok(Some(target)) => {
+                        let new_admin = form.is_admin.as_deref() == Some("1");
+                        let new_enabled = form.enabled.as_deref() != Some("0");
+                        let removes_admin = target.is_admin && target.enabled && (!new_admin || !new_enabled);
+                        let pw = form.password.as_deref().map(str::trim).filter(|p| !p.is_empty());
+                        if let Some(p) = pw {
+                            if p.len() < 10 {
+                                "Password must be at least 10 characters.".to_string()
+                            } else {
+                                apply_user_update(&st, &target, form.email.as_deref(), Some(p), new_admin, new_enabled, removes_admin).await
+                            }
+                        } else {
+                            apply_user_update(&st, &target, form.email.as_deref(), None, new_admin, new_enabled, removes_admin).await
+                        }
+                    }
+                    Ok(None) => "User not found.".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                None => "missing user id".to_string(),
+            },
+            "delete_account" => match form.user_id {
+                Some(id) => delete_user_account(&st.db, id).await
+                    .map(|_| "Deleted user account and all of its tokens/sessions.".to_string())
+                    .unwrap_or_else(|e| e.to_string()),
+                None => "missing user id".to_string(),
+            },
             "rescan" => spawn_rescan(&st),
             "igdb_enrich" => match enrich_catalog_from_igdb(&st, false).await {
                 Ok(out) => out,

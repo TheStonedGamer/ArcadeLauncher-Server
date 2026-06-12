@@ -116,6 +116,16 @@ async fn list_users(db: &Pool) -> Result<Vec<User>> {
     Ok(rows.into_iter().map(user_from_row).collect())
 }
 
+// Number of accounts that are both admin and enabled. Used to guard against
+// demoting / disabling / deleting the final admin and locking out the panel.
+async fn enabled_admin_count(db: &Pool) -> Result<u64> {
+    let mut c = db.get_conn().await?;
+    let count: Option<u64> = c
+        .query_first("SELECT COUNT(*) FROM admin_users WHERE is_admin=TRUE AND enabled=TRUE")
+        .await?;
+    Ok(count.unwrap_or(0))
+}
+
 async fn create_user(db: &Pool, username: &str, email: &str, password: &str, is_admin: bool) -> Result<()> {
     let mut c = db.get_conn().await?;
     let hash = hash_password_argon2(password)?;

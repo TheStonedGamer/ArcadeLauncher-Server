@@ -15,6 +15,46 @@ fn role_str(is_admin: bool) -> &'static str {
     }
 }
 
+// Shared by the admin web panel's per-user "Save Changes" action. Applies an
+// email/password/role/enabled update, but refuses any change that would strip
+// the last remaining admin (demotion or disable) so the panel can't lock out.
+async fn apply_user_update(
+    st: &AppState,
+    target: &User,
+    email: Option<&str>,
+    password: Option<&str>,
+    new_admin: bool,
+    new_enabled: bool,
+    removes_admin: bool,
+) -> String {
+    if removes_admin {
+        match enabled_admin_count(&st.db).await {
+            Ok(n) if n <= 1 => {
+                return "Cannot demote or disable the last remaining admin account.".to_string()
+            }
+            Err(e) => return e.to_string(),
+            _ => {}
+        }
+    }
+    match update_user(&st.db, target, email, password, Some(new_admin), Some(new_enabled)).await {
+        Ok(_) => {
+            let mut notes = Vec::new();
+            if password.is_some() {
+                notes.push("password reset");
+            }
+            if !new_enabled {
+                notes.push("account disabled");
+            }
+            if new_admin != target.is_admin {
+                notes.push(if new_admin { "promoted to admin" } else { "demoted to client" });
+            }
+            let extra = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) };
+            format!("Updated {}{}.", target.username, extra)
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
 fn user_json(u: &User) -> serde_json::Value {
     serde_json::json!({
         "id": u.id,
