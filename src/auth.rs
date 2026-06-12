@@ -1,7 +1,12 @@
 // auth.rs - split out of main.rs and re-assembled via include! (crate-root scope).
 
+// Release version from the VERSION file (the workflow's single source of truth;
+// Cargo.toml's version is not kept in sync). Clients compare major.minor against
+// their own and refuse to connect on mismatch.
+const SERVER_VERSION: &str = include_str!("../VERSION");
+
 async fn api_health(State(_): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"ok": true, "schemaVersion": 1, "version": env!("CARGO_PKG_VERSION"), "backend": "rust"}))
+    Json(serde_json::json!({"ok": true, "schemaVersion": 1, "version": SERVER_VERSION.trim(), "backend": "rust"}))
 }
 
 async fn api_login(State(st): State<AppState>, Form(form): Form<LoginForm>) -> Response {
