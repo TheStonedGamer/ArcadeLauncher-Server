@@ -167,6 +167,7 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    ensure_social_schema(&mut c).await?;
     Ok(())
 }
 

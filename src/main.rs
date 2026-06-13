@@ -64,6 +64,7 @@ include!("scan.rs");
 include!("admin_html.rs");
 include!("discord.rs");
 include!("users_api.rs");
+include!("social_api.rs");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -110,6 +111,12 @@ async fn main() -> Result<()> {
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/api/games/:id/changelogs", get(api_changelogs))
+        .route("/api/social/friends", get(api_social_friends))
+        .route("/api/social/friends/request", post(api_social_request))
+        .route("/api/social/friends/respond", post(api_social_respond))
+        .route("/api/social/friends/block", post(api_social_block))
+        .route("/api/social/messages/:id", get(api_social_history))
+        .route("/ws/social", get(ws_social))
         .route("/art/:id", get(download_art))
         .route("/emulators/*rel", get(download_emulator))
         .route("/files/:id/*rel", get(download_file))
