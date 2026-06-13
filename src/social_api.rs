@@ -631,6 +631,10 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let conn_id = social_hub().register(uid, tx.clone());
 
+    // First frame tells the client its own account id so it can align sent vs
+    // received messages and ignore self-presence echoes.
+    let _ = tx.send(serde_json::json!({ "type": "hello", "selfId": uid }).to_string());
+
     // Mark online (unless invisible already chosen) and announce to friends.
     let was_online = social_hub()
         .conns
