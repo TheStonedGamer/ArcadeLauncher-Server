@@ -79,15 +79,27 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
 // Connection hub (real-time fan-out)
 // ----------------------------------------------------------------------------
 
+// A frame queued for delivery to a socket. Text carries JSON control/chat
+// events; Binary carries voice audio (a 8-byte LE sender-id header followed by
+// the raw codec/PCM payload) relayed on the low-latency path.
+enum OutMsg {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 struct SocialConn {
     conn_id: u64,
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<OutMsg>,
 }
 
 struct SocialHub {
     // user_id -> live sockets for that user (a user may be online on >1 device).
     conns: std::sync::Mutex<std::collections::HashMap<u64, Vec<SocialConn>>>,
     next_id: std::sync::atomic::AtomicU64,
+    // Canonical (lo,hi) pairs with an active, friendship-verified voice call.
+    // Audio frames are relayed only between pairs in this set so the hot path
+    // never touches the database (verification happens once at invite/accept).
+    voice_pairs: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 static SOCIAL_HUB: std::sync::OnceLock<SocialHub> = std::sync::OnceLock::new();
@@ -96,11 +108,12 @@ fn social_hub() -> &'static SocialHub {
     SOCIAL_HUB.get_or_init(|| SocialHub {
         conns: std::sync::Mutex::new(std::collections::HashMap::new()),
         next_id: std::sync::atomic::AtomicU64::new(1),
+        voice_pairs: std::sync::Mutex::new(std::collections::HashSet::new()),
     })
 }
 
 impl SocialHub {
-    fn register(&self, user_id: u64, tx: tokio::sync::mpsc::UnboundedSender<String>) -> u64 {
+    fn register(&self, user_id: u64, tx: tokio::sync::mpsc::UnboundedSender<OutMsg>) -> u64 {
         let conn_id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.conns.lock().unwrap();
         g.entry(user_id).or_default().push(SocialConn { conn_id, tx });
@@ -129,9 +142,36 @@ impl SocialHub {
         let g = self.conns.lock().unwrap();
         if let Some(v) = g.get(&user_id) {
             for c in v {
-                let _ = c.tx.send(msg.to_string());
+                let _ = c.tx.send(OutMsg::Text(msg.to_string()));
             }
         }
+    }
+
+    // Non-blocking binary push (voice audio) to every live socket for `user_id`.
+    fn push_binary(&self, user_id: u64, data: &[u8]) {
+        let g = self.conns.lock().unwrap();
+        if let Some(v) = g.get(&user_id) {
+            for c in v {
+                let _ = c.tx.send(OutMsg::Binary(data.to_vec()));
+            }
+        }
+    }
+
+    fn allow_voice(&self, a: u64, b: u64) {
+        self.voice_pairs.lock().unwrap().insert(pair(a, b));
+    }
+    fn disallow_voice(&self, a: u64, b: u64) {
+        self.voice_pairs.lock().unwrap().remove(&pair(a, b));
+    }
+    fn voice_allowed(&self, a: u64, b: u64) -> bool {
+        self.voice_pairs.lock().unwrap().contains(&pair(a, b))
+    }
+    // Drop every open call pair involving `user_id` (called when they go offline).
+    fn drop_voice_for(&self, user_id: u64) {
+        self.voice_pairs
+            .lock()
+            .unwrap()
+            .retain(|&(lo, hi)| lo != user_id && hi != user_id);
     }
 }
 
@@ -628,12 +668,14 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     use futures_util::SinkExt;
 
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutMsg>();
     let conn_id = social_hub().register(uid, tx.clone());
 
     // First frame tells the client its own account id so it can align sent vs
     // received messages and ignore self-presence echoes.
-    let _ = tx.send(serde_json::json!({ "type": "hello", "selfId": uid }).to_string());
+    let _ = tx.send(OutMsg::Text(
+        serde_json::json!({ "type": "hello", "selfId": uid }).to_string(),
+    ));
 
     // Mark online (unless invisible already chosen) and announce to friends.
     let was_online = social_hub()
@@ -657,8 +699,13 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
                 tokio::select! {
                     msg = rx.recv() => {
                         match msg {
-                            Some(text) => {
+                            Some(OutMsg::Text(text)) => {
                                 if sink.send(Message::Text(text)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(OutMsg::Binary(data)) => {
+                                if sink.send(Message::Binary(data)).await.is_err() {
                                     break;
                                 }
                             }
@@ -683,8 +730,11 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
                 Message::Text(txt) => {
                     handle_ws_message(&st_in, uid, &txt).await;
                 }
+                Message::Binary(data) => {
+                    handle_ws_audio(uid, &data);
+                }
                 Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
+                Message::Ping(_) | Message::Pong(_) => {}
             }
         }
     });
@@ -698,6 +748,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     // Teardown: drop this connection; if it was the last, go offline + notify.
     let last = social_hub().unregister(uid, conn_id);
     if last {
+        social_hub().drop_voice_for(uid);
         set_presence(&st.db, uid, "offline", None, None).await;
         push_presence_diff(&st, uid).await;
     }
@@ -759,8 +810,21 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
             handle_ws_chat(st, uid, env.to, &env.text).await;
         }
         "voice_signal" => {
-            // Opaque relay for session/ICE/STUN/TURN/teardown signaling frames.
+            // Opaque relay for call invite/accept/end signaling frames. We also
+            // gate the binary audio relay here: a friendship-verified invite or
+            // accept opens the (uid,to) pair for audio; an end closes it. This
+            // keeps the per-frame audio path off the database entirely.
             if env.to != 0 && are_friends(&st.db, uid, env.to).await {
+                let kind = env
+                    .payload
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("");
+                match kind {
+                    "invite" | "accept" => social_hub().allow_voice(uid, env.to),
+                    "end" => social_hub().disallow_voice(uid, env.to),
+                    _ => {}
+                }
                 social_hub().push(
                     env.to,
                     &serde_json::json!({
@@ -811,4 +875,22 @@ async fn handle_ws_chat(st: &AppState, uid: u64, to: u64, text: &str) {
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.
     social_hub().push(to, &evt);
     social_hub().push(uid, &evt);
+}
+
+// Relay a binary voice frame from `uid` to its call peer. Wire format from the
+// client is [u64 LE target_id][payload]; we replace the header with the sender
+// id and forward to the target only if the pair has an open, verified call.
+// O(1) hot path: a HashSet membership check, no DB and no JSON.
+fn handle_ws_audio(uid: u64, data: &[u8]) {
+    if data.len() < 8 {
+        return;
+    }
+    let target = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    if target == 0 || !social_hub().voice_allowed(uid, target) {
+        return;
+    }
+    let mut frame = Vec::with_capacity(data.len());
+    frame.extend_from_slice(&uid.to_le_bytes());
+    frame.extend_from_slice(&data[8..]);
+    social_hub().push_binary(target, &frame);
 }
