@@ -480,11 +480,48 @@ async fn sync_catalog_db(db: &Pool, games: &[Game]) -> Result<Vec<Game>> {
         .await?;
     }
     let ids: HashSet<&str> = games.iter().map(|g| g.id.as_str()).collect();
+    let mut pruned = 0usize;
     for id in &existing_ids {
         if !ids.contains(id.as_str()) {
             c.exec_drop("DELETE FROM games WHERE id=:id", params! {"id" => id}).await?;
+            pruned += 1;
         }
     }
+
+    // ── Scan diagnostics ──────────────────────────────────────────────────────
+    // The catalog upsert is idempotent (PK = stable_id, ON DUPLICATE KEY UPDATE,
+    // orphan prune), so a re-scan of an UNCHANGED tree must net zero growth. If
+    // the visible game count still climbs, the cause is almost always two distinct
+    // content paths resolving to the same logical game — most commonly a loose
+    // repack archive AND the folder it was extracted into both being scanned. Log
+    // enough to pinpoint it on the next manual rescan without dumping the catalog.
+    info!(
+        "scan summary: {} scanned, {} existing, {} added, {} pruned (net {:+})",
+        games.len(),
+        existing_ids.len(),
+        new_games.len(),
+        pruned,
+        new_games.len() as i64 - pruned as i64,
+    );
+    // Surface same-platform duplicate titles — the signature of double-counting.
+    let mut by_key: std::collections::HashMap<(String, String), Vec<&str>> =
+        std::collections::HashMap::new();
+    for g in games {
+        by_key
+            .entry((g.platform.clone(), normalize_title(&g.title)))
+            .or_default()
+            .push(g.content_path.as_str());
+    }
+    for ((platform, title), paths) in &by_key {
+        if paths.len() > 1 {
+            warn!(
+                "scan: possible duplicate — platform {platform} has {} entries titled \"{title}\": {:?}",
+                paths.len(),
+                paths,
+            );
+        }
+    }
+
     Ok(new_games)
 }
 
