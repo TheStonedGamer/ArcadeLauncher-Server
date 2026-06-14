@@ -1,8 +1,17 @@
 # ArcadeLauncher — Implementation Roadmap
 
-Source of truth for the step-by-step build-out described in
+Execution tracker for the product vision in **`social.md`** (the v1→v3+ roadmap:
+7 phases + 7 milestones) and the audit in
 [`ARCHITECTURE_REVIEW.md`](../ArcadeLauncher-Client/ARCHITECTURE_REVIEW.md).
-Goal: implement **every** feature, in full, one shippable increment at a time.
+`social.md` = the *what/why* (product areas); this file = the *how/when*
+(sequenced, dependency-ordered increments). Goal: implement **every** feature, in
+full, one shippable increment at a time.
+
+**social.md → ROADMAP mapping:** Milestone 1 (Notifications v2, Friend Requests
+v2, Cloud Saves v2, Downloads v2, **account hardening**) ≈ Phase 0 + parts of
+Phase 1/2.7/3.3 here. Milestone 2 (DMs/Voice/Groups/Presence/Parties) ≈ Phase 1
++ 2.1–2.3. Milestone 3 (Profiles/Activity/Screenshots/Reviews) ≈ 1.4 + 3.7.
+Milestones 4–7 ≈ Phase 2 (library) + Phase 3 (communities/platform/scale).
 Check items off as they land. Each step should compile, be backward-compatible
 where possible, and note any required client/server lockstep.
 
@@ -20,16 +29,20 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
 
 ## Phase 0 — Foundations (durable, sequenced, scalable state)
 
-- [~] **0.1 Persistent notifications** — _Server DONE (compiles, additive,
-  patch-level); client consumption pending in 0.2._
+- [x] **0.1 Persistent notifications** — _Server DONE + DEPLOYED LIVE (v1.2.8,
+  2026-06-14); client consumption DONE in 0.2._
   - [x] `social_notifications` table in `ensure_social_schema`.
   - [x] `store_notification()` helper (persist + best-effort live push).
   - [x] Wired friend_request + friend_accepted to persist.
   - [x] `deliver_pending_notifications()` batch on gateway connect.
   - [x] REST `GET /api/social/notifications` + `POST /api/social/notifications/read`.
   - [ ] (later) persist message + voice_invite notifications (with DM step 1.2).
-- [ ] **0.2 Notification center UI** (C) — bell panel reads the persisted list,
-  shows unread badge, mark-read on open, deep-link to friend/DM.
+- [x] **0.2 Notification center UI** (C) — _DONE (client, builds clean)._ Bell
+  panel now reads the **server-persisted** feed: consumes live `notification`
+  frames (toast) + connect `notifications` backlog batch (silent), `RefreshNotifications()`
+  REST `GET` on start/reconnect, dedup by `serverId`, unread badge, mark-read on
+  open now also `POST`s `/notifications/read{upToId}`, deep-link to friend/DM via
+  `actorId`. Patch-level (additive); needs a client release to ship.
 - [ ] **0.3 Event sequencing + resume** (S, C) — per-user monotonic `event_seq`;
   client sends `resume{last_seq}`; server backfills exactly what was missed
   (replaces "re-pull everything" on reconnect).
@@ -38,6 +51,11 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   >1 instance. Keep `social_hub` as the local socket registry.
 - [ ] **0.5 Server-synced preferences** (S, C) — move `social_prefs.json`
   (favorites, nicknames, notif toggles) into a `user_prefs` table; client caches.
+- [ ] **0.6 Account hardening** (S, C) — _from social.md Milestone 1._ Refresh
+  tokens + rotation, device/session management, login history, force-logout,
+  brute-force protection + login rate limiting, `audit_log` table, email
+  verification + passwordless/remember-me scaffolding. Pure server-first; client
+  adds a "sessions & security" panel after.
 
 ## Phase 1 — Social parity (Steam/Discord/Battle.net)
 
