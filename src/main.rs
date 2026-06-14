@@ -65,6 +65,7 @@ include!("admin_html.rs");
 include!("discord.rs");
 include!("users_api.rs");
 include!("fanout.rs");
+include!("s3.rs");
 include!("social_api.rs");
 
 #[tokio::main]
@@ -138,6 +139,8 @@ async fn main() -> Result<()> {
             get(api_social_friendmeta_get).put(api_social_friendmeta_put),
         )
         .route("/api/social/search", get(api_social_search))
+        .route("/api/social/attachments/presign", post(api_social_attachment_presign))
+        .route("/api/social/attachments/:id", get(api_social_attachment_get))
         .route("/api/social/messages/:id", get(api_social_history))
         .route("/api/social/notifications", get(api_social_notifications))
         .route(

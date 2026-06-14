@@ -132,7 +132,14 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
     (dup `sender_id+client_nonce` re-broadcasts the existing row instead of inserting;
     `clientNonce` echoed in the chat frame). History now returns `replyTo` +
     per-message `reactions:[{emoji,userId}]`. Client SQLite cache + UI deferred (C).
-- [ ] **1.3 DM attachments + screenshots** — MinIO object storage, presigned PUT.
+- [~] **1.3 DM attachments + screenshots** (S) — _server slice done._ MinIO object
+  store (CT 10.0.0.220, bucket `arcade-attachments`). New `social_attachments` table.
+  Hand-rolled SigV4 presign (`src/s3.rs`, no AWS SDK) — `POST /api/social/attachments/
+  presign` {filename,contentType,size} → 25 MiB-capped presigned PUT + `objectKey`;
+  `GET /api/social/attachments/:id` → presigned GET (owner or message-participant).
+  `chat` frames accept optional `attachmentId` (attachment-only messages allowed);
+  history returns per-message `attachmentId`. Gated on `ARCADE_S3_*` env (503 if unset).
+  Client upload/download UI deferred (C).
 - [~] **1.4 User profiles** (S) — _server slice done._ New `social_profiles` table
   (banner, bio, xp). `GET /api/social/profile/:id` →
   `{userId,username,avatarVersion,banner,bio,level,xp}` (level = floor(sqrt(xp/100)));

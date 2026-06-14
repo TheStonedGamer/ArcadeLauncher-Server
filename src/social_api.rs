@@ -200,8 +200,31 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
     let _ = c
         .query_drop("ALTER TABLE social_presence ADD COLUMN status_text VARCHAR(128) NULL")
         .await;
+    // DM attachments (ROADMAP 1.3): one row per uploaded object. object_key is the
+    // MinIO key; message_id links it to a DM once sent (NULL while pending upload).
+    // Bytes live in MinIO, not here — we only track metadata + access control.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_attachments (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          owner_id BIGINT UNSIGNED NOT NULL,
+          message_id BIGINT UNSIGNED NULL,
+          object_key VARCHAR(512) NOT NULL,
+          filename VARCHAR(255) NOT NULL,
+          content_type VARCHAR(128) NULL,
+          size BIGINT NOT NULL DEFAULT 0,
+          created_at BIGINT NOT NULL,
+          INDEX idx_att_msg (message_id),
+          INDEX idx_att_owner (owner_id, id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
+
+// ROADMAP 1.3: max attachment size accepted for a presigned upload (25 MiB) and
+// how long the presigned PUT/GET URLs stay valid.
+const ATTACHMENT_MAX_BYTES: i64 = 25 * 1024 * 1024;
+const ATTACHMENT_URL_TTL_SECS: u64 = 600;
 
 // True if `ignorer` has persistently ignored `ignored` (ROADMAP 1.1b).
 async fn has_ignored(db: &Pool, ignorer: u64, ignored: u64) -> bool {
@@ -215,6 +238,154 @@ async fn has_ignored(db: &Pool, ignorer: u64, ignored: u64) -> bool {
         .ok()
         .flatten();
     n.unwrap_or(0) > 0
+}
+
+// Keep only the basename and a safe character set; used for the object key and
+// the stored display name so a crafted filename can't escape the key prefix.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .take(120)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    cleaned.trim_matches('.').to_string()
+}
+
+#[derive(Deserialize)]
+struct PresignBody {
+    filename: String,
+    #[serde(default, rename = "contentType")]
+    content_type: String,
+    #[serde(default)]
+    size: i64,
+}
+
+// POST /api/social/attachments/presign — register a pending attachment and return
+// a short-lived presigned PUT URL the client uploads the bytes to directly. 503
+// when no object store is configured (feature dormant).
+async fn api_social_attachment_presign(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PresignBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let Some(s3) = st.cfg.s3.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Attachments not configured").into_response();
+    };
+    if body.size <= 0 || body.size > ATTACHMENT_MAX_BYTES {
+        return (StatusCode::BAD_REQUEST, "Invalid or too-large attachment size").into_response();
+    }
+    let safe = sanitize_filename(&body.filename);
+    if safe.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+    }
+    let ts = now();
+    let rnd: u64 = rand::random();
+    let object_key = format!("dm/{}/{:x}-{:x}/{}", me.id, ts, rnd, safe);
+    let ct: Option<String> = if body.content_type.is_empty() {
+        None
+    } else {
+        Some(body.content_type.chars().take(128).collect())
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let ins = c
+        .exec_iter(
+            "INSERT INTO social_attachments (owner_id, object_key, filename, content_type, size, created_at) VALUES (:o,:k,:f,:ct,:s,:t)",
+            params! {"o" => me.id, "k" => &object_key, "f" => &safe, "ct" => &ct, "s" => body.size, "t" => ts},
+        )
+        .await;
+    let id = match ins {
+        Ok(r) => r.last_insert_id().unwrap_or(0),
+        Err(e) => return server_error(e),
+    };
+    let url = s3_presign(s3, "PUT", &object_key, ATTACHMENT_URL_TTL_SECS);
+    Json(serde_json::json!({
+        "attachmentId": id,
+        "objectKey": object_key,
+        "uploadUrl": url,
+        "expiresIn": ATTACHMENT_URL_TTL_SECS,
+    }))
+    .into_response()
+}
+
+// GET /api/social/attachments/:id — presigned download URL, gated to the owner or
+// (once the attachment is linked to a DM) the message's two participants.
+async fn api_social_attachment_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let Some(s3) = st.cfg.s3.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Attachments not configured").into_response();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let row: Option<(u64, Option<u64>, String, String, Option<String>, i64)> = c
+        .exec_first(
+            "SELECT owner_id, message_id, object_key, filename, content_type, size FROM social_attachments WHERE id=:id",
+            params! {"id" => id},
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some((owner, msg_id, key, filename, ct, size)) = row else {
+        return (StatusCode::NOT_FOUND, "No such attachment").into_response();
+    };
+    let allowed = owner == me.id
+        || match msg_id {
+            Some(mid) => {
+                let p: Option<(u64, u64)> = c
+                    .exec_first(
+                        "SELECT sender_id, receiver_id FROM social_messages WHERE id=:m",
+                        params! {"m" => mid},
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                matches!(p, Some((s, r)) if s == me.id || r == me.id)
+            }
+            None => false,
+        };
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "Not your attachment").into_response();
+    }
+    let url = s3_presign(s3, "GET", &key, ATTACHMENT_URL_TTL_SECS);
+    Json(serde_json::json!({
+        "attachmentId": id,
+        "downloadUrl": url,
+        "filename": filename,
+        "contentType": ct,
+        "size": size,
+        "expiresIn": ATTACHMENT_URL_TTL_SECS,
+    }))
+    .into_response()
+}
+
+// Link a freshly-uploaded attachment to the DM that carries it. Best-effort:
+// only the owner's own still-unlinked attachment is claimed. Returns true on link.
+async fn link_attachment(st: &AppState, owner: u64, attachment_id: u64, message_id: u64) -> bool {
+    if attachment_id == 0 || message_id == 0 {
+        return false;
+    }
+    let Ok(mut c) = st.db.get_conn().await else { return false; };
+    let r = c
+        .exec_iter(
+            "UPDATE social_attachments SET message_id=:m WHERE id=:a AND owner_id=:o AND message_id IS NULL",
+            params! {"m" => message_id, "a" => attachment_id, "o" => owner},
+        )
+        .await;
+    matches!(r, Ok(res) if res.affected_rows() > 0)
 }
 
 // The caller's DM privacy policy (defaults to 'everyone').
@@ -1654,6 +1825,8 @@ async fn api_social_history(
     // Per-message reactions for this page (ROADMAP 1.2b).
     let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
     let react_map = reactions_for_messages(&st.db, &ids).await;
+    // Per-message attachment id for this page (ROADMAP 1.3).
+    let att_map = attachments_for_messages(&st.db, &ids).await;
     // Mark inbound messages read up to now.
     let _ = c
         .exec_drop(
@@ -1676,10 +1849,33 @@ async fn api_social_history(
                 "deleted": deleted_at.is_some(),
                 "replyTo": reply_to,
                 "reactions": react_map.get(&id).cloned().unwrap_or_default(),
+                "attachmentId": att_map.get(&id).copied().unwrap_or(0),
             })
         })
         .collect();
     Json(serde_json::json!({ "messages": msgs })).into_response()
+}
+
+// Build message_id -> attachment_id for a page of messages (ROADMAP 1.3). Only
+// the first attachment per message is surfaced (DMs carry at most one today).
+async fn attachments_for_messages(
+    db: &Pool,
+    ids: &[u64],
+) -> std::collections::HashMap<u64, u64> {
+    let mut map = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return map;
+    }
+    let Ok(mut c) = db.get_conn().await else { return map; };
+    let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT message_id, id FROM social_attachments WHERE message_id IN ({list}) ORDER BY id ASC"
+    );
+    let rows: Vec<(u64, u64)> = c.query(sql).await.unwrap_or_default();
+    for (mid, aid) in rows {
+        map.entry(mid).or_insert(aid);
+    }
+    map
 }
 
 // ----------------------------------------------------------------------------
@@ -1853,6 +2049,10 @@ struct WsEnvelope {
     #[serde(default)]
     #[serde(rename = "clientNonce")]
     client_nonce: String,
+    // DM attachment (1.3): id from /attachments/presign to link onto a "chat" frame.
+    #[serde(default)]
+    #[serde(rename = "attachmentId")]
+    attachment_id: u64,
     // Presence depth (1.6): optional custom status text + DND flag for "presence".
     #[serde(default)]
     #[serde(rename = "statusText")]
@@ -1904,7 +2104,7 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
             }
         }
         "chat" => {
-            handle_ws_chat(st, uid, env.to, &env.text, env.reply_to, &env.client_nonce).await;
+            handle_ws_chat(st, uid, env.to, &env.text, env.reply_to, &env.client_nonce, env.attachment_id).await;
         }
         "react" => {
             handle_ws_react(st, uid, env.msg_id, &env.emoji, env.on).await;
@@ -1961,8 +2161,10 @@ async fn handle_ws_chat(
     text: &str,
     reply_to: u64,
     client_nonce: &str,
+    attachment_id: u64,
 ) {
-    if to == 0 || text.is_empty() {
+    // An attachment-only message (no text) is allowed when an attachment rides along.
+    if to == 0 || (text.is_empty() && attachment_id == 0) {
         return;
     }
     let trimmed: String = text.chars().take(4000).collect();
@@ -2028,6 +2230,13 @@ async fn handle_ws_chat(
             Err(_) => return,
         }
     };
+    // Link a presigned attachment to this message (owner-checked) so the GET
+    // endpoint will authorize both DM participants for it.
+    let att_id = if attachment_id > 0 && link_attachment(st, uid, attachment_id, msg_id).await {
+        attachment_id
+    } else {
+        0
+    };
     let mut evt = serde_json::json!({
         "type": "chat",
         "messageId": msg_id,
@@ -2039,6 +2248,9 @@ async fn handle_ws_chat(
     });
     if let Some(ref n) = nonce_opt {
         evt["clientNonce"] = serde_json::Value::String(n.clone());
+    }
+    if att_id > 0 {
+        evt["attachmentId"] = serde_json::Value::from(att_id);
     }
     let evt = evt.to_string();
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.

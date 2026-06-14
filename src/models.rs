@@ -105,6 +105,22 @@ struct Config {
     // gateway fans real-time events out across instances via pub/sub and tracks a
     // cross-instance online registry. Unset ⇒ single-instance in-process behavior.
     redis_url: Option<String>,
+    // Optional S3/MinIO config for DM attachments (ROADMAP 1.3). Some(...) only
+    // when endpoint+bucket+access+secret are all set; otherwise attachment
+    // endpoints return 503 and the feature is dormant (like Redis above).
+    s3: Option<S3Config>,
+}
+
+// S3-compatible object store (MinIO) connection for DM attachments. Path-style
+// addressing; presigned URLs are generated in-process (src/s3.rs) so clients
+// upload/download directly to the store and bytes never transit this server.
+#[derive(Clone)]
+struct S3Config {
+    endpoint: String,    // e.g. http://10.0.0.220:9000 (no trailing slash)
+    region: String,      // e.g. us-east-1 (MinIO ignores but SigV4 needs it)
+    bucket: String,      // e.g. arcade-attachments
+    access_key: String,
+    secret_key: String,
 }
 
 impl Config {
@@ -161,6 +177,23 @@ impl Config {
             redis_url: {
                 let u = env_string("ARCADE_REDIS_URL", "");
                 if u.is_empty() { None } else { Some(u) }
+            },
+            s3: {
+                let endpoint = env_string("ARCADE_S3_ENDPOINT", "");
+                let bucket = env_string("ARCADE_S3_BUCKET", "");
+                let access_key = env_string("ARCADE_S3_ACCESS_KEY", "");
+                let secret_key = env_string("ARCADE_S3_SECRET_KEY", "");
+                if endpoint.is_empty() || bucket.is_empty() || access_key.is_empty() || secret_key.is_empty() {
+                    None
+                } else {
+                    Some(S3Config {
+                        endpoint: endpoint.trim_end_matches('/').to_string(),
+                        region: env_string("ARCADE_S3_REGION", "us-east-1"),
+                        bucket,
+                        access_key,
+                        secret_key,
+                    })
+                }
             },
         })
     }
