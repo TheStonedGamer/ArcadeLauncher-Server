@@ -116,6 +116,11 @@ async fn main() -> Result<()> {
         .route("/api/social/friends/respond", post(api_social_respond))
         .route("/api/social/friends/block", post(api_social_block))
         .route("/api/social/messages/:id", get(api_social_history))
+        .route("/api/social/notifications", get(api_social_notifications))
+        .route(
+            "/api/social/notifications/read",
+            post(api_social_notifications_read),
+        )
         .route("/ws/social", get(ws_social))
         .route("/art/:id", get(download_art))
         .route("/emulators/*rel", get(download_emulator))

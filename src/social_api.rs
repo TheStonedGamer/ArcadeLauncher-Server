@@ -72,6 +72,30 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Durable notification feed, one row per recipient per event. Unlike the
+    // ephemeral hub push, these survive a restart and are redelivered to the
+    // client when it (re)connects, so events that happen while a user is offline
+    // are not lost. kind: friend_request|friend_accepted|friend_removed|message|
+    // voice_invite|system. actor_* identify who caused it; payload is an optional
+    // serialized-JSON blob for deep-linking. seen_at/read_at track badge + read
+    // state (seen = surfaced as a toast; read = explicitly acknowledged).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_notifications (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NOT NULL,
+          kind VARCHAR(32) NOT NULL,
+          actor_id BIGINT UNSIGNED NULL,
+          actor_name VARCHAR(80) NULL,
+          body TEXT NULL,
+          payload TEXT NULL,
+          seen_at BIGINT NULL,
+          read_at BIGINT NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_notif_user (user_id, id),
+          INDEX idx_notif_unread (user_id, read_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -418,6 +442,16 @@ async fn api_social_request(
                 )
                 .await;
             notify_relationship(&st, me.id, target.id, "friend_accepted").await;
+            store_notification(
+                &st,
+                target.id,
+                "friend_accepted",
+                Some(me.id),
+                Some(&me.username),
+                Some(&format!("{} accepted your friend request", me.username)),
+                Some(serde_json::json!({ "userId": me.id, "username": me.username })),
+            )
+            .await;
             return Json(serde_json::json!({ "status": "accepted" })).into_response();
         }
         Some(_) => {
@@ -445,6 +479,17 @@ async fn api_social_request(
         })
         .to_string(),
     );
+    // Durable notification so the target still sees it if currently offline.
+    store_notification(
+        &st,
+        target.id,
+        "friend_request",
+        Some(me.id),
+        Some(&me.username),
+        Some(&format!("{} sent you a friend request", me.username)),
+        Some(serde_json::json!({ "fromId": me.id, "fromUsername": me.username })),
+    )
+    .await;
     Json(serde_json::json!({ "status": "request_sent" })).into_response()
 }
 
@@ -479,6 +524,16 @@ async fn api_social_respond(
             match n {
                 Ok(r) if r.affected_rows() > 0 => {
                     notify_relationship(&st, me.id, body.user_id, "friend_accepted").await;
+                    store_notification(
+                        &st,
+                        body.user_id,
+                        "friend_accepted",
+                        Some(me.id),
+                        Some(&me.username),
+                        Some(&format!("{} accepted your friend request", me.username)),
+                        Some(serde_json::json!({ "userId": me.id, "username": me.username })),
+                    )
+                    .await;
                     Json(serde_json::json!({ "status": "accepted" })).into_response()
                 }
                 Ok(_) => (StatusCode::NOT_FOUND, "No pending request").into_response(),
@@ -560,6 +615,210 @@ async fn notify_relationship(st: &AppState, a: u64, b: u64, kind: &str) {
     social_hub().push(b, &evt);
     let evt2 = serde_json::json!({ "type": kind, "userId": b }).to_string();
     social_hub().push(a, &evt2);
+}
+
+// ----------------------------------------------------------------------------
+// Durable notifications
+// ----------------------------------------------------------------------------
+
+// Persist a notification for `user_id` and push it live if they're connected.
+// Returns the new row id (0 on failure). The DB row is the source of truth and
+// is redelivered by deliver_pending_notifications on the user's next connect, so
+// an offline recipient still sees the event. The live `notification` frame is a
+// best-effort optimization for already-connected clients.
+async fn store_notification(
+    st: &AppState,
+    user_id: u64,
+    kind: &str,
+    actor_id: Option<u64>,
+    actor_name: Option<&str>,
+    body: Option<&str>,
+    payload: Option<serde_json::Value>,
+) -> u64 {
+    let payload_str = payload.as_ref().map(|p| p.to_string());
+    let ts = now();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let ins = c
+        .exec_iter(
+            r#"INSERT INTO social_notifications
+               (user_id, kind, actor_id, actor_name, body, payload, created_at)
+               VALUES (:u, :k, :ai, :an, :b, :p, :t)"#,
+            params! {
+                "u" => user_id, "k" => kind, "ai" => actor_id,
+                "an" => actor_name, "b" => body, "p" => payload_str, "t" => ts,
+            },
+        )
+        .await;
+    let id = match ins {
+        Ok(r) => r.last_insert_id().unwrap_or(0),
+        Err(_) => return 0,
+    };
+    let frame = serde_json::json!({
+        "type": "notification",
+        "id": id,
+        "kind": kind,
+        "actorId": actor_id,
+        "actorName": actor_name,
+        "body": body,
+        "payload": payload,
+        "timestamp": ts,
+        "read": false,
+    })
+    .to_string();
+    social_hub().push(user_id, &frame);
+    id
+}
+
+// Map one DB row to the wire shape shared by the live frame, the connect batch,
+// and the REST list.
+fn notification_row_json(
+    id: u64,
+    kind: String,
+    actor_id: Option<u64>,
+    actor_name: Option<String>,
+    body: Option<String>,
+    payload: Option<String>,
+    ts: i64,
+    read_at: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "actorId": actor_id,
+        "actorName": actor_name,
+        "body": body,
+        "payload": payload.and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok()),
+        "timestamp": ts,
+        "read": read_at.is_some(),
+    })
+}
+
+type NotifRow = (
+    u64,
+    String,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<i64>,
+);
+
+// On (re)connect, push every still-unread notification as one batch frame so the
+// client can repopulate its notification center for anything missed offline.
+async fn deliver_pending_notifications(
+    st: &AppState,
+    uid: u64,
+    tx: &tokio::sync::mpsc::UnboundedSender<OutMsg>,
+) {
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let rows: Vec<NotifRow> = match c
+        .exec(
+            r#"SELECT id, kind, actor_id, actor_name, body, payload, created_at, read_at
+               FROM social_notifications
+               WHERE user_id=:u AND read_at IS NULL
+               ORDER BY id DESC LIMIT 100"#,
+            params! {"u" => uid},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let items: Vec<_> = rows
+        .into_iter()
+        .rev()
+        .map(|(id, kind, aid, aname, body, payload, ts, read)| {
+            notification_row_json(id, kind, aid, aname, body, payload, ts, read)
+        })
+        .collect();
+    let _ = tx.send(OutMsg::Text(
+        serde_json::json!({ "type": "notifications", "items": items }).to_string(),
+    ));
+}
+
+// REST: list recent notifications (read + unread) plus the unread count.
+async fn api_social_notifications(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<NotifRow> = match c
+        .exec(
+            r#"SELECT id, kind, actor_id, actor_name, body, payload, created_at, read_at
+               FROM social_notifications
+               WHERE user_id=:u ORDER BY id DESC LIMIT 200"#,
+            params! {"u" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let mut unread: u64 = 0;
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|(id, kind, aid, aname, body, payload, ts, read)| {
+            if read.is_none() {
+                unread += 1;
+            }
+            notification_row_json(id, kind, aid, aname, body, payload, ts, read)
+        })
+        .collect();
+    Json(serde_json::json!({ "notifications": items, "unread": unread })).into_response()
+}
+
+#[derive(Deserialize)]
+struct NotifReadBody {
+    #[serde(default)]
+    #[serde(rename = "upToId")]
+    up_to_id: u64,
+}
+
+// REST: mark notifications read. With upToId>0, marks only rows up to that id
+// (inclusive); otherwise marks all currently-unread rows.
+async fn api_social_notifications_read(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<NotifReadBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let ts = now();
+    let res = if body.up_to_id > 0 {
+        c.exec_drop(
+            "UPDATE social_notifications SET read_at=:t WHERE user_id=:u AND read_at IS NULL AND id<=:id",
+            params! {"t" => ts, "u" => me.id, "id" => body.up_to_id},
+        )
+        .await
+    } else {
+        c.exec_drop(
+            "UPDATE social_notifications SET read_at=:t WHERE user_id=:u AND read_at IS NULL",
+            params! {"t" => ts, "u" => me.id},
+        )
+        .await
+    };
+    if let Err(e) = res {
+        return server_error(e);
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
 // ----------------------------------------------------------------------------
@@ -676,6 +935,9 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     let _ = tx.send(OutMsg::Text(
         serde_json::json!({ "type": "hello", "selfId": uid }).to_string(),
     ));
+
+    // Redeliver anything that happened while this user was offline.
+    deliver_pending_notifications(&st, uid, &tx).await;
 
     // Mark online (unless invisible already chosen) and announce to friends.
     let was_online = social_hub()
