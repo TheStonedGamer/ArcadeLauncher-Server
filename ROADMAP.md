@@ -53,9 +53,10 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   silently (dedup by id, replaces pending echoes, bumps unread, no toast).
   Backward-compatible (unknown frames ignored both ways) but new client wants the
   new server's resume support → **deploy server with/before the client release.**
-- [x] **0.4 Redis presence + pub/sub fan-out** (S, infra) — _Code DONE; ships
-  DORMANT (no `ARCADE_REDIS_URL` set yet). To go multi-instance: stand up a Redis
-  container, set the env var, run >1 instance behind nginx._ New `src/fanout.rs`:
+- [x] **0.4 Redis presence + pub/sub fan-out** (S, infra) — _DEPLOYED LIVE DORMANT
+  (v1.2.11, 2026-06-14): code in prod but no `ARCADE_REDIS_URL` set, so it runs
+  single-instance identically. To go multi-instance: stand up a Redis container,
+  set the env var, run >1 instance behind nginx._ New `src/fanout.rs`:
   optional Redis bus. Text `push` = local `deliver_local` + publish on
   `social:fanout`; each instance's subscriber delivers peer-origin frames locally
   (deduped by per-process instance id, so no double-delivery). Cross-instance
