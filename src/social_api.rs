@@ -218,6 +218,24 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Library tracking (ROADMAP 2.4): per-account, per-game playtime / last-played /
+    // completion / rating. game_id is the client's stable catalog id (string). This
+    // is account-scoped state synced across devices, so it lives with the other
+    // per-account social tables.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_stats (
+          user_id BIGINT UNSIGNED NOT NULL,
+          game_id VARCHAR(80) NOT NULL,
+          playtime_seconds BIGINT NOT NULL DEFAULT 0,
+          last_played BIGINT NOT NULL DEFAULT 0,
+          play_count BIGINT NOT NULL DEFAULT 0,
+          completion TINYINT NOT NULL DEFAULT 0,
+          rating TINYINT NOT NULL DEFAULT 0,
+          updated_at BIGINT NOT NULL,
+          PRIMARY KEY (user_id, game_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2484,4 +2502,153 @@ fn handle_ws_audio(uid: u64, data: &[u8]) {
     frame.extend_from_slice(&uid.to_le_bytes());
     frame.extend_from_slice(&data[8..]);
     social_hub().push_binary(target, &frame);
+}
+
+// ----------------------------------------------------------------------------
+// REST: library tracking (ROADMAP 2.4) — per-account playtime / last-played /
+// completion / rating, synced across devices. game_id is the client's stable
+// catalog id. All endpoints are self-scoped (the caller's own account only).
+// ----------------------------------------------------------------------------
+
+// GET /api/library/stats — every stats row for the caller.
+async fn api_library_stats(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, i64, i64, i64, i8, i8)> = match c
+        .exec(
+            r#"SELECT game_id, playtime_seconds, last_played, play_count, completion, rating
+               FROM game_stats WHERE user_id=:id"#,
+            params! {"id" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let out: Vec<_> = rows
+        .into_iter()
+        .map(|(game_id, secs, last, count, comp, rating)| {
+            serde_json::json!({
+                "gameId": game_id,
+                "playtimeSeconds": secs,
+                "lastPlayed": last,
+                "playCount": count,
+                "completion": comp,
+                "rating": rating,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "stats": out })).into_response()
+}
+
+#[derive(Deserialize)]
+struct PlaytimeBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    seconds: i64,
+}
+
+// POST /api/library/playtime — add a completed session's seconds to a game,
+// bump last_played + play_count. Upserts the row. Ignores non-positive seconds
+// and absurd values (cap one session at 24h to blunt a stuck-timer client).
+async fn api_library_playtime(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PlaytimeBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let secs = body.seconds.clamp(0, 24 * 3600);
+    if secs <= 0 {
+        return Json(serde_json::json!({ "status": "ok", "ignored": true })).into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let now = now();
+    if let Err(e) = c
+        .exec_drop(
+            r#"INSERT INTO game_stats
+                 (user_id, game_id, playtime_seconds, last_played, play_count, updated_at)
+               VALUES (:id, :gid, :secs, :now, 1, :now)
+               ON DUPLICATE KEY UPDATE
+                 playtime_seconds = playtime_seconds + :secs,
+                 last_played = :now,
+                 play_count = play_count + 1,
+                 updated_at = :now"#,
+            params! {"id" => me.id, "gid" => &gid, "secs" => secs, "now" => now},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+#[derive(Deserialize)]
+struct RatingBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(default)]
+    rating: Option<i8>,
+    #[serde(default)]
+    completion: Option<i8>,
+}
+
+// POST /api/library/rating — set the caller's rating (0-5) and/or completion
+// flag (0/1) for a game. Either field may be supplied alone. Upserts the row.
+async fn api_library_rating(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RatingBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let rating = body.rating.map(|r| r.clamp(0, 5));
+    let completion = body.completion.map(|c| if c != 0 { 1 } else { 0 });
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let now = now();
+    // Ensure a row exists first, then update only supplied columns.
+    let _ = c
+        .exec_drop(
+            "INSERT IGNORE INTO game_stats (user_id, game_id, updated_at) VALUES (:id, :gid, :now)",
+            params! {"id" => me.id, "gid" => &gid, "now" => now},
+        )
+        .await;
+    if let Some(r) = rating {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_stats SET rating=:r, updated_at=:now WHERE user_id=:id AND game_id=:gid",
+                params! {"r" => r, "now" => now, "id" => me.id, "gid" => &gid},
+            )
+            .await;
+    }
+    if let Some(comp) = completion {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_stats SET completion=:c, updated_at=:now WHERE user_id=:id AND game_id=:gid",
+                params! {"c" => comp, "now" => now, "id" => me.id, "gid" => &gid},
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
 }
