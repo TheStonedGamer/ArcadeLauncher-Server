@@ -103,8 +103,15 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
     enforced in `api_social_request`; `GET`/`PUT /api/social/privacy`.
   - [x] **Block auto-decline** — already in place: blocking deletes the friendship
     row and `is_blocked_either` rejects future requests with 403.
-  - [ ] (later 1.1b) DM privacy policy (who-can-DM), per-sender ignore/mute that
-    survives re-requests, client UI for the privacy setting + ignore button.
+  - [x] **1.1b DM privacy + persistent ignore** (S) — _server slice done._
+    `dm_policy` column on `social_friend_settings` (everyone|friends|nobody),
+    enforced in `handle_ws_chat`. New `social_ignores` table; the `ignore` respond
+    action now also `INSERT IGNORE`s a persistent row; `api_social_request` silently
+    no-ops (returns `request_sent`, creates/notifies nothing) when either party has
+    ignored the other; `handle_ws_chat` drops if recipient ignores sender. Privacy
+    GET now returns `{friendPolicy,dmPolicy}`; PUT accepts either/both. New
+    `GET /api/social/ignores` → `{ignored:[ids]}` and `POST /api/social/ignores`
+    `{userId,ignore}`. Additive/patch-level; client UI for the toggle still pending.
 - [~] **1.2 DM upgrades** (S) — _Server slice 1.2a DEPLOYED LIVE (v1.2.18,
   2026-06-14); additive/patch-level, no client change required (new WS frames +
   JSON fields ignored by old clients). Routes verified 401-gated; schema ALTERs
@@ -117,14 +124,30 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
     row (`deleted_at`, body blanked); broadcasts `chat_delete`.
   - [x] **Pagination / infinite history** — `GET /api/social/messages/:id?before=N`
     pages backwards (id<N); history now also returns `editedAt`/`deleted`.
-  - [ ] (later 1.2b) reactions, replies/threads, offline send queue, client SQLite
-    cache, and the client UI to drive edit/delete/read/scrollback.
+  - [x] **1.2b reactions, replies, offline-send idempotency** (S) — _server slice
+    done._ New `social_message_reactions` table; WS `{"type":"react","msgId","emoji",
+    "on"}` toggles, broadcasts `{"type":"reaction","messageId","userId","emoji","on"}`
+    to both parties (actor must be sender/receiver). `reply_to` column + optional
+    `replyTo` on `chat` frames; `client_nonce` column for offline-send idempotency
+    (dup `sender_id+client_nonce` re-broadcasts the existing row instead of inserting;
+    `clientNonce` echoed in the chat frame). History now returns `replyTo` +
+    per-message `reactions:[{emoji,userId}]`. Client SQLite cache + UI deferred (C).
 - [ ] **1.3 DM attachments + screenshots** — MinIO object storage, presigned PUT.
-- [ ] **1.4 User profiles** — avatar (done) + banner, bio, level/XP, profile view.
-- [ ] **1.5 Friend organization** — groups/categories, pinning, friend notes
-  (server-synced), friend search, mutual friends, suggested friends.
-- [ ] **1.6 Presence depth** — custom status text, DND, invisible (done partially),
-  idle auto-detect, device indicator, join/spectate, party presence.
+- [~] **1.4 User profiles** (S) — _server slice done._ New `social_profiles` table
+  (banner, bio, xp). `GET /api/social/profile/:id` →
+  `{userId,username,avatarVersion,banner,bio,level,xp}` (level = floor(sqrt(xp/100)));
+  `PUT /api/social/profile` (self) sets banner/bio. +10 XP to both parties on
+  friend_accepted. Client profile view UI deferred (C).
+- [~] **1.5 Friend organization** (S) — _server slice done._ New `social_friend_meta`
+  table (note, groups CSV, pinned). `GET/PUT /api/social/friendmeta`; note/groups/
+  pinned now included in `api_social_friends` output. `GET /api/social/search?q=`
+  (username LIKE, ≤20, excludes self/blocked). Mutual/suggested friends + client UI
+  deferred (C).
+- [~] **1.6 Presence depth** (S) — _server slice done._ `status_text` column on
+  `social_presence`; `presence` WS frame accepts optional `statusText` + `dnd`
+  (dnd→busy), and `offline` is now an accepted explicit state. `statusText` carried
+  in `presence` diffs and the friends list. Idle auto-detect, device indicator,
+  join/spectate, party presence deferred (C / later).
 
 ## Phase 2 — Comms & library depth
 

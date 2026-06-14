@@ -127,6 +127,17 @@ async fn main() -> Result<()> {
             "/api/social/privacy",
             get(api_social_privacy_get).put(api_social_privacy_put),
         )
+        .route(
+            "/api/social/ignores",
+            get(api_social_ignores_get).post(api_social_ignores_post),
+        )
+        .route("/api/social/profile/:id", get(api_social_profile_get))
+        .route("/api/social/profile", put(api_social_profile_put))
+        .route(
+            "/api/social/friendmeta",
+            get(api_social_friendmeta_get).put(api_social_friendmeta_put),
+        )
+        .route("/api/social/search", get(api_social_search))
         .route("/api/social/messages/:id", get(api_social_history))
         .route("/api/social/notifications", get(api_social_notifications))
         .route(

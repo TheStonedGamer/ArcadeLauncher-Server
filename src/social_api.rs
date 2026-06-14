@@ -134,7 +134,100 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
     let _ = c
         .query_drop("ALTER TABLE social_messages ADD COLUMN deleted_at BIGINT NULL")
         .await;
+    // DM privacy (ROADMAP 1.1b). dm_policy controls who may DM this user:
+    // 'everyone' (default) | 'friends' (accepted friends only) | 'nobody'.
+    // Best-effort ADD COLUMN for pre-existing installs.
+    let _ = c
+        .query_drop("ALTER TABLE social_friend_settings ADD COLUMN dm_policy VARCHAR(16) NOT NULL DEFAULT 'everyone'")
+        .await;
+    // Persistent per-sender ignore (ROADMAP 1.1b). An ignore survives re-requests:
+    // a row (ignorer_id, ignored_id) means ignorer never receives requests/DMs from
+    // ignored. Distinct from blocks (which are mutual-visible and reject with 403).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_ignores (
+          ignorer_id BIGINT UNSIGNED NOT NULL,
+          ignored_id BIGINT UNSIGNED NOT NULL,
+          created_at BIGINT NOT NULL,
+          PRIMARY KEY (ignorer_id, ignored_id),
+          INDEX idx_ign_ed (ignored_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Message reactions (ROADMAP 1.2b). One row per (message, user, emoji).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_message_reactions (
+          message_id BIGINT UNSIGNED NOT NULL,
+          user_id BIGINT UNSIGNED NOT NULL,
+          emoji VARCHAR(32) NOT NULL,
+          created_at BIGINT NOT NULL,
+          PRIMARY KEY (message_id, user_id, emoji),
+          INDEX idx_react_msg (message_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Replies + offline-send idempotency (ROADMAP 1.2b). Best-effort ADD COLUMN.
+    let _ = c
+        .query_drop("ALTER TABLE social_messages ADD COLUMN reply_to BIGINT NULL")
+        .await;
+    let _ = c
+        .query_drop("ALTER TABLE social_messages ADD COLUMN client_nonce VARCHAR(40) NULL")
+        .await;
+    // User profiles (ROADMAP 1.4).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_profiles (
+          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+          banner VARCHAR(512) NULL,
+          bio VARCHAR(1024) NULL,
+          xp BIGINT NOT NULL DEFAULT 0,
+          updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Friend organization metadata (ROADMAP 1.5): per-owner-per-friend note,
+    // comma-separated group labels, and a pin flag.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_friend_meta (
+          owner_id BIGINT UNSIGNED NOT NULL,
+          friend_id BIGINT UNSIGNED NOT NULL,
+          note VARCHAR(512) NULL,
+          groups VARCHAR(255) NULL,
+          pinned TINYINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (owner_id, friend_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Presence depth (ROADMAP 1.6): a free-form custom status string.
+    let _ = c
+        .query_drop("ALTER TABLE social_presence ADD COLUMN status_text VARCHAR(128) NULL")
+        .await;
     Ok(())
+}
+
+// True if `ignorer` has persistently ignored `ignored` (ROADMAP 1.1b).
+async fn has_ignored(db: &Pool, ignorer: u64, ignored: u64) -> bool {
+    let Ok(mut c) = db.get_conn().await else { return false; };
+    let n: Option<u64> = c
+        .exec_first(
+            "SELECT COUNT(*) FROM social_ignores WHERE ignorer_id=:a AND ignored_id=:b",
+            params! {"a" => ignorer, "b" => ignored},
+        )
+        .await
+        .ok()
+        .flatten();
+    n.unwrap_or(0) > 0
+}
+
+// The caller's DM privacy policy (defaults to 'everyone').
+async fn dm_policy_of(db: &Pool, user_id: u64) -> String {
+    let Ok(mut c) = db.get_conn().await else { return "everyone".into(); };
+    c.exec_first(
+        "SELECT dm_policy FROM social_friend_settings WHERE user_id=:id",
+        params! {"id" => user_id},
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "everyone".to_string())
 }
 
 // ROADMAP 1.1 tunables. A pending friend request lives 30 days before it is
@@ -356,39 +449,52 @@ async fn are_friends(db: &Pool, a: u64, b: u64) -> bool {
 // offline so a crashed client doesn't appear perpetually online.
 const PRESENCE_STALE_SECS: i64 = 70;
 
-async fn presence_of(db: &Pool, user_id: u64, online_hint: bool) -> (String, Option<String>, Option<String>) {
+// Returns (state, game_id, game_title, status_text). status_text rides along
+// (ROADMAP 1.6) and is cleared when the user is treated as offline/invisible.
+async fn presence_of(
+    db: &Pool,
+    user_id: u64,
+    online_hint: bool,
+) -> (String, Option<String>, Option<String>, Option<String>) {
     let Ok(mut c) = db.get_conn().await else {
-        return ("offline".into(), None, None);
+        return ("offline".into(), None, None, None);
     };
-    let row: Option<(String, Option<String>, Option<String>, i64)> = c
+    let row: Option<(String, Option<String>, Option<String>, i64, Option<String>)> = c
         .exec_first(
-            "SELECT state, game_id, game_title, updated_at FROM social_presence WHERE user_id=:id",
+            "SELECT state, game_id, game_title, updated_at, status_text FROM social_presence WHERE user_id=:id",
             params! {"id" => user_id},
         )
         .await
         .ok()
         .flatten();
     match row {
-        Some((state, gid, gtitle, upd)) => {
+        Some((state, gid, gtitle, upd, status)) => {
             let fresh = online_hint || (now() - upd) < PRESENCE_STALE_SECS;
             if !fresh || state == "invisible" {
-                ("offline".into(), None, None)
+                ("offline".into(), None, None, None)
             } else {
-                (state, gid, gtitle)
+                (state, gid, gtitle, status)
             }
         }
-        None => ("offline".into(), None, None),
+        None => ("offline".into(), None, None, None),
     }
 }
 
-async fn set_presence(db: &Pool, user_id: u64, state: &str, game_id: Option<&str>, game_title: Option<&str>) {
+async fn set_presence(
+    db: &Pool,
+    user_id: u64,
+    state: &str,
+    game_id: Option<&str>,
+    game_title: Option<&str>,
+    status_text: Option<&str>,
+) {
     let Ok(mut c) = db.get_conn().await else { return; };
     let _ = c
         .exec_drop(
-            r#"INSERT INTO social_presence (user_id, state, game_id, game_title, updated_at)
-               VALUES (:id, :s, :gi, :gt, :t)
-               ON DUPLICATE KEY UPDATE state=:s, game_id=:gi, game_title=:gt, updated_at=:t"#,
-            params! {"id" => user_id, "s" => state, "gi" => game_id, "gt" => game_title, "t" => now()},
+            r#"INSERT INTO social_presence (user_id, state, game_id, game_title, status_text, updated_at)
+               VALUES (:id, :s, :gi, :gt, :st, :t)
+               ON DUPLICATE KEY UPDATE state=:s, game_id=:gi, game_title=:gt, status_text=:st, updated_at=:t"#,
+            params! {"id" => user_id, "s" => state, "gi" => game_id, "gt" => game_title, "st" => status_text, "t" => now()},
         )
         .await;
 }
@@ -418,13 +524,14 @@ async fn broadcast_to_friends(db: &Pool, user_id: u64, json: &str) {
 
 async fn push_presence_diff(st: &AppState, user_id: u64) {
     let online = presence_online(user_id).await;
-    let (state, gid, gtitle) = presence_of(&st.db, user_id, online).await;
+    let (state, gid, gtitle, status) = presence_of(&st.db, user_id, online).await;
     let evt = serde_json::json!({
         "type": "presence",
         "userId": user_id,
         "state": state,
         "gameId": gid,
         "gameTitle": gtitle,
+        "statusText": status,
     })
     .to_string();
     broadcast_to_friends(&st.db, user_id, &evt).await;
@@ -469,7 +576,20 @@ async fn api_social_friends(State(st): State<AppState>, headers: HeaderMap) -> R
             _ => "none",
         };
         let online = presence_online(other).await;
-        let (pstate, gid, gtitle) = presence_of(&st.db, other, online).await;
+        let (pstate, gid, gtitle, status) = presence_of(&st.db, other, online).await;
+        // Friend organization metadata (ROADMAP 1.5): per-row note/groups/pinned.
+        let meta: Option<(Option<String>, Option<String>, i8)> = conn
+            .exec_first(
+                "SELECT note, groups, pinned FROM social_friend_meta WHERE owner_id=:o AND friend_id=:f",
+                params! {"o" => me.id, "f" => other},
+            )
+            .await
+            .ok()
+            .flatten();
+        let (note, groups, pinned) = match meta {
+            Some((n, g, p)) => (n, g, p != 0),
+            None => (None, None, false),
+        };
         out.push(serde_json::json!({
             "accountId": other,
             "username": uname,
@@ -477,6 +597,10 @@ async fn api_social_friends(State(st): State<AppState>, headers: HeaderMap) -> R
             "presence": pstate,
             "currentGameId": gid,
             "currentGameTitle": gtitle,
+            "statusText": status,
+            "note": note,
+            "groups": groups,
+            "pinned": pinned,
         }));
     }
     Json(serde_json::json!({ "friends": out })).into_response()
@@ -505,6 +629,11 @@ async fn api_social_request(
     }
     if is_blocked_either(&st.db, me.id, target.id).await {
         return (StatusCode::FORBIDDEN, "Blocked").into_response();
+    }
+    // Persistent ignore (ROADMAP 1.1b): if the target has ignored me, or I have
+    // ignored the target, pretend the request was sent but create/notify nothing.
+    if has_ignored(&st.db, target.id, me.id).await || has_ignored(&st.db, me.id, target.id).await {
+        return Json(serde_json::json!({ "status": "request_sent" })).into_response();
     }
     // Clear any expired pending invites first so they neither block a fresh
     // request nor count against the outstanding-request cap.
@@ -539,6 +668,9 @@ async fn api_social_request(
                 )
                 .await;
             notify_relationship(&st, me.id, target.id, "friend_accepted").await;
+            // ROADMAP 1.4: small XP reward for a new mutual friendship (both sides).
+            award_xp(&st.db, me.id, 10).await;
+            award_xp(&st.db, target.id, 10).await;
             store_notification(
                 &st,
                 target.id,
@@ -652,6 +784,8 @@ async fn api_social_respond(
             match n {
                 Ok(r) if r.affected_rows() > 0 => {
                     notify_relationship(&st, me.id, body.user_id, "friend_accepted").await;
+                    award_xp(&st.db, me.id, 10).await;
+                    award_xp(&st.db, body.user_id, 10).await;
                     store_notification(
                         &st,
                         body.user_id,
@@ -694,6 +828,14 @@ async fn api_social_respond(
             {
                 return server_error(e);
             }
+            // Persist the ignore so it survives re-requests (ROADMAP 1.1b): future
+            // requests/DMs from this user are silently dropped.
+            let _ = c
+                .exec_drop(
+                    "INSERT IGNORE INTO social_ignores (ignorer_id, ignored_id, created_at) VALUES (:me, :other, :t)",
+                    params! {"me" => me.id, "other" => body.user_id, "t" => now()},
+                )
+                .await;
             Json(serde_json::json!({ "status": "ignored" })).into_response()
         }
         _ => (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
@@ -754,21 +896,27 @@ async fn api_social_block(
 
 #[derive(Deserialize)]
 struct FriendPolicyBody {
+    // Both fields optional so a PUT may set either or both (ROADMAP 1.1b).
+    #[serde(default)]
     #[serde(rename = "friendPolicy")]
-    friend_policy: String,
+    friend_policy: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "dmPolicy")]
+    dm_policy: Option<String>,
 }
 
-// GET /api/social/privacy — the caller's friend-request privacy policy.
+// GET /api/social/privacy — the caller's friend-request + DM privacy policies.
 async fn api_social_privacy_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(me) = launcher_user(&st, &headers).await else {
         return unauthorized();
     };
     let policy = friend_policy_of(&st.db, me.id).await;
-    Json(serde_json::json!({ "friendPolicy": policy })).into_response()
+    let dm = dm_policy_of(&st.db, me.id).await;
+    Json(serde_json::json!({ "friendPolicy": policy, "dmPolicy": dm })).into_response()
 }
 
-// PUT /api/social/privacy — set the friend-request policy. Accepts only the three
-// known values; anything else is rejected so the column stays well-formed.
+// PUT /api/social/privacy — set friend-request and/or DM policy. Each field is
+// optional; a missing field is left untouched. Unknown enum values are rejected.
 async fn api_social_privacy_put(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -777,26 +925,387 @@ async fn api_social_privacy_put(
     let Some(me) = launcher_user(&st, &headers).await else {
         return unauthorized();
     };
-    let policy = body.friend_policy.trim();
-    if !matches!(policy, "everyone" | "mutual" | "nobody") {
-        return (StatusCode::BAD_REQUEST, "friendPolicy must be everyone, mutual, or nobody").into_response();
+    let friend_policy = body.friend_policy.as_deref().map(str::trim);
+    let dm_policy = body.dm_policy.as_deref().map(str::trim);
+    if let Some(p) = friend_policy {
+        if !matches!(p, "everyone" | "mutual" | "nobody") {
+            return (StatusCode::BAD_REQUEST, "friendPolicy must be everyone, mutual, or nobody").into_response();
+        }
+    }
+    if let Some(p) = dm_policy {
+        if !matches!(p, "everyone" | "friends" | "nobody") {
+            return (StatusCode::BAD_REQUEST, "dmPolicy must be everyone, friends, or nobody").into_response();
+        }
     }
     let mut c = match st.db.get_conn().await {
         Ok(c) => c,
         Err(e) => return server_error(e),
     };
-    if let Err(e) = c
+    // Ensure a row exists, then update only the supplied columns.
+    let _ = c
         .exec_drop(
-            r#"INSERT INTO social_friend_settings (user_id, friend_policy, updated_at)
-               VALUES (:id, :p, :t)
-               ON DUPLICATE KEY UPDATE friend_policy=:p, updated_at=:t"#,
-            params! {"id" => me.id, "p" => policy, "t" => now()},
+            r#"INSERT IGNORE INTO social_friend_settings (user_id, friend_policy, updated_at)
+               VALUES (:id, 'everyone', :t)"#,
+            params! {"id" => me.id, "t" => now()},
+        )
+        .await;
+    if let Some(p) = friend_policy {
+        if let Err(e) = c
+            .exec_drop(
+                "UPDATE social_friend_settings SET friend_policy=:p, updated_at=:t WHERE user_id=:id",
+                params! {"p" => p, "t" => now(), "id" => me.id},
+            )
+            .await
+        {
+            return server_error(e);
+        }
+    }
+    if let Some(p) = dm_policy {
+        if let Err(e) = c
+            .exec_drop(
+                "UPDATE social_friend_settings SET dm_policy=:p, updated_at=:t WHERE user_id=:id",
+                params! {"p" => p, "t" => now(), "id" => me.id},
+            )
+            .await
+        {
+            return server_error(e);
+        }
+    }
+    let fp = friend_policy_of(&st.db, me.id).await;
+    let dm = dm_policy_of(&st.db, me.id).await;
+    Json(serde_json::json!({ "friendPolicy": fp, "dmPolicy": dm })).into_response()
+}
+
+// GET /api/social/ignores — the list of account ids the caller is ignoring.
+async fn api_social_ignores_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let ids: Vec<u64> = match c
+        .exec(
+            "SELECT ignored_id FROM social_ignores WHERE ignorer_id=:id ORDER BY created_at DESC",
+            params! {"id" => me.id},
         )
         .await
     {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    Json(serde_json::json!({ "ignored": ids })).into_response()
+}
+
+#[derive(Deserialize)]
+struct IgnoreBody {
+    #[serde(rename = "userId")]
+    user_id: u64,
+    ignore: bool,
+}
+
+// POST /api/social/ignores — add/remove a persistent ignore on another account.
+async fn api_social_ignores_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<IgnoreBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    if body.user_id == 0 || body.user_id == me.id {
+        return (StatusCode::BAD_REQUEST, "invalid userId").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let res = if body.ignore {
+        c.exec_drop(
+            "INSERT IGNORE INTO social_ignores (ignorer_id, ignored_id, created_at) VALUES (:me, :o, :t)",
+            params! {"me" => me.id, "o" => body.user_id, "t" => now()},
+        )
+        .await
+    } else {
+        c.exec_drop(
+            "DELETE FROM social_ignores WHERE ignorer_id=:me AND ignored_id=:o",
+            params! {"me" => me.id, "o" => body.user_id},
+        )
+        .await
+    };
+    if let Err(e) = res {
         return server_error(e);
     }
-    Json(serde_json::json!({ "friendPolicy": policy })).into_response()
+    Json(serde_json::json!({ "status": if body.ignore { "ignored" } else { "unignored" } })).into_response()
+}
+
+// ----------------------------------------------------------------------------
+// REST: user profiles (ROADMAP 1.4)
+// ----------------------------------------------------------------------------
+
+// Level curve: level = floor(sqrt(xp / 100)). So 100 xp = L1, 400 = L2,
+// 900 = L3, 1600 = L4 … a gentle quadratic that keeps early levels quick.
+fn level_for_xp(xp: i64) -> i64 {
+    if xp <= 0 {
+        return 0;
+    }
+    ((xp as f64) / 100.0).sqrt().floor() as i64
+}
+
+// GET /api/social/profile/:id — public profile view for any account.
+async fn api_social_profile_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    if launcher_user(&st, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let user = match find_user_by_id(&st.db, id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No such user").into_response(),
+        Err(e) => return server_error(e),
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let row: Option<(Option<String>, Option<String>, i64)> = c
+        .exec_first(
+            "SELECT banner, bio, xp FROM social_profiles WHERE user_id=:id",
+            params! {"id" => id},
+        )
+        .await
+        .ok()
+        .flatten();
+    let (banner, bio, xp) = row.unwrap_or((None, None, 0));
+    let avatar_version = get_user_avatar_version(&st.db, id).await;
+    Json(serde_json::json!({
+        "userId": id,
+        "username": user.username,
+        "avatarVersion": avatar_version,
+        "banner": banner,
+        "bio": bio,
+        "level": level_for_xp(xp),
+        "xp": xp,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ProfilePutBody {
+    #[serde(default)]
+    banner: Option<String>,
+    #[serde(default)]
+    bio: Option<String>,
+}
+
+// PUT /api/social/profile — update the caller's own banner/bio (self only).
+async fn api_social_profile_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProfilePutBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let banner = body.banner.map(|s| s.chars().take(512).collect::<String>());
+    let bio = body.bio.map(|s| s.chars().take(1024).collect::<String>());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    // Ensure a row, then update only supplied columns so each can change alone.
+    let _ = c
+        .exec_drop(
+            "INSERT IGNORE INTO social_profiles (user_id, xp, updated_at) VALUES (:id, 0, :t)",
+            params! {"id" => me.id, "t" => now()},
+        )
+        .await;
+    if banner.is_some() {
+        let _ = c
+            .exec_drop(
+                "UPDATE social_profiles SET banner=:b, updated_at=:t WHERE user_id=:id",
+                params! {"b" => &banner, "t" => now(), "id" => me.id},
+            )
+            .await;
+    }
+    if bio.is_some() {
+        let _ = c
+            .exec_drop(
+                "UPDATE social_profiles SET bio=:b, updated_at=:t WHERE user_id=:id",
+                params! {"b" => &bio, "t" => now(), "id" => me.id},
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// Award XP to a user (ROADMAP 1.4, low-risk). Best-effort; creates the row if
+// absent. No-op on non-positive amounts.
+async fn award_xp(db: &Pool, user_id: u64, amount: i64) {
+    if amount <= 0 {
+        return;
+    }
+    let Ok(mut c) = db.get_conn().await else { return; };
+    let _ = c
+        .exec_drop(
+            r#"INSERT INTO social_profiles (user_id, xp, updated_at) VALUES (:id, :amt, :t)
+               ON DUPLICATE KEY UPDATE xp = xp + :amt, updated_at=:t"#,
+            params! {"id" => user_id, "amt" => amount, "t" => now()},
+        )
+        .await;
+}
+
+// ----------------------------------------------------------------------------
+// REST: friend organization (ROADMAP 1.5)
+// ----------------------------------------------------------------------------
+
+// GET /api/social/friendmeta — all the caller's friend-meta rows.
+async fn api_social_friendmeta_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(u64, Option<String>, Option<String>, i8)> = match c
+        .exec(
+            "SELECT friend_id, note, groups, pinned FROM social_friend_meta WHERE owner_id=:o",
+            params! {"o" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|(fid, note, groups, pinned)| {
+            serde_json::json!({
+                "userId": fid,
+                "note": note,
+                "groups": groups,
+                "pinned": pinned != 0,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "meta": items })).into_response()
+}
+
+#[derive(Deserialize)]
+struct FriendMetaBody {
+    #[serde(rename = "userId")]
+    user_id: u64,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    groups: Option<String>,
+    #[serde(default)]
+    pinned: Option<bool>,
+}
+
+// PUT /api/social/friendmeta — upsert note/groups/pinned for one friend. Each
+// field is optional and only supplied fields change.
+async fn api_social_friendmeta_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FriendMetaBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    if body.user_id == 0 || body.user_id == me.id {
+        return (StatusCode::BAD_REQUEST, "invalid userId").into_response();
+    }
+    let note = body.note.map(|s| s.chars().take(512).collect::<String>());
+    let groups = body.groups.map(|s| s.chars().take(255).collect::<String>());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let _ = c
+        .exec_drop(
+            "INSERT IGNORE INTO social_friend_meta (owner_id, friend_id, pinned) VALUES (:o, :f, 0)",
+            params! {"o" => me.id, "f" => body.user_id},
+        )
+        .await;
+    if note.is_some() {
+        let _ = c
+            .exec_drop(
+                "UPDATE social_friend_meta SET note=:n WHERE owner_id=:o AND friend_id=:f",
+                params! {"n" => &note, "o" => me.id, "f" => body.user_id},
+            )
+            .await;
+    }
+    if groups.is_some() {
+        let _ = c
+            .exec_drop(
+                "UPDATE social_friend_meta SET groups=:g WHERE owner_id=:o AND friend_id=:f",
+                params! {"g" => &groups, "o" => me.id, "f" => body.user_id},
+            )
+            .await;
+    }
+    if let Some(p) = body.pinned {
+        let _ = c
+            .exec_drop(
+                "UPDATE social_friend_meta SET pinned=:p WHERE owner_id=:o AND friend_id=:f",
+                params! {"p" => if p { 1 } else { 0 }, "o" => me.id, "f" => body.user_id},
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+// GET /api/social/search?q= — username search (LIKE, ≤20), excluding self and
+// anyone in a block relationship with the caller.
+async fn api_social_search(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let term = query.q.trim();
+    if term.is_empty() {
+        return Json(serde_json::json!({ "users": [] })).into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    // Escape LIKE wildcards in the user-supplied term, then wrap with %…%.
+    let escaped = term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let rows: Vec<(u64, String)> = match c
+        .exec(
+            r#"SELECT id, username FROM admin_users
+               WHERE enabled = TRUE AND id != :me AND username LIKE :pat
+               ORDER BY username LIMIT 20"#,
+            params! {"me" => me.id, "pat" => pattern},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let mut users = Vec::new();
+    for (id, username) in rows {
+        if is_blocked_either(&st.db, me.id, id).await {
+            continue;
+        }
+        users.push(serde_json::json!({ "userId": id, "username": username }));
+    }
+    Json(serde_json::json!({ "users": users })).into_response()
 }
 
 // Notify both parties of a relationship change so their friend lists refresh.
@@ -1117,9 +1626,10 @@ async fn api_social_history(
     };
     // `before>0` pages backwards (older than the cursor) for infinite scroll;
     // otherwise the default forward window (newer than `since`) is returned.
-    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>, Option<i64>, Option<i64>)> = match if q.before > 0 {
+    type HistRow = (u64, u64, u64, String, i64, Option<i64>, Option<i64>, Option<i64>, Option<u64>);
+    let rows: Vec<HistRow> = match if q.before > 0 {
         c.exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to
                FROM social_messages
                WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
                  AND id < :before
@@ -1129,7 +1639,7 @@ async fn api_social_history(
         .await
     } else {
         c.exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to
                FROM social_messages
                WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
                  AND id > :since
@@ -1141,6 +1651,9 @@ async fn api_social_history(
         Ok(r) => r,
         Err(e) => return server_error(e),
     };
+    // Per-message reactions for this page (ROADMAP 1.2b).
+    let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+    let react_map = reactions_for_messages(&st.db, &ids).await;
     // Mark inbound messages read up to now.
     let _ = c
         .exec_drop(
@@ -1151,7 +1664,7 @@ async fn api_social_history(
     let msgs: Vec<_> = rows
         .into_iter()
         .rev()
-        .map(|(id, sndr, rcvr, body, ts, read_at, edited_at, deleted_at)| {
+        .map(|(id, sndr, rcvr, body, ts, read_at, edited_at, deleted_at, reply_to)| {
             serde_json::json!({
                 "messageId": id,
                 "senderId": sndr,
@@ -1161,6 +1674,8 @@ async fn api_social_history(
                 "isRead": read_at.is_some(),
                 "editedAt": edited_at,
                 "deleted": deleted_at.is_some(),
+                "replyTo": reply_to,
+                "reactions": react_map.get(&id).cloned().unwrap_or_default(),
             })
         })
         .collect();
@@ -1228,7 +1743,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
         .map_or(0, |v| v.len())
         > 1;
     if !was_online {
-        set_presence(&st.db, uid, "online", None, None).await;
+        set_presence(&st.db, uid, "online", None, None, None).await;
         push_presence_diff(&st, uid).await;
     }
 
@@ -1292,7 +1807,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     if last {
         social_hub().drop_voice_for(uid);
         fanout_clear_online(uid); // remove from cross-instance registry
-        set_presence(&st.db, uid, "offline", None, None).await;
+        set_presence(&st.db, uid, "offline", None, None, None).await;
         push_presence_diff(&st, uid).await;
     }
 }
@@ -1325,6 +1840,25 @@ struct WsEnvelope {
     #[serde(default)]
     #[serde(rename = "msgId")]
     msg_id: u64,
+    // Reactions (1.2b): emoji + on/off toggle for a "react" frame.
+    #[serde(default)]
+    emoji: String,
+    #[serde(default)]
+    on: bool,
+    // Replies (1.2b): optional parent message id for a "chat" frame (0 = none).
+    #[serde(default)]
+    #[serde(rename = "replyTo")]
+    reply_to: u64,
+    // Offline-send idempotency (1.2b): client-generated dedup key for a "chat" frame.
+    #[serde(default)]
+    #[serde(rename = "clientNonce")]
+    client_nonce: String,
+    // Presence depth (1.6): optional custom status text + DND flag for "presence".
+    #[serde(default)]
+    #[serde(rename = "statusText")]
+    status_text: String,
+    #[serde(default)]
+    dnd: bool,
 }
 
 async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
@@ -1339,10 +1873,15 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
             fanout_refresh_online(uid);
         }
         "presence" => {
-            let state = match env.state.as_str() {
-                "online" | "away" | "busy" | "invisible" | "ingame" => env.state.as_str(),
+            // dnd is an alias for busy (ROADMAP 1.6). 'offline' is accepted so a
+            // client can explicitly go dark without disconnecting.
+            let mut state = match env.state.as_str() {
+                "online" | "away" | "busy" | "invisible" | "ingame" | "offline" => env.state.as_str(),
                 _ => "online",
             };
+            if env.dnd {
+                state = "busy";
+            }
             let (gid, gtitle) = if state == "ingame" {
                 (
                     (!env.game_id.is_empty()).then(|| env.game_id.as_str()),
@@ -1351,7 +1890,9 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
             } else {
                 (None, None)
             };
-            set_presence(&st.db, uid, state, gid, gtitle).await;
+            let status = (!env.status_text.is_empty())
+                .then(|| env.status_text.chars().take(128).collect::<String>());
+            set_presence(&st.db, uid, state, gid, gtitle, status.as_deref()).await;
             push_presence_diff(st, uid).await;
         }
         "typing" => {
@@ -1363,7 +1904,10 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
             }
         }
         "chat" => {
-            handle_ws_chat(st, uid, env.to, &env.text).await;
+            handle_ws_chat(st, uid, env.to, &env.text, env.reply_to, &env.client_nonce).await;
+        }
+        "react" => {
+            handle_ws_react(st, uid, env.msg_id, &env.emoji, env.on).await;
         }
         "resume" => {
             backfill_messages(st, uid, env.after_msg_id).await;
@@ -1410,7 +1954,14 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
     }
 }
 
-async fn handle_ws_chat(st: &AppState, uid: u64, to: u64, text: &str) {
+async fn handle_ws_chat(
+    st: &AppState,
+    uid: u64,
+    to: u64,
+    text: &str,
+    reply_to: u64,
+    client_nonce: &str,
+) {
     if to == 0 || text.is_empty() {
         return;
     }
@@ -1418,33 +1969,151 @@ async fn handle_ws_chat(st: &AppState, uid: u64, to: u64, text: &str) {
     if is_blocked_either(&st.db, uid, to).await {
         return;
     }
+    // DM privacy (ROADMAP 1.1b): honour the recipient's dm_policy, and drop if the
+    // recipient has persistently ignored the sender.
+    match dm_policy_of(&st.db, to).await.as_str() {
+        "nobody" => return,
+        "friends" => {
+            if !are_friends(&st.db, uid, to).await {
+                return;
+            }
+        }
+        _ => {}
+    }
+    if has_ignored(&st.db, to, uid).await {
+        return;
+    }
+    let nonce_opt = (!client_nonce.is_empty()).then(|| client_nonce.chars().take(40).collect::<String>());
+    let reply_opt: Option<u64> = (reply_to > 0).then_some(reply_to);
     let ts = now();
     let mut c = match st.db.get_conn().await {
         Ok(c) => c,
         Err(_) => return,
     };
-    let ins = c
-        .exec_iter(
-            "INSERT INTO social_messages (sender_id, receiver_id, body, created_at) VALUES (:s, :r, :b, :t)",
-            params! {"s" => uid, "r" => to, "b" => &trimmed, "t" => ts},
-        )
-        .await;
-    let msg_id = match ins {
-        Ok(r) => r.last_insert_id().unwrap_or(0),
-        Err(_) => return,
+    // Offline-send idempotency (ROADMAP 1.2b): if this sender already stored a row
+    // with this client_nonce, skip the insert and re-broadcast the existing row so
+    // the client can reconcile its optimistic message instead of duplicating it.
+    let (msg_id, ts, reply_final): (u64, i64, Option<u64>) = if let Some(ref n) = nonce_opt {
+        let existing: Option<(u64, i64, Option<u64>)> = c
+            .exec_first(
+                "SELECT id, created_at, reply_to FROM social_messages WHERE sender_id=:s AND client_nonce=:n LIMIT 1",
+                params! {"s" => uid, "n" => n},
+            )
+            .await
+            .ok()
+            .flatten();
+        if let Some((id, ets, rt)) = existing {
+            (id, ets, rt)
+        } else {
+            let ins = c
+                .exec_iter(
+                    "INSERT INTO social_messages (sender_id, receiver_id, body, created_at, reply_to, client_nonce) VALUES (:s, :r, :b, :t, :rt, :n)",
+                    params! {"s" => uid, "r" => to, "b" => &trimmed, "t" => ts, "rt" => reply_opt, "n" => n},
+                )
+                .await;
+            match ins {
+                Ok(r) => (r.last_insert_id().unwrap_or(0), ts, reply_opt),
+                Err(_) => return,
+            }
+        }
+    } else {
+        let ins = c
+            .exec_iter(
+                "INSERT INTO social_messages (sender_id, receiver_id, body, created_at, reply_to) VALUES (:s, :r, :b, :t, :rt)",
+                params! {"s" => uid, "r" => to, "b" => &trimmed, "t" => ts, "rt" => reply_opt},
+            )
+            .await;
+        match ins {
+            Ok(r) => (r.last_insert_id().unwrap_or(0), ts, reply_opt),
+            Err(_) => return,
+        }
     };
-    let evt = serde_json::json!({
+    let mut evt = serde_json::json!({
         "type": "chat",
         "messageId": msg_id,
         "senderId": uid,
         "receiverId": to,
         "text": trimmed,
         "timestamp": ts,
-    })
-    .to_string();
+        "replyTo": reply_final,
+    });
+    if let Some(ref n) = nonce_opt {
+        evt["clientNonce"] = serde_json::Value::String(n.clone());
+    }
+    let evt = evt.to_string();
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.
     social_hub().push(to, &evt);
     social_hub().push(uid, &evt);
+}
+
+// Toggle a reaction on a message (ROADMAP 1.2b). Only the sender or receiver of
+// the message may react; the reaction event is broadcast to both parties.
+async fn handle_ws_react(st: &AppState, uid: u64, msg_id: u64, emoji: &str, on: bool) {
+    if msg_id == 0 || emoji.is_empty() {
+        return;
+    }
+    let emoji: String = emoji.chars().take(32).collect();
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let parties: Option<(u64, u64)> = c
+        .exec_first(
+            "SELECT sender_id, receiver_id FROM social_messages WHERE id=:id",
+            params! {"id" => msg_id},
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some((sender, receiver)) = parties else { return; };
+    if uid != sender && uid != receiver {
+        return;
+    }
+    if on {
+        let _ = c
+            .exec_drop(
+                "INSERT IGNORE INTO social_message_reactions (message_id, user_id, emoji, created_at) VALUES (:m, :u, :e, :t)",
+                params! {"m" => msg_id, "u" => uid, "e" => &emoji, "t" => now()},
+            )
+            .await;
+    } else {
+        let _ = c
+            .exec_drop(
+                "DELETE FROM social_message_reactions WHERE message_id=:m AND user_id=:u AND emoji=:e",
+                params! {"m" => msg_id, "u" => uid, "e" => &emoji},
+            )
+            .await;
+    }
+    let evt = serde_json::json!({
+        "type": "reaction",
+        "messageId": msg_id,
+        "userId": uid,
+        "emoji": emoji,
+        "on": on,
+    })
+    .to_string();
+    social_hub().push(sender, &evt);
+    social_hub().push(receiver, &evt);
+}
+
+// Build message_id -> [{emoji,userId}] for a page of messages (ROADMAP 1.2b).
+async fn reactions_for_messages(
+    db: &Pool,
+    ids: &[u64],
+) -> std::collections::HashMap<u64, Vec<serde_json::Value>> {
+    let mut map: std::collections::HashMap<u64, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return map;
+    }
+    let Ok(mut c) = db.get_conn().await else { return map; };
+    let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT message_id, user_id, emoji FROM social_message_reactions WHERE message_id IN ({list})"
+    );
+    let rows: Vec<(u64, u64, String)> = c.query(sql).await.unwrap_or_default();
+    for (mid, uid, emoji) in rows {
+        map.entry(mid)
+            .or_default()
+            .push(serde_json::json!({ "emoji": emoji, "userId": uid }));
+    }
+    map
 }
 
 // Mark all messages `peer`→`me` as read and notify the peer with a read receipt
