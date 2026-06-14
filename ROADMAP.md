@@ -105,9 +105,10 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
     row and `is_blocked_either` rejects future requests with 403.
   - [ ] (later 1.1b) DM privacy policy (who-can-DM), per-sender ignore/mute that
     survives re-requests, client UI for the privacy setting + ignore button.
-- [~] **1.2 DM upgrades** (S) — _Server slice 1.2a DONE (builds clean); additive/
-  patch-level, no client change required (new WS frames + JSON fields ignored by
-  old clients)._
+- [~] **1.2 DM upgrades** (S) — _Server slice 1.2a DEPLOYED LIVE (v1.2.18,
+  2026-06-14); additive/patch-level, no client change required (new WS frames +
+  JSON fields ignored by old clients). Routes verified 401-gated; schema ALTERs
+  applied clean on boot._
   - [x] **Read receipts** — WS `{"type":"read","to":peer}` marks peer→me read and
     pushes `{"type":"read","readerId","upToId"}` back to the sender.
   - [x] **Edit** — WS `{"type":"edit","msgId","text"}` (sender-only, non-deleted);
