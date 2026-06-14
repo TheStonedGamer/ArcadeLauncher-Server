@@ -126,6 +126,14 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
     let _ = c
         .query_drop("ALTER TABLE social_friendships ADD COLUMN expires_at BIGINT NULL")
         .await;
+    // DM edit/delete history (ROADMAP 1.2). Best-effort ADD COLUMN for existing
+    // installs; NULL means "never edited" / "not deleted".
+    let _ = c
+        .query_drop("ALTER TABLE social_messages ADD COLUMN edited_at BIGINT NULL")
+        .await;
+    let _ = c
+        .query_drop("ALTER TABLE social_messages ADD COLUMN deleted_at BIGINT NULL")
+        .await;
     Ok(())
 }
 
@@ -1084,6 +1092,10 @@ struct HistoryQuery {
     since: u64,
     #[serde(default = "default_limit")]
     limit: u64,
+    // Pagination cursor for infinite history (1.2): when >0, return the page of
+    // messages with id < before (older than the cursor) instead of id > since.
+    #[serde(default)]
+    before: u64,
 }
 fn default_limit() -> u64 {
     100
@@ -1103,9 +1115,21 @@ async fn api_social_history(
         Ok(c) => c,
         Err(e) => return server_error(e),
     };
-    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>)> = match c
-        .exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at
+    // `before>0` pages backwards (older than the cursor) for infinite scroll;
+    // otherwise the default forward window (newer than `since`) is returned.
+    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>, Option<i64>, Option<i64>)> = match if q.before > 0 {
+        c.exec(
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at
+               FROM social_messages
+               WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
+                 AND id < :before
+               ORDER BY id DESC LIMIT :lim"#,
+            params! {"me" => me.id, "other" => other, "before" => q.before, "lim" => limit},
+        )
+        .await
+    } else {
+        c.exec(
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at
                FROM social_messages
                WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
                  AND id > :since
@@ -1113,7 +1137,7 @@ async fn api_social_history(
             params! {"me" => me.id, "other" => other, "since" => q.since, "lim" => limit},
         )
         .await
-    {
+    } {
         Ok(r) => r,
         Err(e) => return server_error(e),
     };
@@ -1127,7 +1151,7 @@ async fn api_social_history(
     let msgs: Vec<_> = rows
         .into_iter()
         .rev()
-        .map(|(id, sndr, rcvr, body, ts, read_at)| {
+        .map(|(id, sndr, rcvr, body, ts, read_at, edited_at, deleted_at)| {
             serde_json::json!({
                 "messageId": id,
                 "senderId": sndr,
@@ -1135,6 +1159,8 @@ async fn api_social_history(
                 "text": body,
                 "timestamp": ts,
                 "isRead": read_at.is_some(),
+                "editedAt": edited_at,
+                "deleted": deleted_at.is_some(),
             })
         })
         .collect();
@@ -1295,6 +1321,10 @@ struct WsEnvelope {
     #[serde(default)]
     #[serde(rename = "afterMsgId")]
     after_msg_id: u64,
+    // DM edit/delete (1.2): the target message id the sender wants to mutate.
+    #[serde(default)]
+    #[serde(rename = "msgId")]
+    msg_id: u64,
 }
 
 async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
@@ -1337,6 +1367,17 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
         }
         "resume" => {
             backfill_messages(st, uid, env.after_msg_id).await;
+        }
+        "read" => {
+            // Mark every inbound message from env.to as read and tell that peer
+            // (the original sender) so their UI can show a read receipt.
+            mark_conversation_read(st, uid, env.to).await;
+        }
+        "edit" => {
+            handle_ws_edit(st, uid, env.msg_id, &env.text).await;
+        }
+        "delete" => {
+            handle_ws_delete(st, uid, env.msg_id).await;
         }
         "voice_signal" => {
             // Opaque relay for call invite/accept/end signaling frames. We also
@@ -1404,6 +1445,105 @@ async fn handle_ws_chat(st: &AppState, uid: u64, to: u64, text: &str) {
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.
     social_hub().push(to, &evt);
     social_hub().push(uid, &evt);
+}
+
+// Mark all messages `peer`→`me` as read and notify the peer with a read receipt
+// carrying the highest message id now read, so their client can flag the thread.
+async fn mark_conversation_read(st: &AppState, me: u64, peer: u64) {
+    if peer == 0 {
+        return;
+    }
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let up_to: Option<u64> = c
+        .exec_first(
+            "SELECT MAX(id) FROM social_messages WHERE receiver_id=:me AND sender_id=:peer",
+            params! {"me" => me, "peer" => peer},
+        )
+        .await
+        .ok()
+        .flatten();
+    let _ = c
+        .exec_drop(
+            "UPDATE social_messages SET read_at=:t WHERE receiver_id=:me AND sender_id=:peer AND read_at IS NULL",
+            params! {"t" => now(), "me" => me, "peer" => peer},
+        )
+        .await;
+    social_hub().push(
+        peer,
+        &serde_json::json!({
+            "type": "read",
+            "readerId": me,
+            "upToId": up_to.unwrap_or(0),
+        })
+        .to_string(),
+    );
+}
+
+// Edit a message: only the original sender may edit, and only if it isn't already
+// deleted. Broadcasts a chat_edit to both parties so every client converges.
+async fn handle_ws_edit(st: &AppState, uid: u64, msg_id: u64, text: &str) {
+    if msg_id == 0 || text.is_empty() {
+        return;
+    }
+    let trimmed: String = text.chars().take(4000).collect();
+    let ts = now();
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let row: Option<(u64, u64)> = c
+        .exec_first(
+            "SELECT sender_id, receiver_id FROM social_messages WHERE id=:id AND sender_id=:uid AND deleted_at IS NULL",
+            params! {"id" => msg_id, "uid" => uid},
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some((sender, receiver)) = row else { return; };
+    let _ = c
+        .exec_drop(
+            "UPDATE social_messages SET body=:b, edited_at=:t WHERE id=:id",
+            params! {"b" => &trimmed, "t" => ts, "id" => msg_id},
+        )
+        .await;
+    let evt = serde_json::json!({
+        "type": "chat_edit",
+        "messageId": msg_id,
+        "text": trimmed,
+        "editedAt": ts,
+    })
+    .to_string();
+    social_hub().push(receiver, &evt);
+    social_hub().push(sender, &evt);
+}
+
+// Delete a message: only the sender may delete. The row is tombstoned
+// (deleted_at set, body blanked) and a chat_delete is broadcast to both parties.
+async fn handle_ws_delete(st: &AppState, uid: u64, msg_id: u64) {
+    if msg_id == 0 {
+        return;
+    }
+    let ts = now();
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let row: Option<(u64, u64)> = c
+        .exec_first(
+            "SELECT sender_id, receiver_id FROM social_messages WHERE id=:id AND sender_id=:uid AND deleted_at IS NULL",
+            params! {"id" => msg_id, "uid" => uid},
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some((sender, receiver)) = row else { return; };
+    let _ = c
+        .exec_drop(
+            "UPDATE social_messages SET body='', deleted_at=:t WHERE id=:id",
+            params! {"t" => ts, "id" => msg_id},
+        )
+        .await;
+    let evt = serde_json::json!({
+        "type": "chat_delete",
+        "messageId": msg_id,
+    })
+    .to_string();
+    social_hub().push(receiver, &evt);
+    social_hub().push(sender, &evt);
 }
 
 // Resume backfill: send every message involving `uid` newer than `after_id` in a

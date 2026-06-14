@@ -105,8 +105,19 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
     row and `is_blocked_either` rejects future requests with 403.
   - [ ] (later 1.1b) DM privacy policy (who-can-DM), per-sender ignore/mute that
     survives re-requests, client UI for the privacy setting + ignore button.
-- [ ] **1.2 DM upgrades** — read receipts, reactions, replies, edit/delete,
-  pagination/infinite history, offline send queue, client SQLite cache.
+- [~] **1.2 DM upgrades** (S) — _Server slice 1.2a DONE (builds clean); additive/
+  patch-level, no client change required (new WS frames + JSON fields ignored by
+  old clients)._
+  - [x] **Read receipts** — WS `{"type":"read","to":peer}` marks peer→me read and
+    pushes `{"type":"read","readerId","upToId"}` back to the sender.
+  - [x] **Edit** — WS `{"type":"edit","msgId","text"}` (sender-only, non-deleted);
+    `edited_at` column; broadcasts `chat_edit` to both.
+  - [x] **Delete** — WS `{"type":"delete","msgId"}` (sender-only); tombstones the
+    row (`deleted_at`, body blanked); broadcasts `chat_delete`.
+  - [x] **Pagination / infinite history** — `GET /api/social/messages/:id?before=N`
+    pages backwards (id<N); history now also returns `editedAt`/`deleted`.
+  - [ ] (later 1.2b) reactions, replies/threads, offline send queue, client SQLite
+    cache, and the client UI to drive edit/delete/read/scrollback.
 - [ ] **1.3 DM attachments + screenshots** — MinIO object storage, presigned PUT.
 - [ ] **1.4 User profiles** — avatar (done) + banner, bio, level/XP, profile view.
 - [ ] **1.5 Friend organization** — groups/categories, pinning, friend notes
