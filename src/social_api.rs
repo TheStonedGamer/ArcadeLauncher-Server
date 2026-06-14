@@ -160,15 +160,24 @@ impl SocialHub {
         self.conns.lock().unwrap().get(&user_id).map_or(false, |v| !v.is_empty())
     }
 
-    // Non-blocking push to every live socket for `user_id`. Dead senders are
-    // dropped lazily by the receive loop's unregister; try_send never blocks.
-    fn push(&self, user_id: u64, msg: &str) {
+    // Deliver to every live socket for `user_id` *on this instance only*. Used by
+    // both the public `push` (after local delivery it also fans out) and the Redis
+    // subscriber (which must not re-publish). Non-blocking; dead senders are
+    // dropped lazily by the receive loop's unregister.
+    fn deliver_local(&self, user_id: u64, msg: &str) {
         let g = self.conns.lock().unwrap();
         if let Some(v) = g.get(&user_id) {
             for c in v {
                 let _ = c.tx.send(OutMsg::Text(msg.to_string()));
             }
         }
+    }
+
+    // Non-blocking push to every live socket for `user_id`: local delivery now,
+    // plus a Redis fan-out to peer instances (no-op when Redis is disabled).
+    fn push(&self, user_id: u64, msg: &str) {
+        self.deliver_local(user_id, msg);
+        fanout_publish(user_id, msg);
     }
 
     // Non-blocking binary push (voice audio) to every live socket for `user_id`.
@@ -328,7 +337,7 @@ async fn broadcast_to_friends(db: &Pool, user_id: u64, json: &str) {
 }
 
 async fn push_presence_diff(st: &AppState, user_id: u64) {
-    let online = social_hub().is_online(user_id);
+    let online = presence_online(user_id).await;
     let (state, gid, gtitle) = presence_of(&st.db, user_id, online).await;
     let evt = serde_json::json!({
         "type": "presence",
@@ -378,7 +387,7 @@ async fn api_social_friends(State(st): State<AppState>, headers: HeaderMap) -> R
             "pending" => "request_received",
             _ => "none",
         };
-        let online = social_hub().is_online(other);
+        let online = presence_online(other).await;
         let (pstate, gid, gtitle) = presence_of(&st.db, other, online).await;
         out.push(serde_json::json!({
             "accountId": other,
@@ -929,6 +938,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutMsg>();
     let conn_id = social_hub().register(uid, tx.clone());
+    fanout_set_online(uid); // cross-instance online registry (no-op without Redis)
 
     // First frame tells the client its own account id so it can align sent vs
     // received messages and ignore self-presence echoes.
@@ -1011,6 +1021,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
     let last = social_hub().unregister(uid, conn_id);
     if last {
         social_hub().drop_voice_for(uid);
+        fanout_clear_online(uid); // remove from cross-instance registry
         set_presence(&st.db, uid, "offline", None, None).await;
         push_presence_diff(&st, uid).await;
     }
@@ -1048,7 +1059,10 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
     };
     match env.kind.as_str() {
         "ping" => {
-            social_hub().push(uid, &serde_json::json!({ "type": "pong" }).to_string());
+            // Pong only needs to reach this instance's socket — deliver locally
+            // (no fan-out) and refresh the cross-instance online TTL.
+            social_hub().deliver_local(uid, &serde_json::json!({ "type": "pong" }).to_string());
+            fanout_refresh_online(uid);
         }
         "presence" => {
             let state = match env.state.as_str() {

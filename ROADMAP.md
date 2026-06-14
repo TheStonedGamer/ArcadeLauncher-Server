@@ -53,9 +53,16 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   silently (dedup by id, replaces pending echoes, bumps unread, no toast).
   Backward-compatible (unknown frames ignored both ways) but new client wants the
   new server's resume support → **deploy server with/before the client release.**
-- [ ] **0.4 Redis presence + pub/sub fan-out** (S, infra) — move presence and
-  cross-user routing off the in-process `social_hub` map so the server can run
-  >1 instance. Keep `social_hub` as the local socket registry.
+- [x] **0.4 Redis presence + pub/sub fan-out** (S, infra) — _Code DONE; ships
+  DORMANT (no `ARCADE_REDIS_URL` set yet). To go multi-instance: stand up a Redis
+  container, set the env var, run >1 instance behind nginx._ New `src/fanout.rs`:
+  optional Redis bus. Text `push` = local `deliver_local` + publish on
+  `social:fanout`; each instance's subscriber delivers peer-origin frames locally
+  (deduped by per-process instance id, so no double-delivery). Cross-instance
+  online registry via `social:online:<uid>` keys (TTL refreshed on heartbeat);
+  `presence_online()` checks local hub then Redis. `social_hub` stays the local
+  socket registry. Binary voice audio stays local-only (cross-instance voice
+  deferred to 2.1–2.3). Backward-compatible / patch-level; no client change.
 - [ ] **0.5 Server-synced preferences** (S, C) — move `social_prefs.json`
   (favorites, nicknames, notif toggles) into a `user_prefs` table; client caches.
 - [ ] **0.6 Account hardening** (S, C) — _from social.md Milestone 1._ Refresh

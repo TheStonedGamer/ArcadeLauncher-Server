@@ -64,6 +64,7 @@ include!("scan.rs");
 include!("admin_html.rs");
 include!("discord.rs");
 include!("users_api.rs");
+include!("fanout.rs");
 include!("social_api.rs");
 
 #[tokio::main]
@@ -77,6 +78,12 @@ async fn main() -> Result<()> {
     let db = Pool::new(cfg.database_url(true).as_str());
     ensure_schema(&db).await?;
     ensure_bootstrap_admin(&db, &cfg).await?;
+
+    // Optional cross-instance fan-out (ROADMAP 0.4). No-op when ARCADE_REDIS_URL
+    // is unset — the gateway then runs single-instance as before.
+    if let Some(url) = cfg.redis_url.clone() {
+        init_fanout(&url).await;
+    }
 
     let state = AppState {
         cfg: cfg.clone(),

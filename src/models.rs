@@ -101,6 +101,10 @@ struct Config {
     db_name: String,
     db_user: String,
     db_password: String,
+    // Optional Redis URL (e.g. redis://10.0.0.x:6379). When set, the social
+    // gateway fans real-time events out across instances via pub/sub and tracks a
+    // cross-instance online registry. Unset ⇒ single-instance in-process behavior.
+    redis_url: Option<String>,
 }
 
 impl Config {
@@ -154,6 +158,10 @@ impl Config {
             db_name: env_string("ARCADE_DB_NAME", "arcadelauncher"),
             db_user: env_string("ARCADE_DB_USER", "arcade"),
             db_password: env_string("ARCADE_DB_PASSWORD", ""),
+            redis_url: {
+                let u = env_string("ARCADE_REDIS_URL", "");
+                if u.is_empty() { None } else { Some(u) }
+            },
         })
     }
 
