@@ -64,13 +64,16 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   `presence_online()` checks local hub then Redis. `social_hub` stays the local
   socket registry. Binary voice audio stays local-only (cross-instance voice
   deferred to 2.1–2.3). Backward-compatible / patch-level; no client change.
-- [x] **0.5 Server-synced preferences** (S, C) — _DONE (both build clean)._
+- [x] **0.5 Server-synced preferences** (S, C) — _DEPLOYED LIVE (v1.2.14,
+  2026-06-14); client pushed (auto-update). Endpoints verified 401-gated; tables
+  created clean on boot._
   `social_user_prefs` table (one opaque JSON blob/user, last-write-wins) +
   `GET`/`POST /api/social/prefs`. Client mirrors `social_prefs.json` to the server
   on every save (`PushPrefsToServer`) and adopts the server copy on connect
   (`PullPrefsFromServer`, server authoritative) while keeping the local file as an
   offline cache. Additive/patch-level.
-- [~] **0.6 Account hardening** (S, C) — _Partial DONE (server slice builds clean)._
+- [~] **0.6 Account hardening** (S, C) — _Server slice DEPLOYED LIVE (v1.2.14);
+  throttle verified (5×401 → 429 w/ "try again in 300s")._
   - [x] `auth_audit` table + `audit()` helper wired into login success/fail,
     challenge login, logout, password change, TOTP enable/disable.
   - [x] Login brute-force throttle now enforced on launcher login (password +
