@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/challenge", get(api_auth_challenge))
         .route("/api/auth/verify", post(api_auth_verify))
         .route("/api/account", get(api_account))
+        .route("/api/account/security", get(api_account_security))
         .route("/api/account/password", post(api_account_password))
         .route("/api/account/totp/setup", post(api_account_totp_setup))
         .route("/api/account/totp/enable", post(api_account_totp_enable))
@@ -127,6 +128,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/social/notifications/read",
             post(api_social_notifications_read),
+        )
+        .route(
+            "/api/social/prefs",
+            get(api_social_prefs_get).post(api_social_prefs_put),
         )
         .route("/ws/social", get(ws_social))
         .route("/art/:id", get(download_art))

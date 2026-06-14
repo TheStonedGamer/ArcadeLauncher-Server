@@ -145,6 +145,7 @@ async fn api_auth_logout(State(st): State<AppState>, headers: HeaderMap) -> Resp
             )
             .await;
     }
+    audit(&st.db, Some(user.id), Some(&user.username), "logout", client_ip(&headers).as_deref(), None).await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 

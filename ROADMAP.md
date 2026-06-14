@@ -64,13 +64,22 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   `presence_online()` checks local hub then Redis. `social_hub` stays the local
   socket registry. Binary voice audio stays local-only (cross-instance voice
   deferred to 2.1–2.3). Backward-compatible / patch-level; no client change.
-- [ ] **0.5 Server-synced preferences** (S, C) — move `social_prefs.json`
-  (favorites, nicknames, notif toggles) into a `user_prefs` table; client caches.
-- [ ] **0.6 Account hardening** (S, C) — _from social.md Milestone 1._ Refresh
-  tokens + rotation, device/session management, login history, force-logout,
-  brute-force protection + login rate limiting, `audit_log` table, email
-  verification + passwordless/remember-me scaffolding. Pure server-first; client
-  adds a "sessions & security" panel after.
+- [x] **0.5 Server-synced preferences** (S, C) — _DONE (both build clean)._
+  `social_user_prefs` table (one opaque JSON blob/user, last-write-wins) +
+  `GET`/`POST /api/social/prefs`. Client mirrors `social_prefs.json` to the server
+  on every save (`PushPrefsToServer`) and adopts the server copy on connect
+  (`PullPrefsFromServer`, server authoritative) while keeping the local file as an
+  offline cache. Additive/patch-level.
+- [~] **0.6 Account hardening** (S, C) — _Partial DONE (server slice builds clean)._
+  - [x] `auth_audit` table + `audit()` helper wired into login success/fail,
+    challenge login, logout, password change, TOTP enable/disable.
+  - [x] Login brute-force throttle now enforced on launcher login (password +
+    challenge paths), returning 429 with retry-after; previously only admin login
+    used it.
+  - [x] `GET /api/account/security` — recent security events for the account.
+  - [ ] (later 0.6b) refresh tokens + rotation, multi-device sessions (needs the
+    one-token-per-user model reworked), email verification, passwordless/remember-me.
+  - [ ] (later) client "sessions & security" panel consuming `/account/security`.
 
 ## Phase 1 — Social parity (Steam/Discord/Battle.net)
 

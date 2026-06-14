@@ -96,6 +96,18 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Server-synced social preferences (favorites, nicknames, notif toggles) so
+    // personalization follows the user across devices instead of living only in
+    // the client's social_prefs.json. One opaque JSON blob per user (the client
+    // owns the shape); last write wins.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_user_prefs (
+          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+          prefs MEDIUMTEXT NOT NULL,
+          updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -824,6 +836,77 @@ async fn api_social_notifications_read(
         )
         .await
     };
+    if let Err(e) = res {
+        return server_error(e);
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// ----------------------------------------------------------------------------
+// REST: server-synced social preferences (ROADMAP 0.5)
+// ----------------------------------------------------------------------------
+
+// GET the stored prefs blob for the caller (an empty object if none yet).
+async fn api_social_prefs_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let row: Option<(String, i64)> = match c
+        .exec_first(
+            "SELECT prefs, updated_at FROM social_user_prefs WHERE user_id=:u",
+            params! {"u" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let (prefs, updated_at) = match row {
+        Some((p, t)) => (
+            serde_json::from_str::<serde_json::Value>(&p)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            t,
+        ),
+        None => (serde_json::json!({}), 0),
+    };
+    Json(serde_json::json!({ "prefs": prefs, "updatedAt": updated_at })).into_response()
+}
+
+// PUT/POST the prefs blob (opaque JSON; client owns the shape). Last write wins.
+async fn api_social_prefs_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    // Accept either the bare prefs object or an envelope { "prefs": {...} }.
+    let prefs = match body.get("prefs") {
+        Some(p) => p.clone(),
+        None => body,
+    };
+    let serialized = prefs.to_string();
+    // Guard against an absurd payload (prefs are small key/value maps).
+    if serialized.len() > 256 * 1024 {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "prefs too large").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let res = c
+        .exec_drop(
+            r#"INSERT INTO social_user_prefs (user_id, prefs, updated_at)
+               VALUES (:u, :p, :t)
+               ON DUPLICATE KEY UPDATE prefs=:p, updated_at=:t"#,
+            params! {"u" => me.id, "p" => &serialized, "t" => now()},
+        )
+        .await;
     if let Err(e) = res {
         return server_error(e);
     }

@@ -75,6 +75,24 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Security audit trail (ROADMAP 0.6): login success/failure, logout, password
+    // and 2FA changes. Drives the account "recent activity" view and gives an
+    // after-the-fact record of account access. user_id is nullable because a
+    // failed login may not resolve to a known account.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS auth_audit (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NULL,
+          username VARCHAR(160) NULL,
+          event VARCHAR(40) NOT NULL,
+          ip VARCHAR(64) NULL,
+          detail VARCHAR(255) NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_audit_user (user_id, id),
+          INDEX idx_audit_event (event, id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS games (
           id VARCHAR(96) NOT NULL PRIMARY KEY,

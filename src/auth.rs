@@ -9,19 +9,71 @@ async fn api_health(State(_): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok": true, "schemaVersion": 1, "version": SERVER_VERSION.trim(), "backend": "rust"}))
 }
 
-async fn api_login(State(st): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+// Best-effort client IP from proxy headers (nginx sets X-Forwarded-For). Falls
+// back to X-Real-IP. Returns None for direct/unknown connections.
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+}
+
+// Append a security audit row (ROADMAP 0.6). Best-effort: a logging failure must
+// never block the auth flow itself.
+async fn audit(
+    db: &Pool,
+    user_id: Option<u64>,
+    username: Option<&str>,
+    event: &str,
+    ip: Option<&str>,
+    detail: Option<&str>,
+) {
+    let Ok(mut c) = db.get_conn().await else {
+        return;
+    };
+    let _ = c
+        .exec_drop(
+            "INSERT INTO auth_audit (user_id, username, event, ip, detail, created_at) VALUES (:u,:n,:e,:i,:d,:t)",
+            params! {"u" => user_id, "n" => username, "e" => event, "i" => ip, "d" => detail, "t" => now()},
+        )
+        .await;
+}
+
+async fn api_login(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<LoginForm>) -> Response {
+    let ip = client_ip(&headers);
+    let key = form.username.trim().to_lowercase();
+    if let Some(secs) = st.login_locked(&key) {
+        audit(&st.db, None, Some(&form.username), "login_locked", ip.as_deref(),
+              Some(&format!("{secs}s remaining"))).await;
+        return (StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": format!("too many attempts; try again in {secs}s")}))).into_response();
+    }
     match find_user(&st.db, &form.username).await {
         Ok(Some(user)) if verify_password_any(&form.password, &user.password_hash)
             && verify_user_totp(&user, &form.totp_code) => {
+            st.clear_login_failures(&key);
             match issue_user_token(&st.db, user.id, &user.username).await {
                 Ok(token) => {
+                    audit(&st.db, Some(user.id), Some(&user.username), "login", ip.as_deref(), Some("password")).await;
                     let must_change = user_must_change_password(&st.db, user.id).await;
                     Json(serde_json::json!({"token": token, "username": user.username, "isAdmin": user.is_admin, "mustChangePassword": must_change})).into_response()
                 }
                 Err(e) => server_error(e),
             }
         }
-        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid username, password, or 2FA code"}))).into_response(),
+        _ => {
+            st.record_login_failure(&key);
+            audit(&st.db, None, Some(&form.username), "login_failed", ip.as_deref(), None).await;
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid username, password, or 2FA code"}))).into_response()
+        }
     }
 }
 
@@ -86,8 +138,15 @@ async fn api_auth_challenge(State(st): State<AppState>, Query(q): Query<Challeng
     Json(serde_json::json!({"nonce": nonce})).into_response()
 }
 
-async fn api_auth_verify(State(st): State<AppState>, Form(form): Form<VerifyForm>) -> Response {
+async fn api_auth_verify(State(st): State<AppState>, headers: HeaderMap, Form(form): Form<VerifyForm>) -> Response {
     let username = form.username.trim().to_lowercase();
+    let ip = client_ip(&headers);
+    if let Some(secs) = st.login_locked(&username) {
+        audit(&st.db, None, Some(&form.username), "login_locked", ip.as_deref(),
+              Some(&format!("{secs}s remaining"))).await;
+        return (StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": format!("too many attempts; try again in {secs}s")}))).into_response();
+    }
     // Pop the nonce (single use).
     let nonce = match st.challenges.lock() {
         Ok(mut map) => match map.remove(&username) {
@@ -109,12 +168,16 @@ async fn api_auth_verify(State(st): State<AppState>, Form(form): Form<VerifyForm
     };
     let expected = hex::encode(hmac_sha256(&key_bytes, nonce.as_bytes()));
     if !constant_eq(expected.as_bytes(), form.proof.trim().as_bytes()) || !verify_user_totp(&user, &form.totp_code) {
+        st.record_login_failure(&username);
+        audit(&st.db, Some(user.id), Some(&user.username), "login_failed", ip.as_deref(), Some("challenge")).await;
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials or 2FA code"}))).into_response();
     }
+    st.clear_login_failures(&username);
     let token = match issue_user_token(&st.db, user.id, &user.username).await {
         Ok(t) => t,
         Err(e) => return server_error(e),
     };
+    audit(&st.db, Some(user.id), Some(&user.username), "login", ip.as_deref(), Some("challenge")).await;
     // Encrypt the token so it never travels in cleartext: HMAC-CTR keyed by the
     // password-derived secret, with a fresh random IV per response.
     let mut iv = [0u8; 16];
@@ -264,6 +327,7 @@ async fn api_account_password(State(st): State<AppState>, headers: HeaderMap, Fo
     ).await {
         return server_error(e);
     }
+    audit(&st.db, Some(user.id), Some(&user.username), "password_change", client_ip(&headers).as_deref(), None).await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -324,6 +388,7 @@ async fn api_account_totp_enable(State(st): State<AppState>, headers: HeaderMap,
     ).await {
         return server_error(e);
     }
+    audit(&st.db, Some(user.id), Some(&user.username), "totp_enabled", client_ip(&headers).as_deref(), None).await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -341,7 +406,44 @@ async fn api_account_totp_disable(State(st): State<AppState>, headers: HeaderMap
     if let Err(e) = disable_user_totp(&st.db, user.id).await {
         return server_error(e);
     }
+    audit(&st.db, Some(user.id), Some(&user.username), "totp_disabled", client_ip(&headers).as_deref(), None).await;
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+// GET /api/account/security — recent security events for the signed-in account
+// (ROADMAP 0.6). Powers an account "recent activity / where am I logged in" view.
+async fn api_account_security(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(u64, String, Option<String>, Option<String>, i64)> = match c
+        .exec(
+            r#"SELECT id, event, ip, detail, created_at FROM auth_audit
+               WHERE user_id=:u ORDER BY id DESC LIMIT 100"#,
+            params! {"u" => user.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(|(id, event, ip, detail, ts)| {
+            serde_json::json!({
+                "id": id,
+                "event": event,
+                "ip": ip,
+                "detail": detail,
+                "timestamp": ts,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "events": events })).into_response()
 }
 
 async fn user_auth_key(db: &Pool, user_id: u64) -> Result<Option<String>> {
