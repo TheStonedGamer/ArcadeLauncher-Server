@@ -43,8 +43,8 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   REST `GET` on start/reconnect, dedup by `serverId`, unread badge, mark-read on
   open now also `POST`s `/notifications/read{upToId}`, deep-link to friend/DM via
   `actorId`. Patch-level (additive); needs a client release to ship.
-- [x] **0.3 Resume / message backfill** (S, C) — _DONE (both repos build clean;
-  pending coordinated push+deploy)._ Implemented pragmatically on the existing
+- [x] **0.3 Resume / message backfill** (S, C) — _Server DONE + DEPLOYED LIVE
+  (v1.2.10, 2026-06-14); client pushed (auto-update)._ Implemented pragmatically on the existing
   monotonic `social_messages.id` rather than a separate `event_seq` log (simpler,
   sufficient): client tracks the highest message id seen (`m_lastMsgId`), sends
   `{"type":"resume","afterMsgId":N}` on reconnect; server's `backfill_messages`
