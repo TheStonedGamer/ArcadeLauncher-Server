@@ -43,9 +43,16 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
   REST `GET` on start/reconnect, dedup by `serverId`, unread badge, mark-read on
   open now also `POST`s `/notifications/read{upToId}`, deep-link to friend/DM via
   `actorId`. Patch-level (additive); needs a client release to ship.
-- [ ] **0.3 Event sequencing + resume** (S, C) — per-user monotonic `event_seq`;
-  client sends `resume{last_seq}`; server backfills exactly what was missed
-  (replaces "re-pull everything" on reconnect).
+- [x] **0.3 Resume / message backfill** (S, C) — _DONE (both repos build clean;
+  pending coordinated push+deploy)._ Implemented pragmatically on the existing
+  monotonic `social_messages.id` rather than a separate `event_seq` log (simpler,
+  sufficient): client tracks the highest message id seen (`m_lastMsgId`), sends
+  `{"type":"resume","afterMsgId":N}` on reconnect; server's `backfill_messages`
+  replies with one `{"type":"chat_backfill","messages":[…]}` batch (≤500, id>N)
+  instead of the client re-pulling every conversation's full history. Client merges
+  silently (dedup by id, replaces pending echoes, bumps unread, no toast).
+  Backward-compatible (unknown frames ignored both ways) but new client wants the
+  new server's resume support → **deploy server with/before the client release.**
 - [ ] **0.4 Redis presence + pub/sub fan-out** (S, infra) — move presence and
   cross-user routing off the in-process `social_hub` map so the server can run
   >1 instance. Keep `social_hub` as the local socket registry.

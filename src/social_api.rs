@@ -1034,6 +1034,12 @@ struct WsEnvelope {
     game_title: String,
     #[serde(default)]
     payload: serde_json::Value,
+    // Resume: highest social_messages.id the client already has. The server
+    // backfills only messages newer than this, instead of the client re-pulling
+    // every conversation's full history on reconnect.
+    #[serde(default)]
+    #[serde(rename = "afterMsgId")]
+    after_msg_id: u64,
 }
 
 async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
@@ -1070,6 +1076,9 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
         }
         "chat" => {
             handle_ws_chat(st, uid, env.to, &env.text).await;
+        }
+        "resume" => {
+            backfill_messages(st, uid, env.after_msg_id).await;
         }
         "voice_signal" => {
             // Opaque relay for call invite/accept/end signaling frames. We also
@@ -1137,6 +1146,47 @@ async fn handle_ws_chat(st: &AppState, uid: u64, to: u64, text: &str) {
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.
     social_hub().push(to, &evt);
     social_hub().push(uid, &evt);
+}
+
+// Resume backfill: send every message involving `uid` newer than `after_id` in a
+// single `chat_backfill` batch. Replaces the reconnecting client's per-conversation
+// full re-pull — only the genuinely missed tail crosses the wire. Capped so a very
+// stale client falls back gracefully (it can still REST-pull a conversation).
+async fn backfill_messages(st: &AppState, uid: u64, after_id: u64) {
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>)> = match c
+        .exec(
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at
+               FROM social_messages
+               WHERE (sender_id=:u OR receiver_id=:u) AND id > :since
+               ORDER BY id ASC LIMIT 500"#,
+            params! {"u" => uid, "since" => after_id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let msgs: Vec<_> = rows
+        .into_iter()
+        .map(|(id, sndr, rcvr, body, ts, read_at)| {
+            serde_json::json!({
+                "messageId": id,
+                "senderId": sndr,
+                "receiverId": rcvr,
+                "text": body,
+                "timestamp": ts,
+                "isRead": read_at.is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    social_hub().push(
+        uid,
+        &serde_json::json!({ "type": "chat_backfill", "messages": msgs }).to_string(),
+    );
 }
 
 // Relay a binary voice frame from `uid` to its call peer. Wire format from the
