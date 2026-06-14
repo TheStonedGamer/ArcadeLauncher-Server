@@ -86,8 +86,24 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
 
 ## Phase 1 — Social parity (Steam/Discord/Battle.net)
 
-- [ ] **1.1 Friend-request state machine** — ignore, cancel vs decline, expiry,
-  rate limiting, privacy controls (who-can-friend/DM), block auto-decline.
+- [~] **1.1 Friend-request state machine** (S) — _Server slice DONE (builds clean);
+  additive/patch-level, no client change needed._
+  - [x] `ignore` action — silently drops an incoming pending request (deletes the
+    row, sends **no** `friend_removed`, so the requester isn't told).
+  - [x] cancel vs decline vs remove already distinct verbs; `ignore` adds the
+    silent variant. decline/cancel/remove still notify both parties.
+  - [x] Pending-request **expiry** — `expires_at` column (30-day TTL on new
+    requests); `sweep_expired_requests()` cleans expired pending rows on the
+    request/list paths (no dedicated sweeper task).
+  - [x] **Rate limiting** — cap of 50 outstanding outgoing pending requests per
+    account (`FRIEND_REQUEST_MAX_OUTGOING`), returns 429.
+  - [x] **Privacy control (who-can-friend)** — `social_friend_settings.friend_policy`
+    = everyone (default) | mutual (shared accepted friend required) | nobody;
+    enforced in `api_social_request`; `GET`/`PUT /api/social/privacy`.
+  - [x] **Block auto-decline** — already in place: blocking deletes the friendship
+    row and `is_blocked_either` rejects future requests with 403.
+  - [ ] (later 1.1b) DM privacy policy (who-can-DM), per-sender ignore/mute that
+    survives re-requests, client UI for the privacy setting + ignore button.
 - [ ] **1.2 DM upgrades** — read receipts, reactions, replies, edit/delete,
   pagination/infinite history, offline send queue, client SQLite cache.
 - [ ] **1.3 DM attachments + screenshots** — MinIO object storage, presigned PUT.

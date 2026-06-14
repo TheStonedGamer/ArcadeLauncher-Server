@@ -123,6 +123,10 @@ async fn main() -> Result<()> {
         .route("/api/social/friends/request", post(api_social_request))
         .route("/api/social/friends/respond", post(api_social_respond))
         .route("/api/social/friends/block", post(api_social_block))
+        .route(
+            "/api/social/privacy",
+            get(api_social_privacy_get).put(api_social_privacy_put),
+        )
         .route("/api/social/messages/:id", get(api_social_history))
         .route("/api/social/notifications", get(api_social_notifications))
         .route(

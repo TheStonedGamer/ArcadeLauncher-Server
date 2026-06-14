@@ -108,7 +108,67 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Per-user friend-request privacy (ROADMAP 1.1). friend_policy controls who
+    // may send an incoming friend request: 'everyone' (default) | 'mutual' (only
+    // people who share at least one accepted friend) | 'nobody'. One row per user;
+    // absence means the default 'everyone'.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_friend_settings (
+          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+          friend_policy VARCHAR(16) NOT NULL DEFAULT 'everyone',
+          updated_at BIGINT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Pending friend requests carry an expiry stamp so stale invites self-clean
+    // (ROADMAP 1.1). Best-effort ADD COLUMN for pre-existing installs; NULL means
+    // "never expires" (legacy rows / accepted friendships).
+    let _ = c
+        .query_drop("ALTER TABLE social_friendships ADD COLUMN expires_at BIGINT NULL")
+        .await;
     Ok(())
+}
+
+// ROADMAP 1.1 tunables. A pending friend request lives 30 days before it is
+// swept. A single user may have at most FRIEND_REQUEST_MAX_OUTGOING requests
+// they initiated outstanding (pending) at once, which doubles as spam control.
+const FRIEND_REQUEST_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const FRIEND_REQUEST_MAX_OUTGOING: u64 = 50;
+
+// Delete any pending friendship rows whose expiry has passed. Best-effort; called
+// opportunistically from the request/list paths so expired invites disappear
+// without a dedicated sweeper task.
+async fn sweep_expired_requests(db: &Pool) {
+    let Ok(mut c) = db.get_conn().await else { return; };
+    let _ = c
+        .exec_drop(
+            "DELETE FROM social_friendships WHERE status='pending' AND expires_at IS NOT NULL AND expires_at < :t",
+            params! {"t" => now()},
+        )
+        .await;
+}
+
+// The caller's friend-request privacy policy (defaults to 'everyone').
+async fn friend_policy_of(db: &Pool, user_id: u64) -> String {
+    let Ok(mut c) = db.get_conn().await else { return "everyone".into(); };
+    c.exec_first(
+        "SELECT friend_policy FROM social_friend_settings WHERE user_id=:id",
+        params! {"id" => user_id},
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "everyone".to_string())
+}
+
+// True if a and b share at least one accepted friend (for the 'mutual' policy).
+async fn shares_mutual_friend(db: &Pool, a: u64, b: u64) -> bool {
+    let af = friend_ids(db, a).await;
+    if af.is_empty() {
+        return false;
+    }
+    let bf = friend_ids(db, b).await;
+    bf.iter().any(|id| af.contains(id))
 }
 
 // ----------------------------------------------------------------------------
@@ -370,6 +430,7 @@ async fn api_social_friends(State(st): State<AppState>, headers: HeaderMap) -> R
     let Some(me) = launcher_user(&st, &headers).await else {
         return unauthorized();
     };
+    sweep_expired_requests(&st.db).await;
     let mut conn = match st.db.get_conn().await {
         Ok(c) => c,
         Err(e) => return server_error(e),
@@ -437,6 +498,13 @@ async fn api_social_request(
     if is_blocked_either(&st.db, me.id, target.id).await {
         return (StatusCode::FORBIDDEN, "Blocked").into_response();
     }
+    // Clear any expired pending invites first so they neither block a fresh
+    // request nor count against the outstanding-request cap.
+    sweep_expired_requests(&st.db).await;
+    // Privacy: honour the target's friend-request policy. 'mutual' requires a
+    // shared accepted friend; 'nobody' rejects outright. A request that would be
+    // an instant accept (they already invited me) bypasses the policy below.
+    let policy = friend_policy_of(&st.db, target.id).await;
     let (lo, hi) = pair(me.id, target.id);
     let mut c = match st.db.get_conn().await {
         Ok(c) => c,
@@ -480,11 +548,42 @@ async fn api_social_request(
         }
         None => {}
     }
+    // No existing relationship → this is a genuinely new outgoing request, so the
+    // target's privacy policy applies.
+    match policy.as_str() {
+        "nobody" => {
+            return (StatusCode::FORBIDDEN, "This user is not accepting friend requests").into_response();
+        }
+        "mutual" => {
+            if !shares_mutual_friend(&st.db, me.id, target.id).await {
+                return (StatusCode::FORBIDDEN, "This user only accepts requests from people they share a friend with").into_response();
+            }
+        }
+        _ => {}
+    }
+    // Spam control: cap how many outgoing pending requests one account may have.
+    let outstanding: u64 = c
+        .exec_first(
+            "SELECT COUNT(*) FROM social_friendships WHERE status='pending' AND requested_by=:me",
+            params! {"me" => me.id},
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if outstanding >= FRIEND_REQUEST_MAX_OUTGOING {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pending friend requests; wait for some to be answered",
+        )
+            .into_response();
+    }
+    let expires = now() + FRIEND_REQUEST_TTL_SECS;
     if let Err(e) = c
         .exec_drop(
-            r#"INSERT INTO social_friendships (user_lo, user_hi, status, requested_by, created_at, updated_at)
-               VALUES (:lo, :hi, 'pending', :rb, :t, :t)"#,
-            params! {"lo" => lo, "hi" => hi, "rb" => me.id, "t" => now()},
+            r#"INSERT INTO social_friendships (user_lo, user_hi, status, requested_by, created_at, updated_at, expires_at)
+               VALUES (:lo, :hi, 'pending', :rb, :t, :t, :exp)"#,
+            params! {"lo" => lo, "hi" => hi, "rb" => me.id, "t" => now(), "exp" => expires},
         )
         .await
     {
@@ -518,7 +617,7 @@ async fn api_social_request(
 struct FriendActionBody {
     #[serde(rename = "userId")]
     user_id: u64,
-    action: String, // accept | decline | cancel | remove
+    action: String, // accept | decline | cancel | remove | ignore
 }
 
 async fn api_social_respond(
@@ -574,6 +673,21 @@ async fn api_social_respond(
             notify_relationship(&st, me.id, body.user_id, "friend_removed").await;
             Json(serde_json::json!({ "status": "removed" })).into_response()
         }
+        // Silently drop an incoming request: delete the pending row but send no
+        // friend_removed event, so the requester is not told they were rebuffed.
+        // Only affects a request the other party sent to me.
+        "ignore" => {
+            if let Err(e) = c
+                .exec_drop(
+                    "DELETE FROM social_friendships WHERE user_lo=:lo AND user_hi=:hi AND status='pending' AND requested_by=:other",
+                    params! {"lo" => lo, "hi" => hi, "other" => body.user_id},
+                )
+                .await
+            {
+                return server_error(e);
+            }
+            Json(serde_json::json!({ "status": "ignored" })).into_response()
+        }
         _ => (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
     }
 }
@@ -628,6 +742,53 @@ async fn api_social_block(
         }
         Json(serde_json::json!({ "status": "unblocked" })).into_response()
     }
+}
+
+#[derive(Deserialize)]
+struct FriendPolicyBody {
+    #[serde(rename = "friendPolicy")]
+    friend_policy: String,
+}
+
+// GET /api/social/privacy — the caller's friend-request privacy policy.
+async fn api_social_privacy_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let policy = friend_policy_of(&st.db, me.id).await;
+    Json(serde_json::json!({ "friendPolicy": policy })).into_response()
+}
+
+// PUT /api/social/privacy — set the friend-request policy. Accepts only the three
+// known values; anything else is rejected so the column stays well-formed.
+async fn api_social_privacy_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FriendPolicyBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let policy = body.friend_policy.trim();
+    if !matches!(policy, "everyone" | "mutual" | "nobody") {
+        return (StatusCode::BAD_REQUEST, "friendPolicy must be everyone, mutual, or nobody").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            r#"INSERT INTO social_friend_settings (user_id, friend_policy, updated_at)
+               VALUES (:id, :p, :t)
+               ON DUPLICATE KEY UPDATE friend_policy=:p, updated_at=:t"#,
+            params! {"id" => me.id, "p" => policy, "t" => now()},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    Json(serde_json::json!({ "friendPolicy": policy })).into_response()
 }
 
 // Notify both parties of a relationship change so their friend lists refresh.
