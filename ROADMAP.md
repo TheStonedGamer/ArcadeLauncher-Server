@@ -86,8 +86,9 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
 
 ## Phase 1 — Social parity (Steam/Discord/Battle.net)
 
-- [~] **1.1 Friend-request state machine** (S) — _Server slice DONE (builds clean);
-  additive/patch-level, no client change needed._
+- [~] **1.1 Friend-request state machine** (S) — _Server slice DEPLOYED LIVE
+  (v1.2.16, 2026-06-14); additive/patch-level, no client change needed.
+  `GET /api/social/privacy` verified 401-gated; schema created clean on boot._
   - [x] `ignore` action — silently drops an incoming pending request (deletes the
     row, sends **no** `friend_removed`, so the requester isn't told).
   - [x] cancel vs decline vs remove already distinct verbs; `ignore` adds the
