@@ -68,10 +68,16 @@ unconditionally:
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection "upgrade";
 ```
-This is the documented keep-alive / 401-501 gotcha — the app has **no WebSockets**. Removed both lines
-(timestamped `.bak` saved beside the config), `nginx -t` passed (the duplicate-server-name warnings are
-pre-existing/benign), `systemctl reload nginx`, verified GET `/api/catalog` and POST `/api/auth/verify`
-respond in ~0.1s through the proxy. If these headers reappear, that's the regression to remove again.
+This is the documented keep-alive / 401-501 gotcha — the app had **no WebSockets** *at that time*. Removed
+both lines from the global scope (timestamped `.bak` saved beside the config), `nginx -t` passed (the
+duplicate-server-name warnings are pre-existing/benign), `systemctl reload nginx`, verified GET
+`/api/catalog` and POST `/api/auth/verify` respond in ~0.1s through the proxy.
+
+> **Update (2026-06-13):** the app **now uses WebSockets** — the `/ws/social` gateway. The site config
+> has since gained a dedicated `location /ws/` block that re-adds `Upgrade`/`Connection "upgrade"` +
+> `proxy_http_version 1.1` + 3600s timeouts, scoped to `/ws/` only. The regression to watch for is now the
+> *opposite*: don't let those upgrade headers leak back into the **global** scope or `location /` (that
+> breaks downloads); keep them inside `/ws/`.
 
 Config notes worth knowing: `client_max_body_size 153600m`, `proxy_buffering off`,
 `proxy_request_buffering off`, `proxy_read_timeout/send_timeout 3600s`, `proxy_http_version 1.1`.

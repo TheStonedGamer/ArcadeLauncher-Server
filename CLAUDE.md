@@ -22,6 +22,10 @@ exactly as when it was one file. To find code, open the file by topic:
 - `igdb.rs` — IGDB auth/search/match/enrich
 - `scan.rs` — catalog scanners, `game_entry`, `sync_catalog_db`, validation
 - `admin_html.rs` — admin/metadata HTML builders + `CSS`
+- `social_api.rs` — social subsystem: friends/requests/block REST, DM history, and
+  the `/ws/social` WebSocket gateway (presence diffs, chat delivery, typing, voice
+  relay). `ws_social` authenticates the `?token=` query param (or `Authorization:
+  Bearer`) **before** `ws.on_upgrade`; `social_socket` runs the in/out pump.
 
 When editing, prefer the relevant file; only edits to the `use` block, shared
 consts, `main`, or tests touch `main.rs`. The compiled binary is identical to the
@@ -76,12 +80,24 @@ former single-file build.
   the folder name is the game name. `igdb_platform_ids`: GameCube→[21], Wii→[5].
 - `download_file` / `download_chunk` return **404** (not 500) with an
   admin-facing "rescan" message when the backing file is missing on disk.
+- **Social gateway** (`/ws/social`, `social_api.rs`): a persistent WebSocket per
+  signed-in client. The outbound pump emits a WS **control Ping every 25s**; the
+  inbound loop also answers an application `{"type":"ping"}` with a data-frame
+  `{"type":"pong"}`. The data-frame pong is load-bearing — the WinHTTP client can't
+  see the control Ping, so without the app ping/pong an idle client would time out
+  and reconnect-loop. Don't remove the `"ping"` handler.
 
-## nginx gotcha (resolved)
-- The proxy originally set `Upgrade: $http_upgrade` / `Connection: "upgrade"`
-  unconditionally on all requests with no WebSocket map. This broke keep-alive on
-  long multi-file download sequences (HTTP 401/501). The app has no WebSockets;
-  fix was removing those two headers from the site config and reloading nginx.
+## nginx (WebSocket-aware — do not strip Upgrade globally)
+- History: the proxy once set `Upgrade: $http_upgrade` / `Connection: "upgrade"`
+  **unconditionally on all requests**, which broke keep-alive on long multi-file
+  download sequences (HTTP 401/501). At that time the app had no WebSockets, so the
+  fix was to remove those headers.
+- **Now the app DOES use WebSockets** (the `/ws/social` gateway). The current site
+  config scopes the upgrade headers to a dedicated `location /ws/` block
+  (`proxy_http_version 1.1`, `Upgrade $http_upgrade`, `Connection "upgrade"`,
+  `proxy_read_timeout/proxy_send_timeout 3600s`) while `location /` stays plain.
+  **Never** move the upgrade headers back to a global scope — keep them inside
+  `/ws/` so downloads and the gateway both work.
 
 ## Conventions
 - Rescans run automatically on an interval (see Auto-rescan above) and can also
