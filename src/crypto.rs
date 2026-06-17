@@ -145,6 +145,21 @@ fn verify_user_totp(user: &User, code: &str) -> bool {
     false
 }
 
+// Mint a coturn "static-auth-secret" (TURN REST API) credential pair for a user.
+// Returns (username, credential) where username = "<expiry_epoch>:<user_id>" and
+// credential = base64(HMAC-SHA1(secret, username)). coturn, configured with the
+// same `static-auth-secret`, recomputes and validates this without any shared
+// per-user state. `expiry` is an absolute unix timestamp (now + ttl).
+fn turn_credentials(secret: &str, user_id: u64, expiry: i64) -> (String, String) {
+    type HmacSha1 = Hmac<Sha1>;
+    let username = format!("{expiry}:{user_id}");
+    // new_from_slice never fails for HMAC (any key length is valid).
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(username.as_bytes());
+    let credential = STANDARD.encode(mac.finalize().into_bytes());
+    (username, credential)
+}
+
 fn totp_code(secret_b32: &str, step: u64) -> Result<String> {
     type HmacSha1 = Hmac<Sha1>;
     let key = base32_decode(secret_b32)?;

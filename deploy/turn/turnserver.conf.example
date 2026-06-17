@@ -1,0 +1,47 @@
+# coturn config for ArcadeLauncher voice (ROADMAP T9g). Copy to turnserver.conf
+# and fill in the CHANGE-ME values. The app server mints time-limited credentials
+# (HMAC-SHA1 of "<expiry>:<userId>") against `static-auth-secret`, so coturn needs
+# no per-user accounts.
+
+# Listen for STUN/TURN on the standard ports.
+listening-port=3478
+tls-listening-port=5349
+
+# Relay port range coturn allocates for media. Keep it small and forward it.
+min-port=49160
+max-port=49200
+
+# REST-API / time-limited credential mode. The secret MUST equal the app server's
+# ARCADE_TURN_SECRET. (One freshly generated 256-bit secret is in deploy/turn/
+# README.md — set the SAME value in both places.)
+use-auth-secret
+static-auth-secret=CHANGE-ME-MUST-MATCH-ARCADE_TURN_SECRET
+
+# Realm — your domain (any stable string the client/server agree on indirectly).
+realm=turn.orlandoaio.net
+
+# The address remote clients use to reach this relay. Set to the PUBLIC IP when
+# off-LAN callers must connect; use the LAN IP (10.0.0.180) for LAN-only voice.
+external-ip=CHANGE-ME-PUBLIC-OR-LAN-IP
+
+# Optional TLS (turns:5349). Provide a cert for turn.<domain> to traverse strict
+# firewalls; comment out if not using TLS.
+# cert=/etc/coturn/certs/fullchain.pem
+# pkey=/etc/coturn/certs/privkey.pem
+
+# Hardening: this server only relays for our app; lock it down.
+no-cli
+no-multicast-peers
+# Block relaying to private/link-local ranges so the TURN server can't be abused
+# to reach internal services.
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+# (If LAN-only voice is intended, REMOVE the 10.0.0.0/192.168.0.0 denials above —
+# otherwise on-LAN relay candidates are blocked.)
+
+# Modest per-session cap to discourage abuse.
+user-quota=12
+total-quota=1200

@@ -1497,6 +1497,38 @@ async fn api_social_search(
     Json(serde_json::json!({ "users": users })).into_response()
 }
 
+// GET /api/social/turn — ICE servers for a WebRTC voice call (ROADMAP T9g). When
+// TURN is configured, mints short-lived (coturn REST API) credentials scoped to
+// the caller and returns them alongside any STUN URLs; otherwise returns a public
+// STUN fallback so peers on friendly NATs can still connect. Bearer-authed so
+// credentials aren't handed to anonymous callers.
+async fn api_social_turn(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    if let Some(turn) = &st.cfg.turn {
+        let expiry = now() + turn.ttl;
+        let (username, credential) = turn_credentials(&turn.secret, me.id, expiry);
+        let mut servers: Vec<serde_json::Value> = turn
+            .stun_urls
+            .iter()
+            .map(|u| serde_json::json!({ "urls": u }))
+            .collect();
+        servers.push(serde_json::json!({
+            "urls": turn.urls,
+            "username": username,
+            "credential": credential,
+        }));
+        return Json(serde_json::json!({ "iceServers": servers, "ttl": turn.ttl })).into_response();
+    }
+    // No TURN configured → public STUN only so P2P still works on open NATs.
+    Json(serde_json::json!({
+        "iceServers": [{ "urls": "stun:stun.l.google.com:19302" }],
+        "ttl": 0,
+    }))
+    .into_response()
+}
+
 // Notify both parties of a relationship change so their friend lists refresh.
 async fn notify_relationship(st: &AppState, a: u64, b: u64, kind: &str) {
     let evt = serde_json::json!({ "type": kind, "userId": a }).to_string();

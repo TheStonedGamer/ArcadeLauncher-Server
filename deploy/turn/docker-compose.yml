@@ -1,0 +1,30 @@
+# coturn TURN/STUN server for ArcadeLauncher WebRTC voice (ROADMAP T9g).
+#
+# Deploy target: the Docker host at 10.0.0.180 (recommended) — a single
+# well-behaved container. coturn needs HOST networking so its relay port range
+# is reachable without per-port Docker NAT mapping (RTP relays pick a random
+# port in min-port..max-port).
+#
+# Setup:
+#   1. Copy turnserver.conf into ./turnserver.conf next to this file.
+#   2. Edit turnserver.conf: set `static-auth-secret` (== ARCADE_TURN_SECRET on
+#      the app server), `realm`, and `external-ip` (the host's PUBLIC IP, or the
+#      LAN IP if calls stay on-LAN).
+#   3. Forward UDP/TCP 3478, TCP 5349, and UDP 49160-49200 from the router to
+#      10.0.0.180 if remote (off-LAN) callers must connect.
+#   4. `docker compose up -d` and check `docker logs arcade-coturn`.
+#
+# TLS (turns:5349) is optional; point cert/pkey at a Let's Encrypt cert for
+# turn.<domain> if you want TURN-over-TLS to punch through restrictive firewalls.
+
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: arcade-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # Optional TLS material for turns:5349 (uncomment + provide certs):
+      # - ./certs:/etc/coturn/certs:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

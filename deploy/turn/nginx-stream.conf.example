@@ -1,0 +1,30 @@
+# OPTIONAL nginx stream proxy for TURN-over-TLS on 443 (ROADMAP T9g).
+#
+# Only needed if you want voice to traverse firewalls that block 3478/5349 but
+# allow 443. Most deployments DO NOT need this — STUN + TURN/5349 is enough.
+#
+# This is a `stream {}` context block (peer of `http {}` in nginx.conf), NOT a
+# `server {}` inside http. nginx must be built --with-stream. SNI-route the TURN
+# hostname to coturn so the existing HTTPS vhost on 443 is untouched.
+#
+# In /etc/nginx/nginx.conf, at the TOP LEVEL (not inside http {}):
+#
+# stream {
+#     map $ssl_preread_server_name $upstream {
+#         turn.orlandoaio.net   coturn_tls;
+#         default               https_web;     # everything else → normal web 443
+#     }
+#     upstream coturn_tls { server 10.0.0.180:5349; }
+#     upstream https_web  { server 127.0.0.1:8443; }   # your real HTTPS vhost
+#
+#     server {
+#         listen 443;
+#         ssl_preread on;             # read SNI without terminating TLS
+#         proxy_pass $upstream;
+#         proxy_timeout 3600s;
+#     }
+# }
+#
+# NOTE: ssl_preread means TLS is passed through (terminated by coturn / the web
+# vhost), so the web server must keep listening on its own port (8443 here).
+# Adjust ports to match this install before applying.

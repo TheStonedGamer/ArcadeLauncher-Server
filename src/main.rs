@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post, put},
     Form, Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE, Engine};
+use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE, Engine};
 use bytes::Bytes;
 use cookie::Cookie;
 use futures_util::{StreamExt, TryStreamExt};
@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
             get(api_social_friendmeta_get).put(api_social_friendmeta_put),
         )
         .route("/api/social/search", get(api_social_search))
+        .route("/api/social/turn", get(api_social_turn))
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))
         .route("/api/social/attachments/:id", get(api_social_attachment_get))
         .route("/api/social/messages/:id", get(api_social_history))
@@ -392,5 +393,17 @@ mod tests {
         assert_eq!(igdb_platform_ids("Wii"), &[5]);
         assert_eq!(igdb_platform_ids("Xbox360"), &[12]);
         assert!(igdb_platform_ids("Unknown").is_empty());
+    }
+
+    #[test]
+    fn turn_credentials_match_coturn_rest_format() {
+        // username = "<expiry>:<userId>"; credential = base64(HMAC-SHA1(secret, username)).
+        let (user, cred) = turn_credentials("s3cr3t", 42, 1_700_000_000);
+        assert_eq!(user, "1700000000:42");
+        // Stable, recomputable value (verified against an independent HMAC-SHA1).
+        assert_eq!(cred, "4m+gopKcl0HXw6KRLkDWn63gfQE=");
+        // Same inputs are deterministic; a different expiry changes the credential.
+        assert_eq!(turn_credentials("s3cr3t", 42, 1_700_000_000), (user, cred));
+        assert_ne!(turn_credentials("s3cr3t", 42, 1_700_000_001).1, "4m+gopKcl0HXw6KRLkDWn63gfQE=");
     }
 }

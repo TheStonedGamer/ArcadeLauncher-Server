@@ -109,6 +109,26 @@ struct Config {
     // when endpoint+bucket+access+secret are all set; otherwise attachment
     // endpoints return 503 and the feature is dormant (like Redis above).
     s3: Option<S3Config>,
+    // Optional TURN/STUN config for WebRTC voice (ROADMAP T9g). Some(...) only
+    // when the shared secret + at least one TURN URL are set; otherwise
+    // /api/social/turn returns STUN-only and voice falls back to STUN.
+    turn: Option<TurnConfig>,
+}
+
+// coturn "static-auth-secret" (TURN REST API) settings. The server mints
+// short-lived credentials per call: username = "<expiry>:<userId>", credential =
+// base64(HMAC-SHA1(secret, username)). The secret is shared with the coturn
+// process (its `static-auth-secret`) and never leaves the server.
+#[derive(Clone)]
+struct TurnConfig {
+    secret: String,
+    // Fully-formed ICE URLs, e.g. ["turn:turn.example.net:3478?transport=udp",
+    //  "turns:turn.example.net:5349?transport=tcp"].
+    urls: Vec<String>,
+    // Optional extra STUN-only URLs advertised alongside TURN.
+    stun_urls: Vec<String>,
+    // Credential lifetime in seconds.
+    ttl: i64,
 }
 
 // S3-compatible object store (MinIO) connection for DM attachments. Path-style
@@ -192,6 +212,30 @@ impl Config {
                         bucket,
                         access_key,
                         secret_key,
+                    })
+                }
+            },
+            turn: {
+                let secret = env_string("ARCADE_TURN_SECRET", "");
+                // Comma-separated TURN URLs (turn:/turns:) and optional STUN URLs.
+                let urls: Vec<String> = env_string("ARCADE_TURN_URLS", "")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let stun_urls: Vec<String> = env_string("ARCADE_STUN_URLS", "")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if secret.is_empty() || urls.is_empty() {
+                    None
+                } else {
+                    Some(TurnConfig {
+                        secret,
+                        urls,
+                        stun_urls,
+                        ttl: (env_u64("ARCADE_TURN_TTL", 3600) as i64).max(60),
                     })
                 }
             },
