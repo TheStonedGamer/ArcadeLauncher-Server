@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
         .route("/api/library/playtime", post(api_library_playtime))
         .route("/api/library/rating", post(api_library_rating))
         .route("/ws/social", get(ws_social))
+        .route("/api/emulators", get(api_emulators))
         .route("/art/:id", get(download_art))
         .route("/emulators/*rel", get(download_emulator))
         .route("/files/:id/*rel", get(download_file))

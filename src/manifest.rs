@@ -43,6 +43,73 @@ async fn download_emulator(
     }
 }
 
+// Emulator runtime catalog. Each top-level entry under `library_root/emulators/`
+// is one emulator (a directory of runtime files, or a single self-contained
+// file). The client downloads these via `/emulators/<id>/<rel>` and shows which
+// are present locally ("ready") in its settings. Additive + read-only — no
+// platform→emulator mapping is implied here; this only enumerates what the
+// server hosts so the client can pre-stage runtimes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmulatorFile {
+    rel: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmulatorEntry {
+    id: String,
+    name: String,
+    total_bytes: u64,
+    files: Vec<EmulatorFile>,
+}
+
+async fn api_emulators(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_api(&st, &headers).await {
+        return unauthorized();
+    }
+    let root = st.cfg.library_root.join("emulators");
+    let mut entries: Vec<EmulatorEntry> = Vec::new();
+    let mut rd = match fs::read_dir(&root).await {
+        Ok(rd) => rd,
+        // No emulators dir yet → empty list, not an error.
+        Err(_) => return Json(serde_json::json!({ "emulators": entries })).into_response(),
+    };
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => return server_error(e),
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        // An emulator is a directory of runtime files (exe + DLLs/assets). Loose
+        // top-level files aren't complete runtimes, so we skip them.
+        if !entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let paths = match walk_files(&path).await {
+            Ok(p) => p,
+            Err(e) => return server_error(e),
+        };
+        let mut files = Vec::new();
+        let mut total_bytes = 0u64;
+        for p in &paths {
+            let size = fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
+            let rel = p.strip_prefix(&path).unwrap_or(p).to_string_lossy().replace('\\', "/");
+            total_bytes += size;
+            files.push(EmulatorFile { rel, size });
+        }
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        entries.push(EmulatorEntry { id: name.clone(), name, total_bytes, files });
+    }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Json(serde_json::json!({ "emulators": entries })).into_response()
+}
+
 async fn authorized_api(st: &AppState, headers: &HeaderMap) -> bool {
     let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
         return false;
