@@ -44,11 +44,14 @@ async fn download_emulator(
 }
 
 // Emulator runtime catalog. Each top-level entry under `library_root/emulators/`
-// is one emulator (a directory of runtime files, or a single self-contained
-// file). The client downloads these via `/emulators/<id>/<rel>` and shows which
-// are present locally ("ready") in its settings. Additive + read-only — no
-// platform→emulator mapping is implied here; this only enumerates what the
-// server hosts so the client can pre-stage runtimes.
+// is one emulator runtime or firmware bundle. The layout is flat: most runtimes
+// are a single self-contained archive (`dolphin-x64.7z`, `rpcs3-win64.7z`, …),
+// firmware is one or more loose blobs (`PS3UPDAT.PUP`, `scph1001.bin`), and a
+// few bundles are a directory of files (`xemu-firmware/`). We surface ALL of
+// them so the client's Settings status area lists every emulator/firmware and
+// shows which are present locally ("ready"). `rel` is always relative to the
+// emulators root, so the client downloads each file from `/emulators/<rel>`.
+// Additive + read-only — no platform→emulator mapping is implied here.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EmulatorFile {
@@ -61,8 +64,54 @@ struct EmulatorFile {
 struct EmulatorEntry {
     id: String,
     name: String,
+    /// "emulator" or "firmware" — lets the client group/label them.
+    kind: String,
     total_bytes: u64,
     files: Vec<EmulatorFile>,
+}
+
+// Map a top-level emulators entry name to a friendly display name and kind.
+// Falls back to a title derived from the file name for anything unrecognized,
+// so newly-added runtimes still appear (just with a plainer label).
+fn emulator_meta(entry_name: &str) -> (String, &'static str) {
+    let lower = entry_name.to_lowercase();
+    let known: &[(&str, &str, &str)] = &[
+        ("dolphin", "Dolphin (GameCube / Wii)", "emulator"),
+        ("ryujinx", "Ryujinx (Switch)", "emulator"),
+        ("xenia", "Xenia (Xbox 360)", "emulator"),
+        ("xemu-win", "xemu (Xbox)", "emulator"),
+        ("rpcs3", "RPCS3 (PlayStation 3)", "emulator"),
+        ("pcsx2", "PCSX2 (PlayStation 2)", "emulator"),
+        ("duckstation", "DuckStation (PlayStation 1)", "emulator"),
+        ("gopher64", "gopher64 (Nintendo 64)", "emulator"),
+        ("mesen", "Mesen (NES / SNES)", "emulator"),
+        ("ps3updat", "PlayStation 3 firmware", "firmware"),
+        ("scph", "PlayStation 1 BIOS (SCPH1001)", "firmware"),
+        ("xemu-firmware", "Xbox firmware (xemu BIOS / HDD)", "firmware"),
+    ];
+    for (needle, name, kind) in known {
+        if lower.starts_with(needle) || lower.contains(needle) {
+            return ((*name).to_string(), kind);
+        }
+    }
+    // Unknown: derive a readable title from the file name (strip extension,
+    // turn separators into spaces). Classify common firmware extensions.
+    let stem = std::path::Path::new(entry_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(entry_name);
+    let title = stem.replace(['-', '_'], " ");
+    let kind = if lower.ends_with(".pup")
+        || lower.ends_with(".bin")
+        || lower.ends_with(".bios")
+        || lower.contains("firmware")
+        || lower.contains("bios")
+    {
+        "firmware"
+    } else {
+        "emulator"
+    };
+    (title, kind)
 }
 
 async fn api_emulators(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -83,30 +132,56 @@ async fn api_emulators(State(st): State<AppState>, headers: HeaderMap) -> Respon
             Err(e) => return server_error(e),
         };
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(entry_name) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
             continue;
         };
-        // An emulator is a directory of runtime files (exe + DLLs/assets). Loose
-        // top-level files aren't complete runtimes, so we skip them.
-        if !entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false) {
+        // Skip bookkeeping files that aren't runtimes/firmware themselves.
+        if entry_name.eq_ignore_ascii_case("SHA256SUMS")
+            || entry_name.starts_with('.')
+            || entry_name.ends_with(".part")
+        {
             continue;
         }
-        let paths = match walk_files(&path).await {
-            Ok(p) => p,
-            Err(e) => return server_error(e),
+        let is_dir = entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false);
+
+        // Collect this entry's files with `rel` relative to the emulators root.
+        // A directory expands to every file underneath it; a loose file is a
+        // single-file entry. Either way the client downloads `/emulators/<rel>`.
+        let file_paths = if is_dir {
+            match walk_files(&path).await {
+                Ok(p) => p,
+                Err(e) => return server_error(e),
+            }
+        } else {
+            vec![path.clone()]
         };
         let mut files = Vec::new();
         let mut total_bytes = 0u64;
-        for p in &paths {
+        for p in &file_paths {
             let size = fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
-            let rel = p.strip_prefix(&path).unwrap_or(p).to_string_lossy().replace('\\', "/");
+            let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy().replace('\\', "/");
             total_bytes += size;
             files.push(EmulatorFile { rel, size });
         }
+        if files.is_empty() {
+            continue;
+        }
         files.sort_by(|a, b| a.rel.cmp(&b.rel));
-        entries.push(EmulatorEntry { id: name.clone(), name, total_bytes, files });
+        let (name, kind) = emulator_meta(&entry_name);
+        entries.push(EmulatorEntry {
+            id: entry_name,
+            name,
+            kind: kind.to_string(),
+            total_bytes,
+            files,
+        });
     }
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Emulators first, then firmware, each alphabetized by display name.
+    entries.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     Json(serde_json::json!({ "emulators": entries })).into_response()
 }
 
