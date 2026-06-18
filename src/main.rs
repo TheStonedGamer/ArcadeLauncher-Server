@@ -44,6 +44,7 @@ const IGDB_CLIENT_ID_KEY: &str = "igdb.client_id";
 const IGDB_CLIENT_SECRET_KEY: &str = "igdb.client_secret";
 const PUBLIC_BASE_URL_KEY: &str = "server.public_base_url";
 const DISCORD_WEBHOOK_KEY: &str = "discord.webhook_url";
+const DISCORD_APP_ID_KEY: &str = "discord.app_id";
 
 // ============================================================================
 // Source split into modules and re-assembled via include! macros below. Each
@@ -115,6 +116,7 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
         )
         .route("/api/health", get(api_health))
+        .route("/api/client-config", get(api_client_config))
         .route("/api/saves/:id", get(api_saves_list))
         .route("/api/saves/:id/file", get(api_saves_get).put(api_saves_put))
         .route("/api/catalog", get(api_catalog))

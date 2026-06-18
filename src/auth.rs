@@ -9,6 +9,19 @@ async fn api_health(State(_): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok": true, "schemaVersion": 1, "version": SERVER_VERSION.trim(), "backend": "rust"}))
 }
 
+// Public, non-secret client configuration handed to every launcher at startup.
+// Currently just the launcher's own Discord application id (the same for all
+// users) used for Rich Presence. Anonymous like /api/health; the app id is not
+// sensitive, and the client degrades to "no presence" when it's empty/absent.
+async fn api_client_config(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let app_id = setting_value(&st.db, DISCORD_APP_ID_KEY)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Json(serde_json::json!({ "discordAppId": app_id }))
+}
+
 // Best-effort client IP from proxy headers (nginx sets X-Forwarded-For). Falls
 // back to X-Real-IP. Returns None for direct/unknown connections.
 fn client_ip(headers: &HeaderMap) -> Option<String> {
