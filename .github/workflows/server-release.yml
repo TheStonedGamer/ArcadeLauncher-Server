@@ -19,7 +19,11 @@ env:
 jobs:
   package:
     name: Package Server
-    runs-on: ubuntu-latest
+    # Self-hosted Linux runner in the Proxmox CT (label `arcade-pve`). Build runs
+    # natively on the runner (Debian 12 CT) — no Docker — so the toolchain is the
+    # CT's own. Build deps are apt-installed each run (runner user has passwordless
+    # sudo); Rust is provisioned by dtolnay/rust-toolchain.
+    runs-on: [self-hosted, arcade-pve]
     if: github.ref_type == 'tag' || github.actor != 'github-actions[bot]'
 
     steps:
@@ -78,13 +82,20 @@ jobs:
           git tag -f "${{ steps.ver.outputs.TAG }}"
           git push -f origin "${{ steps.ver.outputs.TAG }}"
 
-      - name: Build Rust server in Debian 12
+      - name: Install build deps
         run: |
-          docker run --rm \
-            -v "$PWD:/work" \
-            -w /work \
-            debian:12 \
-            bash -lc 'apt-get update && apt-get install -y ca-certificates curl build-essential pkg-config cmake && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && cargo build --release --locked'
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake ca-certificates curl
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: server-release
+
+      - name: Build Rust server (native)
+        run: cargo build --release --locked
 
       - name: Package server tarball
         shell: bash
