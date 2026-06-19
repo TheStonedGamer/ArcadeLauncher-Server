@@ -19,11 +19,13 @@ env:
 jobs:
   package:
     name: Package Server
-    # Self-hosted Linux runner in the Proxmox CT (label `arcade-pve`). Build runs
+    # Self-hosted Linux runner in the Proxmox CT (label `prox-pve`). Build runs
     # natively on the runner (Debian 12 CT) — no Docker — so the toolchain is the
     # CT's own. Build deps are apt-installed each run (runner user has passwordless
-    # sudo); Rust is provisioned by dtolnay/rust-toolchain.
-    runs-on: [self-hosted, arcade-pve]
+    # sudo); Rust is provisioned by dtolnay/rust-toolchain. The Proxmox-specific
+    # `prox-pve` label keeps desktop-PC runners (generic `arcade-pve`) from ever
+    # grabbing a release build.
+    runs-on: [self-hosted, prox-pve]
     if: github.ref_type == 'tag' || github.actor != 'github-actions[bot]'
 
     steps:
