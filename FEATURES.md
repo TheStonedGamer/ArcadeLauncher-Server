@@ -21,6 +21,15 @@ through WIC, networking is WinHTTP, and archive extraction uses a bundled LZMA
 SDK. Everything is statically linked or shipped in the MSI, so there are no
 external runtime dependencies.
 
+> **Unified Client (current):** a cross-platform **Tauri v2 (Rust) + React**
+> client — `ArcadeLauncher-Unified-Client` — now replaces the separate native
+> Windows (C++/Direct2D) and Linux (C++/nanovg) launchers with one codebase
+> shipping on both OSes, at full parity with the features below (plus a card
+> right-click context menu, Steam-style Validate & Repair, a controller remap
+> editor with firmware/BIOS auto-deploy, and a pending-friend-requests tab). Its
+> own `FEATURES.md` lives in that repo. The capabilities in §1 describe the
+> launcher product regardless of which client renders them.
+
 ### 1.1 Unified game library
 - A single cover-art grid spanning **three sources** at once:
   - **Local emulator ROMs** (see Platform Support below).
@@ -167,6 +176,9 @@ social gateway, account management, and an HTML admin UI.
 - `GET /api/health` — status + live server `VERSION`.
 - `GET /api/catalog` — catalog entries (no per-file hashes).
 - `GET /api/games/{id}/manifest` — full file manifest for one game.
+- `GET /api/emulators` — flat list of server-known emulator runtimes and their
+  firmware/BIOS blobs (with `kind`), so a client can auto-deploy required firmware
+  (e.g. PS2 BIOS → PCSX2) without manual setup.
 - `GET /files/{id}/{relative-path}` — ranged file download.
 - `GET/POST /api/account`, `/api/account/password`,
   `/api/account/totp/{setup,enable,disable}` — launcher account self-service.
@@ -218,7 +230,10 @@ A persistent, full-duplex social layer shared between the launcher's
 ### 3.2 Features over the gateway
 - **Friends & requests** — send/accept/decline friend requests, block, and a REST
   friend list + DM history (`/api/social/*`) used for initial load and reconnect
-  reconciliation.
+  reconciliation. `POST /api/social/friends/respond` carries `{userId, action}`
+  where `action` ∈ `accept | decline | cancel | remove | ignore` (`ignore`
+  silently drops an incoming request without notifying the sender); clients
+  surface this as a pending-requests tab.
 - **Presence** — online / away / in-game broadcast as diffs.
 - **Direct messages** — delivered live, persisted as history server-side.
 - **Voice** — PCM relayed between participants over the binary channel.
