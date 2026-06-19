@@ -86,6 +86,7 @@ fn emulator_meta(entry_name: &str) -> (String, &'static str) {
         ("gopher64", "gopher64 (Nintendo 64)", "emulator"),
         ("mesen", "Mesen (NES / SNES)", "emulator"),
         ("ps3updat", "PlayStation 3 firmware", "firmware"),
+        ("ps2-bios", "PlayStation 2 BIOS (PCSX2)", "firmware"),
         ("scph", "PlayStation 1 BIOS (SCPH1001)", "firmware"),
         ("xemu-firmware", "Xbox firmware (xemu BIOS / HDD)", "firmware"),
     ];
