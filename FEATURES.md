@@ -180,6 +180,10 @@ social gateway, account management, and an HTML admin UI.
   firmware/BIOS blobs (with `kind`), so a client can auto-deploy required firmware
   (e.g. PS2 BIOS → PCSX2) without manual setup.
 - `GET /files/{id}/{relative-path}` — ranged file download.
+- `GET /api/saves/{id}` and `GET/PUT /api/saves/{id}/file?path=&mtime=` — per-game
+  **cloud-save** listing and per-file get/put (traversal-guarded, 50 MB/file cap).
+- `GET /api/social/turn` — short-lived **TURN credentials** (HMAC of the coturn
+  shared secret + TTL) for the unified client's WebRTC voice.
 - `GET/POST /api/account`, `/api/account/password`,
   `/api/account/totp/{setup,enable,disable}` — launcher account self-service.
 - `/api/social/*` + `/ws/social` — the social subsystem (see §3).
@@ -235,8 +239,17 @@ A persistent, full-duplex social layer shared between the launcher's
   silently drops an incoming request without notifying the sender); clients
   surface this as a pending-requests tab.
 - **Presence** — online / away / in-game broadcast as diffs.
-- **Direct messages** — delivered live, persisted as history server-side.
-- **Voice** — PCM relayed between participants over the binary channel.
+- **Direct messages** — delivered live, persisted as history server-side. The
+  unified client adds **edit/delete, emoji reactions, replies, and file
+  attachments** (presigned `POST /api/social/attachments/presign` → object-store
+  PUT → `GET /api/social/attachments/{id}`), plus **profiles** (banner/bio/level-XP),
+  **privacy** policies, and a per-user **ignore** list.
+- **Voice** — two relay models. The **native** launcher relays raw **PCM over the
+  binary channel**. The **unified client** instead does **peer-to-peer WebRTC**,
+  using the gateway only to relay `voice_signal` offer/answer/ICE; media flows P2P
+  via **STUN + a deployed coturn TURN server**, with TTL-limited TURN credentials
+  served from `GET /api/social/turn`. (The two voice models don't interop — fine
+  post-cutover since the unified client is now the sole shipping client.)
 
 ### 3.3 Keepalive & resilience (the hard-won bits)
 - **Server-side control Ping every 25s** keeps proxies/timeouts happy.
@@ -284,10 +297,16 @@ provides a community request board:
   (`install-linux.sh`, service + env templates).
 - **Reverse proxy** — nginx fronts the server at a public domain, terminating TLS
   and routing both the HTTP API and the `/ws/social` gateway to the upstream.
+- **TURN/voice** — a **coturn** server (Docker, host networking) provides WebRTC
+  TURN relay for symmetric-NAT / off-LAN voice; the app server mints time-limited
+  credentials against coturn's shared secret via `GET /api/social/turn`. TURN media
+  is its own UDP/TCP service (router-forwarded), not proxied through nginx.
 - **Clients** connect to the public URL (works on-LAN and remotely); the raw LAN
   IP only works inside the home network.
 - Both repos auto-version and publish GitHub releases on push to `main`; the
-  client MSI is downloaded/applied by the launcher's self-update.
+  client installer is downloaded/applied by the launcher's self-update. The
+  **server and unified client share a version line** (currently **0.10.0**) so the
+  `major.minor` lockstep stays satisfied — coordinated `x.x.0` bumps go to both.
 
 ---
 
