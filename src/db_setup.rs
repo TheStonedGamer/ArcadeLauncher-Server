@@ -93,6 +93,25 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Self-service signups awaiting admin approval (ROADMAP TSd). A pending row
+    // is NOT an account — it never reaches admin_users (and so can't sign in)
+    // until the admin clicks the single-use Approve link. Deny drops the row.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS pending_registrations (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          username VARCHAR(64) NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          password_hash VARCHAR(255) NOT NULL,
+          auth_key CHAR(64) NOT NULL,
+          token CHAR(48) NOT NULL,
+          ip VARCHAR(64) NULL,
+          created_at BIGINT NOT NULL,
+          UNIQUE KEY uniq_pending_token (token),
+          INDEX idx_pending_username (username),
+          INDEX idx_pending_email (email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS games (
           id VARCHAR(96) NOT NULL PRIMARY KEY,

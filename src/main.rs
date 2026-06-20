@@ -12,6 +12,10 @@ use bytes::Bytes;
 use cookie::Cookie;
 use futures_util::{StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
+use lettre::{
+    message::header::ContentType, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
+    AsyncTransport, Message, Tokio1Executor,
+};
 use mysql_async::{params, prelude::Queryable, Pool, Row};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use reqwest::Client;
@@ -68,6 +72,7 @@ include!("users_api.rs");
 include!("fanout.rs");
 include!("s3.rs");
 include!("social_api.rs");
+include!("registration.rs");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -102,6 +107,9 @@ async fn main() -> Result<()> {
         .route("/api/users/:id", put(api_users_update).delete(api_users_delete))
         .route("/api/auth/challenge", get(api_auth_challenge))
         .route("/api/auth/verify", post(api_auth_verify))
+        .route("/api/auth/register", post(api_auth_register))
+        .route("/api/auth/approve", get(api_auth_approve))
+        .route("/api/auth/deny", get(api_auth_deny))
         .route("/api/account", get(api_account))
         .route("/api/account/security", get(api_account_security))
         .route("/api/account/password", post(api_account_password))
@@ -396,6 +404,65 @@ mod tests {
         assert_eq!(igdb_platform_ids("Wii"), &[5]);
         assert_eq!(igdb_platform_ids("Xbox360"), &[12]);
         assert!(igdb_platform_ids("Unknown").is_empty());
+    }
+
+    #[test]
+    fn registration_validation_rules() {
+        // Happy path.
+        assert!(validate_registration("player_one", "p1@example.com", "longenough1").is_ok());
+        // Username length bounds.
+        assert!(validate_registration("ab", "a@b.co", "longenough1").is_err());
+        assert!(validate_registration(&"x".repeat(33), "a@b.co", "longenough1").is_err());
+        // Must start alphanumeric and only allowed chars.
+        assert!(validate_registration("_leading", "a@b.co", "longenough1").is_err());
+        assert!(validate_registration("has space", "a@b.co", "longenough1").is_err());
+        assert!(validate_registration("bad$char", "a@b.co", "longenough1").is_err());
+        // Dotted/underscored/hyphenated names allowed.
+        assert!(validate_registration("a.b-c_d", "a@b.co", "longenough1").is_ok());
+        // Email shape.
+        assert!(validate_registration("good", "no-at-sign", "longenough1").is_err());
+        assert!(validate_registration("good", "two@@x.com", "longenough1").is_err());
+        assert!(validate_registration("good", "nodot@localhost", "longenough1").is_err());
+        // Password minimum length.
+        assert!(validate_registration("good", "a@b.co", "short").is_err());
+    }
+
+    #[test]
+    fn email_plausibility() {
+        assert!(is_plausible_email("a@b.co"));
+        assert!(is_plausible_email("orlandb204567@outlook.com"));
+        assert!(!is_plausible_email("a@b"));
+        assert!(!is_plausible_email("@b.co"));
+        assert!(!is_plausible_email("a@.co"));
+        // Surrounding whitespace is trimmed, so a trailing space is accepted.
+        assert!(is_plausible_email("a@b.co "));
+        // Internal whitespace is rejected.
+        assert!(!is_plausible_email("a b@c.co"));
+        assert!(!is_plausible_email(""));
+    }
+
+    #[test]
+    fn registration_email_carries_both_links() {
+        let (subject, body) = registration_email(
+            "newbie",
+            "n@example.com",
+            "1.2.3.4",
+            "https://arcade.example/api/auth/approve?token=AAA",
+            "https://arcade.example/api/auth/deny?token=AAA",
+        );
+        assert!(subject.contains("newbie"));
+        assert!(body.contains("n@example.com"));
+        assert!(body.contains("approve?token=AAA"));
+        assert!(body.contains("deny?token=AAA"));
+        assert!(body.contains("1.2.3.4"));
+        // IP line is omitted when unknown.
+        let (_, body2) = registration_email("x", "x@y.zz", "", "http://a", "http://d");
+        assert!(!body2.contains("From IP:"));
+    }
+
+    #[test]
+    fn username_normalization() {
+        assert_eq!(normalize_username("  PlayerOne "), "playerone");
     }
 
     #[test]

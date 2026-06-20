@@ -113,6 +113,27 @@ struct Config {
     // when the shared secret + at least one TURN URL are set; otherwise
     // /api/social/turn returns STUN-only and voice falls back to STUN.
     turn: Option<TurnConfig>,
+    // Self-service registration (ROADMAP TSd). Closed by default: deploying the
+    // binary never silently opens signup — flip ARCADE_REGISTRATION_OPEN=true.
+    registration_open: bool,
+    // Where new-account approval emails go (defaults to ARCADE_ADMIN_EMAIL).
+    registration_notify_email: String,
+    // Optional SMTP for sending those approval emails. Some(...) only when host +
+    // From are set; otherwise the request is logged with the approve/deny links.
+    smtp: Option<SmtpConfig>,
+}
+
+// Outbound SMTP for admin notifications (registration approvals). Auth is
+// optional (username empty ⇒ unauthenticated relay). STARTTLS by default
+// (port 587); set ARCADE_SMTP_STARTTLS=false for implicit-TLS submission.
+#[derive(Clone)]
+struct SmtpConfig {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    from: String,
+    starttls: bool,
 }
 
 // coturn "static-auth-secret" (TURN REST API) settings. The server mints
@@ -236,6 +257,31 @@ impl Config {
                         urls,
                         stun_urls,
                         ttl: (env_u64("ARCADE_TURN_TTL", 3600) as i64).max(60),
+                    })
+                }
+            },
+            registration_open: env_string("ARCADE_REGISTRATION_OPEN", "false") == "true",
+            registration_notify_email: {
+                let e = env_string("ARCADE_REGISTRATION_NOTIFY_EMAIL", "");
+                if e.is_empty() {
+                    env_string("ARCADE_ADMIN_EMAIL", "")
+                } else {
+                    e
+                }
+            },
+            smtp: {
+                let host = env_string("ARCADE_SMTP_HOST", "");
+                let from = env_string("ARCADE_SMTP_FROM", "");
+                if host.is_empty() || from.is_empty() {
+                    None
+                } else {
+                    Some(SmtpConfig {
+                        host,
+                        port: env_u16("ARCADE_SMTP_PORT", 587),
+                        username: env_string("ARCADE_SMTP_USER", ""),
+                        password: env_string("ARCADE_SMTP_PASS", ""),
+                        from,
+                        starttls: env_string("ARCADE_SMTP_STARTTLS", "true") != "false",
                     })
                 }
             },
