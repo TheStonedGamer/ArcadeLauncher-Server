@@ -116,8 +116,6 @@ struct Config {
     // Self-service registration (ROADMAP TSd). Closed by default: deploying the
     // binary never silently opens signup — flip ARCADE_REGISTRATION_OPEN=true.
     registration_open: bool,
-    // Where new-account approval emails go (defaults to ARCADE_ADMIN_EMAIL).
-    registration_notify_email: String,
     // Optional SMTP for sending those approval emails. Some(...) only when host +
     // From are set; otherwise the request is logged with the approve/deny links.
     smtp: Option<SmtpConfig>,
@@ -261,14 +259,6 @@ impl Config {
                 }
             },
             registration_open: env_string("ARCADE_REGISTRATION_OPEN", "false") == "true",
-            registration_notify_email: {
-                let e = env_string("ARCADE_REGISTRATION_NOTIFY_EMAIL", "");
-                if e.is_empty() {
-                    env_string("ARCADE_ADMIN_EMAIL", "")
-                } else {
-                    e
-                }
-            },
             smtp: {
                 let host = env_string("ARCADE_SMTP_HOST", "");
                 let from = env_string("ARCADE_SMTP_FROM", "");

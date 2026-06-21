@@ -245,13 +245,13 @@ async fn api_auth_register(
     let deny_url = format!("{base}/api/auth/deny?token={token}");
     let (subject, body, html) =
         registration_email(&username, &email, ip.as_deref().unwrap_or(""), &approve_url, &deny_url);
-    // Notify EVERY enabled admin at their configured email, plus the explicit
-    // ARCADE_REGISTRATION_NOTIFY_EMAIL if set, deduped case-insensitively.
-    let recipients = collect_admin_recipients(&mut c, &st.cfg.registration_notify_email).await;
+    // Notify EVERY enabled admin at their configured email, deduped
+    // case-insensitively.
+    let recipients = collect_admin_recipients(&mut c).await;
     // Best-effort: a mail failure must never fail the signup. send_admin_email
     // logs the links when SMTP is unconfigured so the admin can still act.
     if recipients.is_empty() {
-        warn!("no admin recipients (no enabled admin emails / ARCADE_REGISTRATION_NOTIFY_EMAIL); not emailing. Subject: {subject}");
+        warn!("no enabled admin emails to notify; not emailing. Subject: {subject}");
     }
     for to in &recipients {
         send_admin_email(&st.cfg, to, &subject, &body, Some(&html)).await;
@@ -362,11 +362,8 @@ async fn api_auth_deny(
 }
 
 // Gather the set of admin notification recipients: every enabled admin's
-// non-empty email, plus the explicit ARCADE_REGISTRATION_NOTIFY_EMAIL if set.
-// Deduped case-insensitively (preserving the first-seen casing). Best-effort —
-// a DB error just falls back to the configured notify email so signups still
-// alert someone.
-async fn collect_admin_recipients(c: &mut mysql_async::Conn, notify: &str) -> Vec<String> {
+// non-empty email, deduped case-insensitively (preserving first-seen casing).
+async fn collect_admin_recipients(c: &mut mysql_async::Conn) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     let mut push = |addr: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
@@ -385,7 +382,6 @@ async fn collect_admin_recipients(c: &mut mysql_async::Conn, notify: &str) -> Ve
     for addr in &rows {
         push(addr, &mut seen, &mut out);
     }
-    push(notify, &mut seen, &mut out);
     out
 }
 
