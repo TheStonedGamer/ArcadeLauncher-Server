@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 target/
+
+# Host-runner helper scripts / scratch (not server source)
+*.ps1
+scr111.png
