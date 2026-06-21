@@ -13,7 +13,7 @@ use cookie::Cookie;
 use futures_util::{StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use lettre::{
-    message::header::ContentType, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
+    message::{header::ContentType, MultiPart, SinglePart}, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
     AsyncTransport, Message, Tokio1Executor,
 };
 use mysql_async::{params, prelude::Queryable, Pool, Row};

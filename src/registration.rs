@@ -78,15 +78,17 @@ fn normalize_username(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-// Build the admin notification email (subject, plain-text body) for a pending
-// signup. The two links are single-use Approve/Deny URLs.
+// Build the admin notification email (subject, plain-text body, HTML body) for a
+// pending signup. The HTML body renders Accept / Deny as styled buttons; the
+// plain-text part keeps the raw URLs as a fallback for text-only clients. Both
+// point at the same single-use Approve/Deny URLs.
 fn registration_email(
     username: &str,
     email: &str,
     ip: &str,
     approve_url: &str,
     deny_url: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     let subject = format!("ArcadeLauncher: new account request — {username}");
     let ip_line = if ip.is_empty() {
         String::new()
@@ -100,9 +102,43 @@ fn registration_email(
          {ip_line}\n\
          Approve and create the account:\n  {approve_url}\n\n\
          Deny and discard the request:\n  {deny_url}\n\n\
-         These links are single-use. Until you approve, the account cannot sign in.\n"
+         These buttons are single-use. Until you approve, the account cannot sign in.\n"
     );
-    (subject, body)
+    let ip_row = if ip.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<tr><td style=\"color:#a9b0bd;padding:2px 12px 2px 0\">From IP</td>\
+             <td style=\"color:#e6e6e6\">{}</td></tr>",
+            esc(ip)
+        )
+    };
+    let html = format!(
+        "<!doctype html><html><body style=\"margin:0;background:#0f1116;\
+         font-family:system-ui,-apple-system,sans-serif;color:#e6e6e6\">\
+         <div style=\"max-width:34rem;margin:0 auto;padding:2rem\">\
+         <h1 style=\"font-size:1.25rem;margin:0 0 1rem\">New ArcadeLauncher account request</h1>\
+         <table style=\"border-collapse:collapse;margin:0 0 1.5rem;font-size:.95rem\">\
+         <tr><td style=\"color:#a9b0bd;padding:2px 12px 2px 0\">Username</td>\
+         <td style=\"color:#e6e6e6\">{username}</td></tr>\
+         <tr><td style=\"color:#a9b0bd;padding:2px 12px 2px 0\">Email</td>\
+         <td style=\"color:#e6e6e6\">{email}</td></tr>\
+         {ip_row}</table>\
+         <table style=\"border-collapse:separate\"><tr>\
+         <td style=\"padding-right:12px\"><a href=\"{approve_url}\" \
+         style=\"display:inline-block;background:#2ea043;color:#fff;text-decoration:none;\
+         font-weight:600;padding:12px 28px;border-radius:8px\">Accept</a></td>\
+         <td><a href=\"{deny_url}\" \
+         style=\"display:inline-block;background:#da3633;color:#fff;text-decoration:none;\
+         font-weight:600;padding:12px 28px;border-radius:8px\">Deny</a></td>\
+         </tr></table>\
+         <p style=\"color:#a9b0bd;font-size:.85rem;margin:1.5rem 0 0;line-height:1.5\">\
+         These buttons are single-use. Until you accept, the account cannot sign in.</p>\
+         </div></body></html>",
+        username = esc(username),
+        email = esc(email),
+    );
+    (subject, body, html)
 }
 
 // A small dark-themed HTML page shown after the admin clicks Approve/Deny.
@@ -207,11 +243,11 @@ async fn api_auth_register(
     let base = public_base_url(&st, &headers).await;
     let approve_url = format!("{base}/api/auth/approve?token={token}");
     let deny_url = format!("{base}/api/auth/deny?token={token}");
-    let (subject, body) =
+    let (subject, body, html) =
         registration_email(&username, &email, ip.as_deref().unwrap_or(""), &approve_url, &deny_url);
     // Best-effort: a mail failure must never fail the signup. send_admin_email
     // logs the links when SMTP is unconfigured so the admin can still act.
-    send_admin_email(&st.cfg, &st.cfg.registration_notify_email, &subject, &body).await;
+    send_admin_email(&st.cfg, &st.cfg.registration_notify_email, &subject, &body, Some(&html)).await;
     audit(&st.db, None, Some(&username), "register_requested", ip.as_deref(), Some(&email)).await;
     Json(serde_json::json!({
         "ok": true,
@@ -319,7 +355,7 @@ async fn api_auth_deny(
 
 // Best-effort admin email. Logs (and prints the links via the caller's body)
 // instead of erroring when SMTP is unconfigured or the recipient is unset.
-async fn send_admin_email(cfg: &Config, to: &str, subject: &str, body: &str) {
+async fn send_admin_email(cfg: &Config, to: &str, subject: &str, body: &str, html: Option<&str>) {
     let Some(smtp) = cfg.smtp.as_ref() else {
         warn!("SMTP not configured; not emailing admin. Subject: {subject}\n{body}");
         return;
@@ -328,20 +364,43 @@ async fn send_admin_email(cfg: &Config, to: &str, subject: &str, body: &str) {
         warn!("no registration notify email set (ARCADE_REGISTRATION_NOTIFY_EMAIL / ARCADE_ADMIN_EMAIL); not emailing. Subject: {subject}");
         return;
     }
-    match build_and_send_email(smtp, to, subject, body).await {
+    match build_and_send_email_parts(smtp, to, subject, body, html).await {
         Ok(()) => info!("admin notification email sent to {to}"),
         Err(e) => warn!("admin email send failed ({e}); links:\n{body}"),
     }
 }
 
 async fn build_and_send_email(smtp: &SmtpConfig, to: &str, subject: &str, body: &str) -> Result<()> {
-    let email = Message::builder()
+    build_and_send_email_parts(smtp, to, subject, body, None).await
+}
+
+// Sends a plain-text email, or a multipart/alternative (text + HTML) when an
+// `html` part is supplied so clients render buttons while text-only clients
+// still get the raw links.
+async fn build_and_send_email_parts(
+    smtp: &SmtpConfig,
+    to: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
+) -> Result<()> {
+    let builder = Message::builder()
         .from(smtp.from.parse().context("invalid SMTP From address")?)
         .to(to.parse().context("invalid recipient address")?)
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_string())
-        .context("build email message")?;
+        .subject(subject);
+    let email = match html {
+        Some(h) => builder
+            .multipart(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::plain(body.to_string()))
+                    .singlepart(SinglePart::html(h.to_string())),
+            )
+            .context("build email message")?,
+        None => builder
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_string())
+            .context("build email message")?,
+    };
     let mut builder = if smtp.starttls {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp.host).context("smtp starttls relay")?
     } else {
