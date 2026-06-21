@@ -1,10 +1,32 @@
 # ArcadeLauncher Server — Session Handoff
 
-_Last updated: 2026-06-12 (work done in prior session, dated 2026-06-10 in logs)_
+_Last updated: 2026-06-21_
 
 **Rust / axum 0.7 / tokio** backend with a **MariaDB** (`mysql_async`) catalog, Argon2/TOTP auth, and an
 admin HTML UI rendered via `format!`. Serves the `ArcadeLauncher-Client` Windows launcher. See the
 client's `HANDOFF.md` for the full cross-cutting picture; this file is server-/infra-focused.
+
+## Recent changes (2026-06-21, prod 0.10.9)
+- **Self-service registration + email** shipped: `registration.rs` (POST `/api/auth/register`,
+  GET `/api/auth/approve|deny`) and `password_reset.rs` (forgot/reset). New-signup emails go to **every
+  enabled admin** (queried from `admin_users`) as a **multipart HTML message with Accept/Deny buttons**;
+  the old single `ARCADE_REGISTRATION_NOTIFY_EMAIL` config was **removed**. SMTP via `lettre` from
+  `ARCADE_SMTP_HOST/PORT/USER/PASS/FROM/STARTTLS` (note the names — `USER`/`PASS`/`STARTTLS`, not
+  `USERNAME`/`PASSWORD`/`TLS`).
+- **New admin pages** in `admin_extra.rs` (included after `admin_html.rs`):
+  - `/admin/accounts` — account management moved off the dashboard: user cards, create-user, tokens, and
+    a **Pending Account Requests** table (approve → creates non-admin account / deny).
+  - `/admin/requests` — game-request triage (set status / delete), writing the shared `game_requests`
+    table directly. The client board's inline admin dropdown was removed (client v0.10.15).
+  - All three admin pages share `admin_post`; POSTs carry a `return_to` field so the handler re-renders
+    the right page. New `AdminForm` fields: `return_to`, `pending_id`, `request_id`, `request_status`.
+- **Deploy is now git-pull, not scp:** push → on CT `cd /root/build-arcade && git pull --ff-only` →
+  `cargo build --release` → install → restart. `/root/build-arcade` is a git clone of the (public) repo.
+  Pull picks up the CI `VERSION` bump automatically. **Startup binds ~25s after restart** (schema + fs
+  watcher) — poll `/api/health` for ~30s; don't mistake the gap for a failure.
+- **Companion Requests service 502 fix** (separate repo `ArcadeLauncher-Requests`): board load panicked
+  reading a NULL `AVG(stars)` into `f64`; now read via `Option<f64>` + `CAST(... AS DOUBLE)`. That repo is
+  **private** and the CT has no GitHub creds, so it still deploys via **scp** (no git-pull there yet).
 
 ## Repos / hosts
 - Server: `C:\Users\BrianTheMint\source\repos\ArcadeLauncher-Server` — `github.com/TheStonedGamer/ArcadeLauncher-Server`

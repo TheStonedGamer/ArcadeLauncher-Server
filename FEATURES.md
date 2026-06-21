@@ -201,6 +201,18 @@ social gateway, account management, and an HTML admin UI.
   - sign in with username/email + password;
   - issue password-reset links by email;
   - force a user to change their password on next login.
+- **Account management page** (`/admin/accounts`) — full account administration on
+  its own page (off the main dashboard): full-text-filterable user cards (edit
+  email/role/status, reset password, toggle 2FA, force password change, delete),
+  create-user form, issued-token table, and a **Pending Account Requests** table
+  that lets an admin **Approve** (creates a standard non-admin account) or **Deny**
+  each outstanding self-service signup — the in-app counterpart to the emailed
+  Accept/Deny links.
+- **Game-request triage page** (`/admin/requests`) — set each community request's
+  status (pending / approved / fulfilled / declined) or delete it. This replaces
+  the inline admin status dropdown that used to live on the client Requests board.
+- **New-signup notifications** email **every enabled admin** (each admin's own
+  address) with HTML **Accept / Deny** buttons.
 - **First-boot bootstrap** of an admin account from environment variables when no
   admin exists.
 - **Password-reset email** via optional SMTP settings; if SMTP is unconfigured, a
@@ -281,7 +293,9 @@ provides a community request board:
 - Logged-in launcher users **request game releases** to be added to the catalog,
   **search IGDB** to pick the exact release, and **upvote** each other's
   requests.
-- Admins triage the board: **approve / fulfill / decline**.
+- Admins triage the board: **approve / fulfill / decline** — now from the main
+  server admin UI (`/admin/requests`), which updates the shared `game_requests`
+  table directly (the client board no longer carries an inline admin dropdown).
 - Intentionally decoupled: it shares the same MariaDB and launcher accounts
   (authenticating against the server's `admin_users` table and reading IGDB
   credentials from `server_settings` — no duplicated secrets), owns only its own
