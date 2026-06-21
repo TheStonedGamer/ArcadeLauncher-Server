@@ -511,7 +511,7 @@ async fn api_metrics(State(st): State<AppState>) -> Response {
     async fn count(c: &mut mysql_async::Conn, sql: &str) -> i64 {
         c.query_first::<i64, _>(sql).await.ok().flatten().unwrap_or(0)
     }
-    let users = count(&mut c, "SELECT COUNT(*) FROM users").await;
+    let users = count(&mut c, "SELECT COUNT(*) FROM admin_users").await;
     let games = count(&mut c, "SELECT COUNT(*) FROM games").await;
     let messages = count(&mut c, "SELECT COUNT(*) FROM social_messages").await;
     let friendships =

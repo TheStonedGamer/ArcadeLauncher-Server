@@ -3006,7 +3006,7 @@ async fn api_social_reviews_get(
     let rows: Vec<(u64, String, i8, Option<String>, i64)> = match c
         .exec(
             r#"SELECT r.user_id, COALESCE(u.username,''), r.rating, r.body, r.updated_at
-               FROM game_reviews r LEFT JOIN users u ON u.id = r.user_id
+               FROM game_reviews r LEFT JOIN admin_users u ON u.id = r.user_id
                WHERE r.game_id=:g ORDER BY r.updated_at DESC"#,
             params! {"g" => &gid},
         )
@@ -3136,7 +3136,7 @@ async fn api_social_screenshots_get(
             r#"SELECT s.id, s.user_id, COALESCE(u.username,''), s.caption, a.object_key, s.created_at
                FROM game_screenshots s
                JOIN social_attachments a ON a.id = s.attachment_id
-               LEFT JOIN users u ON u.id = s.user_id
+               LEFT JOIN admin_users u ON u.id = s.user_id
                WHERE s.game_id=:g ORDER BY s.id DESC LIMIT 50"#,
             params! {"g" => &gid},
         )
@@ -3174,7 +3174,7 @@ async fn api_social_activity(State(st): State<AppState>, headers: HeaderMap) -> 
     let in_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
     let sql = format!(
         r#"SELECT a.id, a.user_id, COALESCE(u.username,''), a.kind, a.game_id, a.payload, a.created_at
-           FROM social_activity a LEFT JOIN users u ON u.id = a.user_id
+           FROM social_activity a LEFT JOIN admin_users u ON u.id = a.user_id
            WHERE a.user_id IN ({in_list}) ORDER BY a.id DESC LIMIT 100"#
     );
     let rows: Vec<(u64, u64, String, String, Option<String>, Option<String>, i64)> =
