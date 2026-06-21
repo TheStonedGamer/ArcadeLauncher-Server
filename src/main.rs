@@ -73,6 +73,7 @@ include!("fanout.rs");
 include!("s3.rs");
 include!("social_api.rs");
 include!("registration.rs");
+include!("password_reset.rs");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -110,6 +111,8 @@ async fn main() -> Result<()> {
         .route("/api/auth/register", post(api_auth_register))
         .route("/api/auth/approve", get(api_auth_approve))
         .route("/api/auth/deny", get(api_auth_deny))
+        .route("/api/auth/forgot", post(api_auth_forgot))
+        .route("/api/auth/reset", get(api_auth_reset_page).post(api_auth_reset_submit))
         .route("/api/account", get(api_account))
         .route("/api/account/security", get(api_account_security))
         .route("/api/account/password", post(api_account_password))
