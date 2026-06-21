@@ -459,8 +459,55 @@ async fn get_game_save(db: &Pool, user_id: u64, game_id: &str, rel_path: &str) -
     Ok(row.and_then(|mut r| r.take::<Vec<u8>, _>(0)))
 }
 
+// ROADMAP 2.7: how many prior versions to retain per save file.
+const SAVE_VERSION_KEEP: u64 = 10;
+
+// Current stored mtime for a save file, if any (for conflict detection).
+async fn get_game_save_mtime(db: &Pool, user_id: u64, game_id: &str, rel_path: &str) -> Result<Option<i64>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<i64> = c
+        .exec_first(
+            "SELECT mtime FROM game_saves WHERE user_id=:u AND game_id=:g AND rel_path=:p",
+            params! {"u" => user_id, "g" => game_id, "p" => rel_path},
+        )
+        .await?;
+    Ok(row)
+}
+
 async fn put_game_save(db: &Pool, user_id: u64, game_id: &str, rel_path: &str, mtime: i64, bytes: &[u8]) -> Result<()> {
     let mut c = db.get_conn().await?;
+    // Archive the prior bytes (if any) into version history before overwriting.
+    let prior: Option<Row> = c
+        .exec_first(
+            "SELECT data, mtime FROM game_saves WHERE user_id=:u AND game_id=:g AND rel_path=:p",
+            params! {"u" => user_id, "g" => game_id, "p" => rel_path},
+        )
+        .await?;
+    if let Some(mut r) = prior {
+        let old_data: Vec<u8> = r.take(0).unwrap_or_default();
+        let old_mtime: i64 = r.take(1).unwrap_or_default();
+        if !old_data.is_empty() {
+            c.exec_drop(
+                r#"INSERT INTO game_save_versions (user_id, game_id, rel_path, data, mtime, created_at)
+                   VALUES (:u, :g, :p, :d, :m, :t)"#,
+                params! {"u" => user_id, "g" => game_id, "p" => rel_path, "d" => old_data, "m" => old_mtime, "t" => now()},
+            )
+            .await?;
+            // Prune to the most recent SAVE_VERSION_KEEP versions for this file.
+            c.exec_drop(
+                r#"DELETE FROM game_save_versions
+                   WHERE user_id=:u AND game_id=:g AND rel_path=:p AND version_id NOT IN (
+                     SELECT version_id FROM (
+                       SELECT version_id FROM game_save_versions
+                       WHERE user_id=:u AND game_id=:g AND rel_path=:p
+                       ORDER BY version_id DESC LIMIT :k
+                     ) keep
+                   )"#,
+                params! {"u" => user_id, "g" => game_id, "p" => rel_path, "k" => SAVE_VERSION_KEEP},
+            )
+            .await?;
+        }
+    }
     c.exec_drop(
         r#"INSERT INTO game_saves (user_id, game_id, rel_path, data, mtime, updated_at)
            VALUES (:u, :g, :p, :d, :m, :t)
@@ -469,4 +516,45 @@ async fn put_game_save(db: &Pool, user_id: u64, game_id: &str, rel_path: &str, m
     )
     .await?;
     Ok(())
+}
+
+// List archived versions for one save file (newest first), without the bytes.
+async fn list_save_versions(db: &Pool, user_id: u64, game_id: &str, rel_path: &str) -> Result<Vec<(u64, i64, u64, i64)>> {
+    let mut c = db.get_conn().await?;
+    let rows: Vec<Row> = c
+        .exec(
+            r#"SELECT version_id, mtime, LENGTH(data), created_at FROM game_save_versions
+               WHERE user_id=:u AND game_id=:g AND rel_path=:p ORDER BY version_id DESC"#,
+            params! {"u" => user_id, "g" => game_id, "p" => rel_path},
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<u64, _>(0).unwrap_or_default(),
+                row.get::<i64, _>(1).unwrap_or_default(),
+                row.get::<u64, _>(2).unwrap_or_default(),
+                row.get::<i64, _>(3).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+// Fetch the bytes of one archived version (scoped to the owner).
+async fn get_save_version(db: &Pool, user_id: u64, game_id: &str, version_id: u64) -> Result<Option<(String, i64, Vec<u8>)>> {
+    let mut c = db.get_conn().await?;
+    let row: Option<Row> = c
+        .exec_first(
+            "SELECT rel_path, mtime, data FROM game_save_versions WHERE version_id=:v AND user_id=:u AND game_id=:g",
+            params! {"v" => version_id, "u" => user_id, "g" => game_id},
+        )
+        .await?;
+    Ok(row.map(|mut r| {
+        (
+            r.take::<String, _>(0).unwrap_or_default(),
+            r.take::<i64, _>(1).unwrap_or_default(),
+            r.take::<Vec<u8>, _>(2).unwrap_or_default(),
+        )
+    }))
 }

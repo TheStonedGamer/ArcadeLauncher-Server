@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Form, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE, Engine};
@@ -128,9 +128,17 @@ async fn main() -> Result<()> {
                 .layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
         )
         .route("/api/health", get(api_health))
+        .route("/api/metrics", get(api_metrics))
+        .route("/api/feature-flags", get(api_feature_flags))
+        .route("/api/games/search", get(api_games_search))
         .route("/api/client-config", get(api_client_config))
         .route("/api/saves/:id", get(api_saves_list))
         .route("/api/saves/:id/file", get(api_saves_get).put(api_saves_put))
+        .route("/api/saves/:id/versions", get(api_saves_versions))
+        .route("/api/saves/:id/version", get(api_saves_version_get))
+        .route("/api/saves/:id/restore", post(api_saves_restore))
+        .route("/api/config", get(api_config_all))
+        .route("/api/config/:ns", get(api_config_get).post(api_config_put))
         .route("/api/catalog", get(api_catalog))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/api/games/:id/changelogs", get(api_changelogs))
@@ -153,6 +161,13 @@ async fn main() -> Result<()> {
             get(api_social_friendmeta_get).put(api_social_friendmeta_put),
         )
         .route("/api/social/search", get(api_social_search))
+        .route("/api/social/review", put(api_social_review_put))
+        .route("/api/social/review/:id", delete(api_social_review_delete))
+        .route("/api/social/reviews/:id", get(api_social_reviews_get))
+        .route("/api/social/activity", get(api_social_activity))
+        .route("/api/social/screenshot", post(api_social_screenshot_create))
+        .route("/api/social/screenshot/:id", delete(api_social_screenshot_delete))
+        .route("/api/social/screenshots/:id", get(api_social_screenshots_get))
         .route("/api/social/turn", get(api_social_turn))
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))
         .route("/api/social/attachments/:id", get(api_social_attachment_get))
@@ -169,6 +184,28 @@ async fn main() -> Result<()> {
         .route("/api/library/stats", get(api_library_stats))
         .route("/api/library/playtime", post(api_library_playtime))
         .route("/api/library/rating", post(api_library_rating))
+        .route("/api/library/meta", post(api_library_meta))
+        .route("/api/library/duplicates", get(api_library_duplicates))
+        .route(
+            "/api/library/launch-profiles",
+            get(api_library_launch_profiles),
+        )
+        .route(
+            "/api/library/launch-profile",
+            post(api_library_launch_profile_put),
+        )
+        .route(
+            "/api/library/collections",
+            get(api_library_collections).post(api_library_collection_create),
+        )
+        .route(
+            "/api/library/collections/:id",
+            put(api_library_collection_update).delete(api_library_collection_delete),
+        )
+        .route(
+            "/api/library/collections/:id/items",
+            post(api_library_collection_items),
+        )
         .route("/ws/social", get(ws_social))
         .route("/api/emulators", get(api_emulators))
         .route("/art/:id", get(download_art))
@@ -449,7 +486,7 @@ mod tests {
 
     #[test]
     fn registration_email_carries_both_links() {
-        let (subject, body) = registration_email(
+        let (subject, body, _html) = registration_email(
             "newbie",
             "n@example.com",
             "1.2.3.4",
@@ -462,7 +499,7 @@ mod tests {
         assert!(body.contains("deny?token=AAA"));
         assert!(body.contains("1.2.3.4"));
         // IP line is omitted when unknown.
-        let (_, body2) = registration_email("x", "x@y.zz", "", "http://a", "http://d");
+        let (_, body2, _) = registration_email("x", "x@y.zz", "", "http://a", "http://d");
         assert!(!body2.contains("From IP:"));
     }
 

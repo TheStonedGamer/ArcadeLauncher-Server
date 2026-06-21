@@ -182,6 +182,26 @@ social gateway, account management, and an HTML admin UI.
 - `GET /files/{id}/{relative-path}` — ranged file download.
 - `GET /api/saves/{id}` and `GET/PUT /api/saves/{id}/file?path=&mtime=` — per-game
   **cloud-save** listing and per-file get/put (traversal-guarded, 50 MB/file cap).
+  **Cloud Saves v2** (ROADMAP 2.7): PUT accepts optional `baseMtime` → **409 conflict**
+  on stale overwrite; `GET /api/saves/{id}/versions?path=`, `GET …/version?versionId=`,
+  `POST …/restore?versionId=` give **version history / backups / rollback** (10 kept/file).
+- **Library tracking** (ROADMAP 2.4): `GET /api/library/stats`; `POST /api/library/{playtime,
+  rating,meta}` — per-account playtime, last-played, play_count, completion, rating, tags, notes.
+- **Library organization** (ROADMAP 2.5): `GET/POST /api/library/collections`,
+  `PUT/DELETE /api/library/collections/{id}`, `POST /api/library/collections/{id}/items`
+  (manual + smart collections); `GET /api/library/duplicates` (cross-platform dupes).
+- **Launch profiles** (ROADMAP 2.6): `GET /api/library/launch-profiles`,
+  `POST /api/library/launch-profile` — per-game launch/emulator/controller config sync.
+- **Cloud config sync** (ROADMAP 2.8): `GET /api/config`, `GET/POST /api/config/{ns}` —
+  namespaced per-account JSON (settings, favorites, controller-mappings, metadata-edits).
+- **Reviews + activity feed + screenshots** (ROADMAP 3.7): `PUT/DELETE /api/social/review*`,
+  `GET /api/social/reviews/{id}` (aggregate avg/count); `GET /api/social/activity`
+  (self + friends, server-generated on ≥5-min sessions / reviews / screenshots);
+  `POST/DELETE /api/social/screenshot*`, `GET /api/social/screenshots/{id}` (presigned
+  image URLs via the MinIO attachment pipeline).
+- **Observability + platform** (ROADMAP 3.4/3.5): `GET /api/metrics` (Prometheus text),
+  `GET /api/feature-flags` (server-set JSON flag map), `GET /api/games/search?q=`
+  (FULLTEXT over title/summary/genres, LIKE fallback).
 - `GET /api/social/turn` — short-lived **TURN credentials** (HMAC of the coturn
   shared secret + TTL) for the unified client's WebRTC voice.
 - `GET/POST /api/account`, `/api/account/password`,

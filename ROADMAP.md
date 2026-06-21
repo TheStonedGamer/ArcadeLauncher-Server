@@ -160,38 +160,91 @@ repos it touches (S=server, C=client) and whether it breaks version lockstep.
 
 - [ ] **2.1 Voice v2** — Opus codec, jitter buffer, packet-loss concealment,
   device selection, push-to-talk, voice-activation, noise suppression/AEC.
-- [ ] **2.2 Voice NAT traversal** — Coturn (STUN/TURN), ICE; relay as fallback.
+  _CLIENT/NATIVE — not server-sliceable: codec + audio pipeline live in the C++/
+  unified client. Server already relays binary voice frames over `/ws/social`._
+- [~] **2.2 Voice NAT traversal** — Coturn (STUN/TURN), ICE; relay as fallback.
+  _Server side already LIVE: coturn deployed + `GET /api/social/turn` mints
+  time-limited credentials (see FEATURES §5). ICE/relay-fallback wiring is client._
 - [ ] **2.3 Voice rooms / group calls** — multi-party; SFU (LiveKit/mediasoup) if
-  group/screen-share becomes real.
-- [ ] **2.4 Library tracking** — playtime, last-played, completion, ratings,
-  tags, notes.
-- [ ] **2.5 Library organization** — smart/dynamic collections, folders, custom
-  tags, duplicate detection.
-- [ ] **2.6 Launch profiles** — per-game args, emulator profiles, per-game
-  controller profiles, multi-disc, pre-launch validation.
-- [ ] **2.7 Cloud Saves v2** — conflict resolution, multiple slots, version
-  history, backups, compression, encryption, selective sync.
-- [ ] **2.8 Cloud config sync** — settings, favorites, controller mappings,
-  metadata edits.
+  group/screen-share becomes real. _INFRA/CLIENT — needs an SFU stood up + client work._
+- [~] **2.4 Library tracking** (S) — _server slice DONE; builds clean. Client UI
+  deferred (C)._ `game_stats` table (per-account, per-game, keyed `(user_id,game_id)`):
+  playtime_seconds, last_played, play_count, completion, rating, **tags, notes**.
+  `GET /api/library/stats` → all rows for the account; `POST /api/library/playtime`
+  `{gameId,seconds}` accrues a session (caps 24h/session, bumps last_played+play_count);
+  `POST /api/library/rating` `{gameId,rating?,completion?}` (rating 0–5, completion 0/1);
+  `POST /api/library/meta` `{gameId,tags?[],notes?}` (tags normalized: trim/lowercase/
+  dedup, ≤20×≤32 chars; notes ≤4000 chars). Additive/patch-level.
+- [~] **2.5 Library organization** (S) — _server slice DONE; builds clean. Client UI
+  deferred (C)._ `game_collections` + `game_collection_items` tables. Manual
+  collections (explicit membership) and smart collections (opaque `rules` JSON, client
+  evaluates against library stats). `GET/POST /api/library/collections`,
+  `PUT/DELETE /api/library/collections/:id`, `POST /api/library/collections/:id/items`
+  `{gameId,add}` (rejects membership edits on smart collections). Pinned + sortOrder for
+  ordering; cap 200/account. Custom tags = 2.4. `GET /api/library/duplicates` groups
+  catalog games by `normalize_title` and returns multi-member groups (cross-platform
+  duplicate detection). Additive/patch-level.
+- [~] **2.6 Launch profiles** (S) — _server slice DONE (config-sync only; launching is
+  client-side). Client UI/logic deferred (C)._ `game_launch_profiles` table: one opaque
+  JSON blob per `(user_id, game_id)` holding launch args, emulator profile, per-game
+  controller profile, multi-disc list, pre-launch checks — schema owned by the client,
+  server just syncs it (last-write-wins, like prefs). `GET /api/library/launch-profiles`
+  → `{gameId: profile}` map; `POST /api/library/launch-profile` `{gameId, profile}`
+  upserts (null profile deletes); blob capped 64 KiB. Additive/patch-level.
+- [~] **2.7 Cloud Saves v2** (S) — _server slice DONE; builds clean. Implemented
+  additively over the existing `game_saves` table (no destabilizing PK change)._
+  - **Version history + backups**: new `game_save_versions` table; every overwrite in
+    `put_game_save` archives the prior bytes (pruned to 10/file).
+    `GET /api/saves/:id/versions?path=` lists versions, `GET /api/saves/:id/version?versionId=N`
+    fetches bytes, `POST /api/saves/:id/restore?versionId=N` rolls back (archiving the
+    live row first).
+  - **Conflict resolution**: PUT accepts optional `baseMtime`; mismatch with the stored
+    mtime → 409 `{currentMtime,baseMtime}` so the client can merge. Omitted = no check
+    (backward-compatible).
+  - **Slots / compression / encryption / selective sync** remain client-side over the
+    existing per-file API — the server stores opaque bytes per `rel_path`, so the client
+    namespaces slots into the path and compresses/encrypts before upload. Additive/patch-level.
+- [~] **2.8 Cloud config sync** (S) — _server slice DONE; builds clean._ Generic
+  namespaced per-account JSON store `user_config` `(user_id, namespace)` →
+  settings / favorites / controller-mappings / metadata-edits as separate namespaces
+  (generalizes the single 0.5 prefs blob). `GET /api/config` → `{ns: data}` map;
+  `GET /api/config/:ns`; `POST /api/config/:ns` (body = blob; JSON `null` deletes).
+  Namespace slug-validated; blob capped 256 KiB; last-write-wins. Additive/patch-level.
 
 ## Phase 3 — Communities, platform & scale
 
 - [ ] **3.1 Group chats / communities / channels** (text + voice), party chat,
   temporary game lobbies.
 - [ ] **3.2 Notification redesign completion** — categories, priorities, grouping,
-  quiet hours, sound routing, per-category mute, push.
+  quiet hours, sound routing, per-category mute, push. _Mostly CLIENT (routing/grouping/
+  sound) — quiet-hours/mute prefs can ride the 2.8 config-sync `notifications` namespace;
+  server `social_notifications` already carries `kind` for categorization. Push needs a
+  client push channel. Deferred pending client work._
 - [ ] **3.3 Download v2** — multi-threaded chunking, delta patching, verify/repair,
-  download scheduler/priorities, LAN/peer cache, disk preallocation.
-- [ ] **3.4 Observability** — `tracing` structured logs (Loki), Prometheus
-  metrics + Grafana, `audit_log` table, admin analytics.
-- [ ] **3.5 Platform systems** — plugin system, theme engine, localization,
-  crash reporting, diagnostics export, backup/restore, portable mode, feature
-  flags, API versioning (`/api/v1`), full-text search.
+  download scheduler/priorities, LAN/peer cache, disk preallocation. _CLIENT-side: the
+  server already serves ranged `/files` + `/chunks` with manifest hashes; chunking/
+  scheduling/peer-cache are downloader logic in the client._
+- [~] **3.4 Observability** (S) — _server slice DONE._ `GET /api/metrics` exposes
+  Prometheus text-format gauges (users/games/messages/friendships/notifications) for a
+  scraper → Grafana. `auth_audit` table already present (0.6) and surfaced via
+  `/api/account/security`. `tracing`/Loki shipping + Grafana dashboards are infra/ops.
+- [~] **3.5 Platform systems** (S, partial) — _server slices DONE: **feature flags**
+  (`GET /api/feature-flags`, JSON map under the `feature_flags` server setting),
+  **full-text search** (`GET /api/games/search?q=`, FULLTEXT over title/summary/genres
+  with LIKE fallback). Remaining (plugin system, theme engine, localization, crash
+  reporting, backup/restore, portable mode) are CLIENT/structural; `/api/v1` versioning
+  is a future routing refactor._
 - [ ] **3.6 Big Picture polish** — full controller setup, on-screen keyboard,
-  keyboard-less first-run.
-- [ ] **3.7 Steam-like extras (triaged)** — activity feed, user screenshots,
-  achievements (where cores expose them), library/family sharing, game pages,
-  news/events. (Skip: trading cards, marketplace, monetized cosmetics.)
+  keyboard-less first-run. _CLIENT-only (UI/input)._
+- [~] **3.7 Steam-like extras (triaged)** (S, partial) — _server slices DONE:
+  **activity feed** (`GET /api/social/activity` — self + friends, server-generated on
+  ≥5-min sessions + reviews), **reviews** (`PUT /api/social/review`,
+  `DELETE /api/social/review/:gameId`, `GET /api/social/reviews/:gameId` with aggregate
+  avg/count), **user screenshots** (`POST /api/social/screenshot` registers an uploaded
+  1.3-attachment against a game, `GET /api/social/screenshots/:gameId` returns presigned
+  image URLs + uploader, `DELETE /api/social/screenshot/:id`; posts a `screenshot`
+  activity event). Achievements (core-dependent), library/family sharing, game pages,
+  news/events remain. (Skip: trading cards, marketplace, monetized cosmetics.)_
 
 ---
 

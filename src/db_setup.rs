@@ -141,6 +141,12 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN developer VARCHAR(255) NULL").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN publisher VARCHAR(255) NULL").await;
     let _ = c.query_drop("ALTER TABLE games ADD COLUMN franchise VARCHAR(255) NULL").await;
+    // ROADMAP 3.5: full-text search index over title + summary + genres. Best-effort
+    // (older MariaDB / existing index → ignored); the search endpoint falls back to
+    // LIKE when MATCH…AGAINST errors, so this is purely an optimization.
+    let _ = c
+        .query_drop("ALTER TABLE games ADD FULLTEXT INDEX ft_games_search (title, summary, genres)")
+        .await;
     // Cloud saves: one row per user+game+file. Files are small (emulator/PC
     // save data); the client enforces per-file and per-folder caps.
     c.query_drop(
@@ -152,6 +158,35 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
             mtime BIGINT NOT NULL DEFAULT 0,
             updated_at BIGINT NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, game_id, rel_path(191))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // ROADMAP 2.7: cloud-saves version history. Each overwrite of a game_saves row
+    // archives the PRIOR bytes here so a user can roll back / recover a clobbered
+    // save. Pruned to the most recent SAVE_VERSION_KEEP per (user,game,path).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_save_versions (
+            version_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            user_id BIGINT UNSIGNED NOT NULL,
+            game_id VARCHAR(128) NOT NULL,
+            rel_path VARCHAR(400) NOT NULL,
+            data LONGBLOB NOT NULL,
+            mtime BIGINT NOT NULL DEFAULT 0,
+            created_at BIGINT NOT NULL DEFAULT 0,
+            INDEX idx_sv_file (user_id, game_id, rel_path(191), version_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // ROADMAP 2.8: cloud config sync. Generic per-account, per-namespace JSON blob
+    // (settings, favorites, controller-mappings, metadata-edits, …). Last-write-wins;
+    // the client owns each namespace's schema. Generalizes the single 0.5 prefs blob.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS user_config (
+            user_id BIGINT UNSIGNED NOT NULL,
+            namespace VARCHAR(64) NOT NULL,
+            data MEDIUMTEXT NOT NULL,
+            updated_at BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, namespace)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;

@@ -5,3 +5,7 @@ target/
 # Host-runner helper scripts / scratch (not server source)
 *.ps1
 scr111.png
+
+# Local-only handoff/secrets docs — internal IPs + AD/Cloudflare object IDs, never commit (public repo)
+*.local.md
+ADMIN_ACCESS_HANDOFF.local.md

@@ -236,6 +236,95 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // ROADMAP 2.4: per-account tags (comma-separated) + free-form note on a game.
+    let _ = c
+        .query_drop("ALTER TABLE game_stats ADD COLUMN tags VARCHAR(512) NOT NULL DEFAULT ''")
+        .await;
+    let _ = c
+        .query_drop("ALTER TABLE game_stats ADD COLUMN notes TEXT NULL")
+        .await;
+    // ROADMAP 2.5: user-defined collections. kind='manual' (explicit membership in
+    // game_collection_items) or 'smart' (rules JSON evaluated client-side against
+    // library stats; stored opaquely here). pinned floats favorites to the top.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_collections (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NOT NULL,
+          name VARCHAR(120) NOT NULL,
+          kind VARCHAR(16) NOT NULL DEFAULT 'manual',
+          rules TEXT NULL,
+          pinned TINYINT NOT NULL DEFAULT 0,
+          sort_order INT NOT NULL DEFAULT 0,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL,
+          INDEX idx_coll_user (user_id, pinned, sort_order)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_collection_items (
+          collection_id BIGINT UNSIGNED NOT NULL,
+          game_id VARCHAR(80) NOT NULL,
+          added_at BIGINT NOT NULL,
+          PRIMARY KEY (collection_id, game_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // ROADMAP 2.6: per-account, per-game launch profile. One opaque JSON blob holding
+    // launch args, emulator profile, controller profile, multi-disc list, etc. The
+    // client owns the schema and the actual launching; the server only syncs the blob
+    // across devices (last-write-wins, like social_user_prefs).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_launch_profiles (
+          user_id BIGINT UNSIGNED NOT NULL,
+          game_id VARCHAR(80) NOT NULL,
+          profile MEDIUMTEXT NOT NULL,
+          updated_at BIGINT NOT NULL,
+          PRIMARY KEY (user_id, game_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // ROADMAP 3.7: per-account game reviews (one per user per game) + a server-
+    // generated activity feed surfaced to a user's friends.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_reviews (
+          user_id BIGINT UNSIGNED NOT NULL,
+          game_id VARCHAR(80) NOT NULL,
+          rating TINYINT NOT NULL DEFAULT 0,
+          body TEXT NULL,
+          updated_at BIGINT NOT NULL,
+          PRIMARY KEY (user_id, game_id),
+          INDEX idx_review_game (game_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // ROADMAP 3.7: user screenshots — reuses the 1.3 MinIO attachment pipeline. One
+    // row links an uploaded attachment to a game + uploader with an optional caption.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS game_screenshots (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NOT NULL,
+          game_id VARCHAR(80) NOT NULL,
+          attachment_id BIGINT UNSIGNED NOT NULL,
+          caption VARCHAR(280) NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_shot_game (game_id, id),
+          INDEX idx_shot_user (user_id, id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS social_activity (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          user_id BIGINT UNSIGNED NOT NULL,
+          kind VARCHAR(32) NOT NULL,
+          game_id VARCHAR(80) NULL,
+          payload TEXT NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_activity_user (user_id, id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2551,9 +2640,10 @@ async fn api_library_stats(State(st): State<AppState>, headers: HeaderMap) -> Re
         Ok(c) => c,
         Err(e) => return server_error(e),
     };
-    let rows: Vec<(String, i64, i64, i64, i8, i8)> = match c
+    let rows: Vec<(String, i64, i64, i64, i8, i8, String, Option<String>)> = match c
         .exec(
-            r#"SELECT game_id, playtime_seconds, last_played, play_count, completion, rating
+            r#"SELECT game_id, playtime_seconds, last_played, play_count, completion, rating,
+                      tags, notes
                FROM game_stats WHERE user_id=:id"#,
             params! {"id" => me.id},
         )
@@ -2564,7 +2654,9 @@ async fn api_library_stats(State(st): State<AppState>, headers: HeaderMap) -> Re
     };
     let out: Vec<_> = rows
         .into_iter()
-        .map(|(game_id, secs, last, count, comp, rating)| {
+        .map(|(game_id, secs, last, count, comp, rating, tags, notes)| {
+            let tag_list: Vec<&str> =
+                tags.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
             serde_json::json!({
                 "gameId": game_id,
                 "playtimeSeconds": secs,
@@ -2572,6 +2664,8 @@ async fn api_library_stats(State(st): State<AppState>, headers: HeaderMap) -> Re
                 "playCount": count,
                 "completion": comp,
                 "rating": rating,
+                "tags": tag_list,
+                "notes": notes.unwrap_or_default(),
             })
         })
         .collect();
@@ -2624,6 +2718,10 @@ async fn api_library_playtime(
         .await
     {
         return server_error(e);
+    }
+    // ROADMAP 3.7: surface meaningful sessions (≥5 min) on the friends activity feed.
+    if secs >= 300 {
+        record_activity(&st, me.id, "played", Some(&gid), Some(serde_json::json!({"seconds": secs}))).await;
     }
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
@@ -2682,5 +2780,801 @@ async fn api_library_rating(
             )
             .await;
     }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LibraryMetaBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+// POST /api/library/meta — set the caller's tags and/or notes for a game
+// (ROADMAP 2.4). Tags are normalized (trimmed, lowercased, deduped, ≤20 tags,
+// each ≤32 chars) and stored comma-joined; notes capped at 4000 chars. Either
+// field may be supplied alone. Upserts the row.
+async fn api_library_meta(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LibraryMetaBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let tags_csv = body.tags.map(|tags| {
+        let mut seen: Vec<String> = Vec::new();
+        for t in tags {
+            let norm: String = t.trim().to_lowercase().chars().take(32).collect();
+            if !norm.is_empty() && !seen.iter().any(|s| s == &norm) {
+                seen.push(norm);
+            }
+            if seen.len() >= 20 {
+                break;
+            }
+        }
+        seen.join(",")
+    });
+    let notes = body
+        .notes
+        .map(|n| n.chars().take(4000).collect::<String>());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let now = now();
+    let _ = c
+        .exec_drop(
+            "INSERT IGNORE INTO game_stats (user_id, game_id, updated_at) VALUES (:id, :gid, :now)",
+            params! {"id" => me.id, "gid" => &gid, "now" => now},
+        )
+        .await;
+    if let Some(tags_csv) = tags_csv {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_stats SET tags=:t, updated_at=:now WHERE user_id=:id AND game_id=:gid",
+                params! {"t" => tags_csv, "now" => now, "id" => me.id, "gid" => &gid},
+            )
+            .await;
+    }
+    if let Some(notes) = notes {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_stats SET notes=:n, updated_at=:now WHERE user_id=:id AND game_id=:gid",
+                params! {"n" => notes, "now" => now, "id" => me.id, "gid" => &gid},
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// GET /api/library/duplicates — catalog-wide duplicate detection (ROADMAP 2.5).
+// Groups games whose titles collapse to the same `normalize_title` key and returns
+// only the groups with >1 member, so the client can surface "you have N copies of X
+// across platforms". Catalog-global (not per-account), but auth-gated.
+async fn api_library_duplicates(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if launcher_user(&st, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, String, String)> = match c
+        .exec("SELECT id, title, platform FROM games", ())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let mut groups: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for (id, title, platform) in rows {
+        let key = normalize_title(&title);
+        if key.is_empty() {
+            continue;
+        }
+        groups.entry(key).or_default().push(serde_json::json!({
+            "gameId": id, "title": title, "platform": platform,
+        }));
+    }
+    let mut out: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(key, games)| serde_json::json!({ "key": key, "games": games }))
+        .collect();
+    out.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    Json(serde_json::json!({ "duplicates": out })).into_response()
+}
+
+// ---- ROADMAP 3.7: Reviews + activity feed ----
+
+// Record one activity-feed event for a user (best-effort; never blocks the caller).
+// Each user keeps at most ~200 recent events (pruned opportunistically).
+async fn record_activity(st: &AppState, user_id: u64, kind: &str, game_id: Option<&str>, payload: Option<serde_json::Value>) {
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let payload_str = payload.as_ref().map(|p| p.to_string());
+    let ts = now();
+    let _ = c
+        .exec_drop(
+            r#"INSERT INTO social_activity (user_id, kind, game_id, payload, created_at)
+               VALUES (:u, :k, :g, :p, :t)"#,
+            params! {"u" => user_id, "k" => kind, "g" => game_id, "p" => payload_str, "t" => ts},
+        )
+        .await;
+    // Opportunistic prune: keep the newest 200 per user.
+    let _ = c
+        .exec_drop(
+            r#"DELETE FROM social_activity WHERE user_id=:u AND id NOT IN (
+                 SELECT id FROM (SELECT id FROM social_activity WHERE user_id=:u ORDER BY id DESC LIMIT 200) keep
+               )"#,
+            params! {"u" => user_id},
+        )
+        .await;
+}
+
+#[derive(Deserialize)]
+struct ReviewBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    rating: i8,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+// PUT /api/social/review — upsert the caller's review (rating 1-5 + optional text)
+// for a game. Posts a `review` activity-feed event.
+async fn api_social_review_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReviewBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let rating = body.rating.clamp(1, 5);
+    let text: Option<String> = body.body.map(|b| b.chars().take(4000).collect());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let now = now();
+    if let Err(e) = c
+        .exec_drop(
+            r#"INSERT INTO game_reviews (user_id, game_id, rating, body, updated_at)
+               VALUES (:u, :g, :r, :b, :t)
+               ON DUPLICATE KEY UPDATE rating=VALUES(rating), body=VALUES(body), updated_at=VALUES(updated_at)"#,
+            params! {"u" => me.id, "g" => &gid, "r" => rating, "b" => &text, "t" => now},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    record_activity(&st, me.id, "review", Some(&gid), Some(serde_json::json!({"rating": rating}))).await;
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// DELETE /api/social/review/:gameId — remove the caller's review.
+async fn api_social_review_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(game_id): AxumPath<String>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = game_id.chars().take(80).collect();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let _ = c
+        .exec_drop(
+            "DELETE FROM game_reviews WHERE user_id=:u AND game_id=:g",
+            params! {"u" => me.id, "g" => &gid},
+        )
+        .await;
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// GET /api/social/reviews/:gameId — all reviews for a game (with reviewer username
+// + avatar version), plus the aggregate average + count.
+async fn api_social_reviews_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(game_id): AxumPath<String>,
+) -> Response {
+    if launcher_user(&st, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let gid: String = game_id.chars().take(80).collect();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(u64, String, i8, Option<String>, i64)> = match c
+        .exec(
+            r#"SELECT r.user_id, COALESCE(u.username,''), r.rating, r.body, r.updated_at
+               FROM game_reviews r LEFT JOIN users u ON u.id = r.user_id
+               WHERE r.game_id=:g ORDER BY r.updated_at DESC"#,
+            params! {"g" => &gid},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let count = rows.len();
+    let sum: i64 = rows.iter().map(|r| r.2 as i64).sum();
+    let avg = if count > 0 { sum as f64 / count as f64 } else { 0.0 };
+    let reviews: Vec<_> = rows
+        .into_iter()
+        .map(|(uid, uname, rating, body, updated)| {
+            serde_json::json!({
+                "userId": uid, "username": uname, "rating": rating,
+                "body": body.unwrap_or_default(), "updatedAt": updated,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "gameId": gid, "average": avg, "count": count, "reviews": reviews }))
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ScreenshotBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "attachmentId")]
+    attachment_id: u64,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+// POST /api/social/screenshot — register an already-uploaded attachment (via the 1.3
+// presign flow) as a screenshot for a game. Caller must own the attachment. Emits a
+// `screenshot` activity-feed event.
+async fn api_social_screenshot_create(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ScreenshotBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let caption: Option<String> = body.caption.map(|c| c.chars().take(280).collect());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    // Verify the attachment exists and is owned by the caller.
+    let owner: Option<u64> = c
+        .exec_first(
+            "SELECT owner_id FROM social_attachments WHERE id=:a",
+            params! {"a" => body.attachment_id},
+        )
+        .await
+        .ok()
+        .flatten();
+    if owner != Some(me.id) {
+        return (StatusCode::FORBIDDEN, "not your attachment").into_response();
+    }
+    let ts = now();
+    let ins = c
+        .exec_iter(
+            r#"INSERT INTO game_screenshots (user_id, game_id, attachment_id, caption, created_at)
+               VALUES (:u, :g, :a, :cap, :t)"#,
+            params! {"u" => me.id, "g" => &gid, "a" => body.attachment_id, "cap" => &caption, "t" => ts},
+        )
+        .await;
+    let id = match ins {
+        Ok(r) => r.last_insert_id().unwrap_or(0),
+        Err(e) => return server_error(e),
+    };
+    record_activity(&st, me.id, "screenshot", Some(&gid), Some(serde_json::json!({"screenshotId": id}))).await;
+    Json(serde_json::json!({ "status": "ok", "id": id })).into_response()
+}
+
+// DELETE /api/social/screenshot/:id — remove the caller's screenshot (metadata only;
+// the underlying attachment object is left to the attachment lifecycle).
+async fn api_social_screenshot_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let _ = c
+        .exec_drop(
+            "DELETE FROM game_screenshots WHERE id=:i AND user_id=:u",
+            params! {"i" => id, "u" => me.id},
+        )
+        .await;
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// GET /api/social/screenshots/:gameId — recent screenshots for a game (≤50), each
+// with uploader + a short-lived presigned GET URL for the image. 503 if object
+// storage isn't configured.
+async fn api_social_screenshots_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(game_id): AxumPath<String>,
+) -> Response {
+    if launcher_user(&st, &headers).await.is_none() {
+        return unauthorized();
+    }
+    let Some(s3) = st.cfg.s3.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Attachments not configured").into_response();
+    };
+    let gid: String = game_id.chars().take(80).collect();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(u64, u64, String, Option<String>, String, i64)> = match c
+        .exec(
+            r#"SELECT s.id, s.user_id, COALESCE(u.username,''), s.caption, a.object_key, s.created_at
+               FROM game_screenshots s
+               JOIN social_attachments a ON a.id = s.attachment_id
+               LEFT JOIN users u ON u.id = s.user_id
+               WHERE s.game_id=:g ORDER BY s.id DESC LIMIT 50"#,
+            params! {"g" => &gid},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let out: Vec<_> = rows
+        .into_iter()
+        .map(|(id, uid, uname, caption, object_key, created)| {
+            let url = s3_presign(s3, "GET", &object_key, ATTACHMENT_URL_TTL_SECS);
+            serde_json::json!({
+                "id": id, "userId": uid, "username": uname,
+                "caption": caption.unwrap_or_default(), "url": url, "createdAt": created,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "gameId": gid, "screenshots": out })).into_response()
+}
+
+// GET /api/social/activity — recent activity from the caller and their accepted
+// friends (newest first, ≤100), with author username.
+async fn api_social_activity(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut ids = friend_ids(&st.db, me.id).await;
+    ids.push(me.id);
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    // Build an IN (...) list of trusted, server-derived integer ids.
+    let in_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        r#"SELECT a.id, a.user_id, COALESCE(u.username,''), a.kind, a.game_id, a.payload, a.created_at
+           FROM social_activity a LEFT JOIN users u ON u.id = a.user_id
+           WHERE a.user_id IN ({in_list}) ORDER BY a.id DESC LIMIT 100"#
+    );
+    let rows: Vec<(u64, u64, String, String, Option<String>, Option<String>, i64)> =
+        match c.exec(sql, ()).await {
+            Ok(r) => r,
+            Err(e) => return server_error(e),
+        };
+    let out: Vec<_> = rows
+        .into_iter()
+        .map(|(id, uid, uname, kind, gid, payload, created)| {
+            let pv = payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "id": id, "userId": uid, "username": uname, "kind": kind,
+                "gameId": gid, "payload": pv, "createdAt": created,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "activity": out })).into_response()
+}
+
+// ---- ROADMAP 2.6: Launch profiles (config sync) ----
+
+// GET /api/library/launch-profiles — all of the caller's per-game launch profile
+// blobs, as a { gameId: profileJson } map. Profiles are opaque to the server.
+async fn api_library_launch_profiles(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, String)> = match c
+        .exec(
+            "SELECT game_id, profile FROM game_launch_profiles WHERE user_id=:id",
+            params! {"id" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let mut map = serde_json::Map::new();
+    for (gid, profile) in rows {
+        let val = serde_json::from_str::<serde_json::Value>(&profile)
+            .unwrap_or(serde_json::Value::String(profile));
+        map.insert(gid, val);
+    }
+    Json(serde_json::json!({ "profiles": map })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LaunchProfileBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    // The full profile object; stored verbatim as JSON. `null`/absent deletes it.
+    #[serde(default)]
+    profile: Option<serde_json::Value>,
+}
+
+// POST /api/library/launch-profile — upsert (or, with null profile, delete) the
+// caller's launch profile for one game. Blob capped at 64 KiB.
+async fn api_library_launch_profile_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LaunchProfileBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let now = now();
+    match body.profile {
+        None | Some(serde_json::Value::Null) => {
+            let _ = c
+                .exec_drop(
+                    "DELETE FROM game_launch_profiles WHERE user_id=:id AND game_id=:gid",
+                    params! {"id" => me.id, "gid" => &gid},
+                )
+                .await;
+        }
+        Some(v) => {
+            let blob = v.to_string();
+            if blob.len() > 64 * 1024 {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "profile too large").into_response();
+            }
+            if let Err(e) = c
+                .exec_drop(
+                    r#"INSERT INTO game_launch_profiles (user_id, game_id, profile, updated_at)
+                       VALUES (:id, :gid, :p, :now)
+                       ON DUPLICATE KEY UPDATE profile=:p, updated_at=:now"#,
+                    params! {"id" => me.id, "gid" => &gid, "p" => &blob, "now" => now},
+                )
+                .await
+            {
+                return server_error(e);
+            }
+        }
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// ---- ROADMAP 2.5: Library organization (collections) ----
+
+// GET /api/library/collections — the caller's collections, each with its member
+// game ids (manual) and item count. Smart collections carry their opaque `rules`
+// JSON for the client to evaluate; their items array is empty.
+async fn api_library_collections(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let cols: Vec<(u64, String, String, Option<String>, i8, i32)> = match c
+        .exec(
+            r#"SELECT id, name, kind, rules, pinned, sort_order FROM game_collections
+               WHERE user_id=:id ORDER BY pinned DESC, sort_order ASC, id ASC"#,
+            params! {"id" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let mut out = Vec::with_capacity(cols.len());
+    for (id, name, kind, rules, pinned, sort_order) in cols {
+        let items: Vec<String> = c
+            .exec(
+                "SELECT game_id FROM game_collection_items WHERE collection_id=:cid ORDER BY added_at ASC",
+                params! {"cid" => id},
+            )
+            .await
+            .unwrap_or_default();
+        out.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "kind": kind,
+            "rules": rules.unwrap_or_default(),
+            "pinned": pinned != 0,
+            "sortOrder": sort_order,
+            "items": items,
+            "count": items.len(),
+        }));
+    }
+    Json(serde_json::json!({ "collections": out })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollectionBody {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    rules: Option<String>,
+}
+
+// POST /api/library/collections — create a collection (cap 200/account).
+async fn api_library_collection_create(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CollectionBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let name: String = body.name.trim().chars().take(120).collect();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name required").into_response();
+    }
+    let kind = match body.kind.as_deref() {
+        Some("smart") => "smart",
+        _ => "manual",
+    };
+    let rules: Option<String> = body.rules.map(|r| r.chars().take(4000).collect());
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let n: Option<u64> = c
+        .exec_first(
+            "SELECT COUNT(*) FROM game_collections WHERE user_id=:id",
+            params! {"id" => me.id},
+        )
+        .await
+        .ok()
+        .flatten();
+    if n.unwrap_or(0) >= 200 {
+        return (StatusCode::TOO_MANY_REQUESTS, "collection limit reached").into_response();
+    }
+    let now = now();
+    if let Err(e) = c
+        .exec_drop(
+            r#"INSERT INTO game_collections (user_id, name, kind, rules, created_at, updated_at)
+               VALUES (:id, :name, :kind, :rules, :now, :now)"#,
+            params! {"id" => me.id, "name" => &name, "kind" => kind, "rules" => &rules, "now" => now},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    let id: Option<u64> = c.exec_first("SELECT LAST_INSERT_ID()", ()).await.ok().flatten();
+    Json(serde_json::json!({ "status": "ok", "id": id.unwrap_or(0) })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollectionUpdateBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    rules: Option<String>,
+    #[serde(default)]
+    pinned: Option<bool>,
+    #[serde(rename = "sortOrder", default)]
+    sort_order: Option<i32>,
+}
+
+// PUT /api/library/collections/:id — update name/rules/pinned/sortOrder (owner only).
+async fn api_library_collection_update(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(cid): AxumPath<u64>,
+    Json(body): Json<CollectionUpdateBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let owner: Option<u64> = c
+        .exec_first(
+            "SELECT user_id FROM game_collections WHERE id=:cid",
+            params! {"cid" => cid},
+        )
+        .await
+        .ok()
+        .flatten();
+    if owner != Some(me.id) {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    }
+    let now = now();
+    if let Some(name) = body.name {
+        let name: String = name.trim().chars().take(120).collect();
+        if !name.is_empty() {
+            let _ = c
+                .exec_drop(
+                    "UPDATE game_collections SET name=:v, updated_at=:now WHERE id=:cid",
+                    params! {"v" => &name, "now" => now, "cid" => cid},
+                )
+                .await;
+        }
+    }
+    if let Some(rules) = body.rules {
+        let rules: String = rules.chars().take(4000).collect();
+        let _ = c
+            .exec_drop(
+                "UPDATE game_collections SET rules=:v, updated_at=:now WHERE id=:cid",
+                params! {"v" => &rules, "now" => now, "cid" => cid},
+            )
+            .await;
+    }
+    if let Some(pinned) = body.pinned {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_collections SET pinned=:v, updated_at=:now WHERE id=:cid",
+                params! {"v" => if pinned {1} else {0}, "now" => now, "cid" => cid},
+            )
+            .await;
+    }
+    if let Some(so) = body.sort_order {
+        let _ = c
+            .exec_drop(
+                "UPDATE game_collections SET sort_order=:v, updated_at=:now WHERE id=:cid",
+                params! {"v" => so, "now" => now, "cid" => cid},
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// DELETE /api/library/collections/:id — delete a collection and its items (owner only).
+async fn api_library_collection_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(cid): AxumPath<u64>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let owner: Option<u64> = c
+        .exec_first(
+            "SELECT user_id FROM game_collections WHERE id=:cid",
+            params! {"cid" => cid},
+        )
+        .await
+        .ok()
+        .flatten();
+    if owner != Some(me.id) {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    }
+    let _ = c
+        .exec_drop(
+            "DELETE FROM game_collection_items WHERE collection_id=:cid",
+            params! {"cid" => cid},
+        )
+        .await;
+    let _ = c
+        .exec_drop(
+            "DELETE FROM game_collections WHERE id=:cid",
+            params! {"cid" => cid},
+        )
+        .await;
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollectionItemBody {
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(default = "default_true")]
+    add: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// POST /api/library/collections/:id/items — add (add=true) or remove a game from a
+// manual collection (owner only). Smart collections reject membership edits.
+async fn api_library_collection_items(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(cid): AxumPath<u64>,
+    Json(body): Json<CollectionItemBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let gid: String = body.game_id.chars().take(80).collect();
+    if gid.is_empty() {
+        return (StatusCode::BAD_REQUEST, "gameId required").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let row: Option<(u64, String)> = c
+        .exec_first(
+            "SELECT user_id, kind FROM game_collections WHERE id=:cid",
+            params! {"cid" => cid},
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some((owner, kind)) = row else {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    };
+    if owner != me.id {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    }
+    if kind == "smart" {
+        return (StatusCode::BAD_REQUEST, "smart collection membership is rule-based").into_response();
+    }
+    let now = now();
+    if body.add {
+        let _ = c
+            .exec_drop(
+                "INSERT IGNORE INTO game_collection_items (collection_id, game_id, added_at) VALUES (:cid, :gid, :now)",
+                params! {"cid" => cid, "gid" => &gid, "now" => now},
+            )
+            .await;
+    } else {
+        let _ = c
+            .exec_drop(
+                "DELETE FROM game_collection_items WHERE collection_id=:cid AND game_id=:gid",
+                params! {"cid" => cid, "gid" => &gid},
+            )
+            .await;
+    }
+    let _ = c
+        .exec_drop(
+            "UPDATE game_collections SET updated_at=:now WHERE id=:cid",
+            params! {"now" => now, "cid" => cid},
+        )
+        .await;
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
