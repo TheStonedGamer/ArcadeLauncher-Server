@@ -76,6 +76,11 @@ include!("social_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");
 
+// The former standalone Requests service, folded in as a real module (NOT an
+// include!) so its same-named helpers stay namespaced. Mounted under /requests
+// on the public app in main(). See requests_app.rs.
+mod requests_app;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -101,7 +106,14 @@ async fn main() -> Result<()> {
         challenges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         login_throttle: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
+    // Build the folded-in Requests sub-app (reuses the server's DB pool) and
+    // mount it under /requests. nest_service is used because the sub-app already
+    // has its own state applied (Router<()>). nginx routes external /requests
+    // here, so the old :8723 binary can be retired after deploy.
+    let requests_router = requests_app::router(state.db.clone()).await?;
+
     let public_app = Router::new()
+        .nest_service("/requests", requests_router)
         .route("/api/login", post(api_login))
         .route("/api/auth/login", post(api_auth_login))
         .route("/api/auth/logout", post(api_auth_logout))

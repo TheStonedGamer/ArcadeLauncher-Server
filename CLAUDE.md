@@ -27,6 +27,16 @@ exactly as when it was one file. To find code, open the file by topic:
   relay). `ws_social` authenticates the `?token=` query param (or `Authorization:
   Bearer`) **before** `ws.on_upgrade`; `social_socket` runs the in/out pump.
 
+**`requests_app.rs` is the ONE exception to the include! pattern** — it is a real
+`mod requests_app;` (declared in `main.rs`), NOT an `include!`. It holds the
+former standalone *Requests* service (was its own binary on :8723), folded in so
+its many same-named helpers (`now`, `constant_eq`, `Config`, `User`, `Session`,
+`igdb_*`, `health`, `ensure_schema`, …) stay namespaced and don't collide with the
+crate-root items. `requests_app::router(db)` builds a `Router<()>` mounted via
+`nest_service("/requests", …)` on the public app; it reuses the server's MariaDB
+pool and only writes its own `game_requests` / `request_*` tables. The board's
+static page is `src/requests_index.html`.
+
 When editing, prefer the relevant file; only edits to the `use` block, shared
 consts, `main`, or tests touch `main.rs`. The compiled binary is identical to the
 former single-file build.
