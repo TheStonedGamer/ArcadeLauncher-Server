@@ -6,6 +6,34 @@ _Last updated: 2026-06-21_
 admin HTML UI rendered via `format!`. Serves the `ArcadeLauncher-Client` Windows launcher. See the
 client's `HANDOFF.md` for the full cross-cutting picture; this file is server-/infra-focused.
 
+## Roadmap 2.4-3.7 server slices (2026-06-21, prod **0.10.12** LIVE)
+- Shipped + deployed to CT `10.0.0.210` and verified (`/api/health` = 0.10.12, new endpoints
+  return data / clean 401s; schema migrated clean on boot):
+  - **2.4** library tracking (`game_stats` + tags/notes): `/api/library/{stats,playtime,rating,meta}`
+  - **2.5** collections (`game_collections`/`_items`, manual+smart) + `/api/library/duplicates`
+  - **2.6** launch profiles (`game_launch_profiles`): `/api/library/launch-profile(s)`
+  - **2.7** Cloud Saves v2: `game_save_versions` (history/backups/restore) + `baseMtime` 409 conflict;
+    `/api/saves/:id/{versions,version,restore}`
+  - **2.8** cloud config sync (`user_config`): `/api/config`, `/api/config/:ns`
+  - **3.4** observability: `GET /api/metrics` (Prometheus text). **Prometheus on `10.0.0.235`
+    now scrapes it** (job `arcadelauncher`, `metrics_path:/api/metrics`, target `10.0.0.210:8721`,
+    config backed up to `prometheus.yml.bak.*`, validated + reloaded). Grafana can graph `arcade_*`.
+  - **3.5** feature flags (`/api/feature-flags`, `feature_flags` server setting) + full-text
+    `GET /api/games/search?q=` (FULLTEXT over title/summary/genres, LIKE fallback)
+  - **3.7** reviews (`/api/social/review(s)`), friends **activity feed** (`/api/social/activity`,
+    server-generated on ≥5-min sessions/reviews/screenshots), **screenshots**
+    (`/api/social/screenshot(s)`, reuses the 1.3 MinIO attachment pipeline)
+- **Bug caught + fixed before it bit:** new social/metrics queries had joined a nonexistent `users`
+  table (launcher accounts live in **`admin_users`**) — would 500 / silently read 0. Fixed in `496480b`.
+- **Security fix:** `ADMIN_ACCESS_HANDOFF.local.md` was NOT actually gitignored despite the claim;
+  added `*.local.md` to `.gitignore` so it can't leak to the public repo.
+- **Not server-sliceable (CLIENT/native, in `ArcadeLauncher-Unified-Client`):** 2.1 Voice v2 (Opus),
+  2.3 SFU client + group calls, 3.2 notif routing/grouping/push, 3.3 Download v2, 3.6 Big Picture,
+  and the consuming UI for all of the above. 2.2 server half (coturn + `/api/social/turn`) already lived.
+- **Deploy gotcha:** the CT clone `/root/build-arcade` was on branch `master` with no upstream, so
+  `git pull --ff-only` silently no-ops. Fixed with `git checkout -B main origin/main`; future deploys
+  use `git fetch origin && git reset --hard origin/main`.
+
 ## Recent changes (2026-06-21, prod 0.10.9)
 - **Self-service registration + email** shipped: `registration.rs` (POST `/api/auth/register`,
   GET `/api/auth/approve|deny`) and `password_reset.rs` (forgot/reset). New-signup emails go to **every
