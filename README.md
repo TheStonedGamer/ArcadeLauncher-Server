@@ -136,30 +136,26 @@ ARCADE_SMTP_TLS=1
 
 If SMTP is not configured, the reset page still creates a temporary reset URL and displays it after request. That fallback is for LAN/recovery use only.
 
-## Game Requests (companion service)
+## Game Requests (folded in, under `/requests`)
 
-Game requests are handled by a separate binary,
-[**ArcadeLauncher-Requests**](https://github.com/TheStonedGamer/ArcadeLauncher-Requests),
-that runs alongside this server. It lets logged-in launcher users request game
-releases they'd like added to the catalog, search IGDB to pick the exact
-release, and upvote each other's requests; admins triage the board
-(approve / fulfill / decline).
+The Game Requests board is **part of this server**. It lets logged-in launcher
+users request game releases they'd like added to the catalog, search IGDB to pick
+the exact release, and upvote each other's requests; admins triage the board
+(approve / fulfill / decline) from the admin UI at `/admin/requests`.
 
-It is intentionally decoupled from this server:
+It was once a separate `ArcadeLauncher-Requests` binary on its own port (`8723`);
+it is now a namespaced module (`mod requests_app`, the one exception to the
+`include!` layout — see [`CLAUDE.md`](CLAUDE.md)) mounted via
+`nest_service("/requests", …)` on the public app. The standalone repo is dormant
+origin history and the `:8723` systemd unit is retired.
 
-- **Shares the same MariaDB and launcher accounts.** It authenticates against
-  this server's `admin_users` table (same usernames/passwords/TOTP) and reads
-  IGDB credentials from the same `server_settings` table — no duplicated
-  secrets. It owns only three tables (`game_requests`, `request_votes`,
-  `request_sessions`) and never modifies this server's tables.
-- **Runs on its own port** (`8723`) with its own session cookie.
-- **Emails the admin on each brand-new request** (fire-and-forget; configured
-  via its own `ARCADE_REQ_SMTP_*` / `ARCADE_REQ_NOTIFY_TO` env vars). Upvotes of
-  an existing request do not send mail.
-
-Because it shares the database, deploy it on the same host/CT as this server and
-point it at the same DB credentials. See the Requests repo's README for its full
-endpoint list and environment configuration.
+- **Reuses this server's MariaDB pool and launcher accounts.** It authenticates
+  against `admin_users` + `launcher_tokens` (so the unified client's Requests tab
+  uses the launcher's own bearer token) and reads IGDB credentials from
+  `server_settings` — no duplicated secrets. It owns only the `game_requests` /
+  `request_votes` / `request_ratings` tables and never modifies other tables.
+- **No extra process, port, or env file** — it ships in the single
+  `arcadelauncher-server` binary and shares its config and deploy path.
 
 ## API
 

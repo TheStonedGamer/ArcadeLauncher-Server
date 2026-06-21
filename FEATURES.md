@@ -2,7 +2,7 @@
 
 > This document is **identical in both repos** (`ArcadeLauncher-Client` and
 > `ArcadeLauncher-Server`) and describes the whole platform — the native Windows
-> launcher, the Rust backend, the social subsystem, and the companion services —
+> launcher, the Rust backend, the social subsystem, and the Game Requests board —
 > as a single product. Keep the two copies in sync when editing.
 
 ArcadeLauncher is a private, self-hosted game platform: a native Windows launcher
@@ -306,21 +306,21 @@ A persistent, full-duplex social layer shared between the launcher's
 
 ---
 
-## 4. Companion service — Game Requests
+## 4. Game Requests board (folded into the server)
 
-A separate binary, **ArcadeLauncher-Requests**, runs alongside the server and
-provides a community request board:
+A community request board lives **inside this server process**. It was once a
+separate `ArcadeLauncher-Requests` binary on its own port (`8723`); it is now a
+namespaced `mod requests_app` mounted under `/requests` (one binary — the extra
+port/systemd unit is retired, the standalone repo is dormant origin history):
 - Logged-in launcher users **request game releases** to be added to the catalog,
-  **search IGDB** to pick the exact release, and **upvote** each other's
-  requests.
-- Admins triage the board: **approve / fulfill / decline** — now from the main
-  server admin UI (`/admin/requests`), which updates the shared `game_requests`
-  table directly (the client board no longer carries an inline admin dropdown).
-- Intentionally decoupled: it shares the same MariaDB and launcher accounts
-  (authenticating against the server's `admin_users` table and reading IGDB
-  credentials from `server_settings` — no duplicated secrets), owns only its own
-  three tables, runs on its own port (`8723`) with its own session cookie, and
-  emails the admin on each brand-new request.
+  **search IGDB** to pick the exact release, and **upvote** each other's requests.
+- Admins triage the board: **approve / fulfill / decline** from the main server
+  admin UI (`/admin/requests`), which updates the shared `game_requests` table
+  directly (the client board shows a read-only status badge only).
+- Reuses the server's MariaDB pool and launcher accounts (same `admin_users` +
+  `launcher_tokens`; IGDB credentials from `server_settings` — no duplicated
+  secrets) and owns only its `game_requests` / `request_*` tables. Bearer-authed,
+  so the unified client's in-app Requests tab uses the launcher's own token.
 
 ---
 

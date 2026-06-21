@@ -52,9 +52,11 @@ client's `HANDOFF.md` for the full cross-cutting picture; this file is server-/i
   `cargo build --release` → install → restart. `/root/build-arcade` is a git clone of the (public) repo.
   Pull picks up the CI `VERSION` bump automatically. **Startup binds ~25s after restart** (schema + fs
   watcher) — poll `/api/health` for ~30s; don't mistake the gap for a failure.
-- **Companion Requests service 502 fix** (separate repo `ArcadeLauncher-Requests`): board load panicked
-  reading a NULL `AVG(stars)` into `f64`; now read via `Option<f64>` + `CAST(... AS DOUBLE)`. That repo is
-  **private** and the CT has no GitHub creds, so it still deploys via **scp** (no git-pull there yet).
+- **Requests board folded into the server:** the former standalone `ArcadeLauncher-Requests` binary (its
+  own `:8723` systemd unit) is now `mod requests_app` mounted under `/requests` in this server (one binary;
+  `:8723` retired, standalone repo dormant). It reuses this server's DB pool + launcher bearer tokens and
+  deploys via the same git-pull path. (Historical: a 502 on board load — NULL `AVG(stars)` into `f64` —
+  was fixed via `Option<f64>` + `CAST(... AS DOUBLE)` before the fold-in.)
 
 ## Repos / hosts
 - Server: `C:\Users\BrianTheMint\source\repos\ArcadeLauncher-Server` — `github.com/TheStonedGamer/ArcadeLauncher-Server`
