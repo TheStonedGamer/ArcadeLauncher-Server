@@ -67,6 +67,7 @@ include!("scan_jobs.rs");
 include!("igdb.rs");
 include!("scan.rs");
 include!("admin_html.rs");
+include!("admin_extra.rs");
 include!("discord.rs");
 include!("users_api.rs");
 include!("fanout.rs");
@@ -183,6 +184,8 @@ async fn main() -> Result<()> {
         .route("/", get(admin_page))
         .route("/admin", get(admin_page).post(admin_post))
         .route("/admin/metadata", get(admin_metadata_page).post(admin_metadata_post))
+        .route("/admin/accounts", get(admin_accounts_page).post(admin_post))
+        .route("/admin/requests", get(admin_requests_page).post(admin_post))
         .route("/admin/login", get(admin_page).post(admin_post))
         .route("/admin/logout", get(admin_logout))
         .route("/admin/scan-status", get(admin_scan_status))

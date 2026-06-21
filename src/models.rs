@@ -452,6 +452,14 @@ struct AdminForm {
     changelog_version: Option<String>,
     changelog_title: Option<String>,
     changelog_body: Option<String>,
+    // Which admin page a POST should re-render ("accounts" / "requests"); empty
+    // → the main dashboard. Lets the shared admin_post dispatch serve all pages.
+    return_to: Option<String>,
+    // Pending-signup approval (approve_pending / deny_pending actions).
+    pending_id: Option<u64>,
+    // Game-request triage (set_request_status / delete_request actions).
+    request_id: Option<u64>,
+    request_status: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

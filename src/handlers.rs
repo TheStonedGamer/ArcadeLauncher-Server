@@ -231,7 +231,24 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
         };
         let matcher_game_id = form.game_id.clone().unwrap_or_default();
         let matcher_query = form.search_query.clone().unwrap_or_default();
+        let return_to = form.return_to.clone().unwrap_or_default();
         let msg = match form.action.as_str() {
+            "approve_pending" => match form.pending_id {
+                Some(id) => approve_pending_registration(&st.db, id).await.unwrap_or_else(|e| e.to_string()),
+                None => "missing pending id".to_string(),
+            },
+            "deny_pending" => match form.pending_id {
+                Some(id) => deny_pending_registration(&st.db, id).await.unwrap_or_else(|e| e.to_string()),
+                None => "missing pending id".to_string(),
+            },
+            "set_request_status" => match form.request_id {
+                Some(id) => set_game_request_status(&st.db, id, form.request_status.as_deref().unwrap_or("")).await.unwrap_or_else(|e| e.to_string()),
+                None => "missing request id".to_string(),
+            },
+            "delete_request" => match form.request_id {
+                Some(id) => delete_game_request(&st.db, id).await.unwrap_or_else(|e| e.to_string()),
+                None => "missing request id".to_string(),
+            },
             "add_user" => {
                 let username = form.username.unwrap_or_default();
                 let email = form.email.unwrap_or_default();
@@ -364,7 +381,11 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
             },
             _ => "No action taken.".to_string(),
         };
-        Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response()
+        match return_to.as_str() {
+            "accounts" => Html(accounts_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+            "requests" => Html(requests_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+            _ => Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+        }
     }
 }
 
