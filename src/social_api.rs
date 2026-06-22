@@ -325,6 +325,42 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // T12k-7: account-brokered device discovery. One row per PC signed into the
+    // account; "My PCs" lists these with no IP typing. `online` is NOT stored —
+    // it is derived from `last_seen` freshness (mirror PRESENCE_STALE_SECS), so we
+    // never have to map device_id → live WS connection. lan_addr/mesh_addr are the
+    // advertised connect paths (mesh_addr stays empty until T12k-8 ships); cert_fp
+    // is the host's pairing fingerprint for later brokered auto-pin.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS stream_hosts (
+          user_id BIGINT UNSIGNED NOT NULL,
+          device_id VARCHAR(64) NOT NULL,
+          name VARCHAR(128) NOT NULL DEFAULT '',
+          lan_addr VARCHAR(128) NOT NULL DEFAULT '',
+          mesh_addr VARCHAR(128) NOT NULL DEFAULT '',
+          cert_fp VARCHAR(128) NOT NULL DEFAULT '',
+          last_seen BIGINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // T12k-9: last-known published library per PC, so a device's games are browsable
+    // even while it is asleep (offline → greyed but still listed). game_key is the
+    // client's stable catalog key; cover_ref is a RELATIVE art ref (never an absolute
+    // NAS/server path, per the catalog relative-path rule).
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS stream_host_apps (
+          user_id BIGINT UNSIGNED NOT NULL,
+          device_id VARCHAR(64) NOT NULL,
+          game_key VARCHAR(128) NOT NULL,
+          name VARCHAR(255) NOT NULL DEFAULT '',
+          cover_ref VARCHAR(512) NOT NULL DEFAULT '',
+          last_seen BIGINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, device_id, game_key),
+          INDEX idx_hostapp_dev (user_id, device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1541,6 +1577,254 @@ async fn api_social_friendmeta_put(
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
+// ----------------------------------------------------------------------------
+// T12k-7 / T12k-9: account-brokered "My PCs" device discovery + per-PC library.
+// ----------------------------------------------------------------------------
+
+// Upsert a device row, stamping last_seen=now so freshness keeps it "online".
+// Shared by the REST register path and the WS stream_host_announce arm. Empty
+// strings (not NULL) for optional fields — the columns are NOT NULL DEFAULT ''.
+async fn upsert_stream_host(
+    db: &Pool,
+    user_id: u64,
+    device_id: &str,
+    name: &str,
+    lan_addr: &str,
+    mesh_addr: &str,
+    cert_fp: &str,
+) {
+    let Ok(mut c) = db.get_conn().await else { return; };
+    let _ = c
+        .exec_drop(
+            r#"INSERT INTO stream_hosts (user_id, device_id, name, lan_addr, mesh_addr, cert_fp, last_seen)
+               VALUES (:u, :d, :n, :l, :m, :f, :t)
+               ON DUPLICATE KEY UPDATE name=:n, lan_addr=:l, mesh_addr=:m, cert_fp=:f, last_seen=:t"#,
+            params! {
+                "u" => user_id, "d" => device_id, "n" => name,
+                "l" => lan_addr, "m" => mesh_addr, "f" => cert_fp, "t" => now(),
+            },
+        )
+        .await;
+}
+
+// GET /api/social/hosts — every PC signed into the caller's account. `online` is
+// derived from last_seen freshness (mirror presence_of), never stored.
+async fn api_social_hosts_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, String, String, String, String, i64)> = match c
+        .exec(
+            "SELECT device_id, name, lan_addr, mesh_addr, cert_fp, last_seen \
+             FROM stream_hosts WHERE user_id=:u ORDER BY name",
+            params! {"u" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let t = now();
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|(device_id, name, lan_addr, mesh_addr, cert_fp, last_seen)| {
+            serde_json::json!({
+                "deviceId": device_id,
+                "name": name,
+                "lanAddr": lan_addr,
+                "meshAddr": mesh_addr,
+                "certFp": cert_fp,
+                "online": (t - last_seen) < PRESENCE_STALE_SECS,
+                "lastSeen": last_seen,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "hosts": items })).into_response()
+}
+
+#[derive(Deserialize)]
+struct StreamHostBody {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "lanAddr")]
+    lan_addr: String,
+    #[serde(default, rename = "meshAddr")]
+    mesh_addr: String,
+    #[serde(default, rename = "certFp")]
+    cert_fp: String,
+}
+
+// POST /api/social/hosts/register — durable upsert of the caller's own device.
+// (The WS announce frame does the same thing on a heartbeat; this is the path a
+// client hits once on sign-in / host-enable so the row exists even before the WS
+// pump warms up.)
+async fn api_social_hosts_register(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StreamHostBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let device_id = body.device_id.chars().take(64).collect::<String>();
+    if device_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing deviceId").into_response();
+    }
+    let name = body.name.chars().take(128).collect::<String>();
+    let lan_addr = body.lan_addr.chars().take(128).collect::<String>();
+    let mesh_addr = body.mesh_addr.chars().take(128).collect::<String>();
+    let cert_fp = body.cert_fp.chars().take(128).collect::<String>();
+    upsert_stream_host(&st.db, me.id, &device_id, &name, &lan_addr, &mesh_addr, &cert_fp).await;
+    // Tell the caller's other devices a host changed so their My PCs refreshes.
+    social_hub().push(
+        me.id,
+        &serde_json::json!({ "type": "stream_host_update", "deviceId": device_id }).to_string(),
+    );
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// DELETE /api/social/hosts/:device_id — forget one of my devices and its apps.
+async fn api_social_host_forget(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(device_id): AxumPath<String>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            "DELETE FROM stream_hosts WHERE user_id=:u AND device_id=:d",
+            params! {"u" => me.id, "d" => &device_id},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    let _ = c
+        .exec_drop(
+            "DELETE FROM stream_host_apps WHERE user_id=:u AND device_id=:d",
+            params! {"u" => me.id, "d" => &device_id},
+        )
+        .await;
+    social_hub().push(
+        me.id,
+        &serde_json::json!({ "type": "stream_host_update", "deviceId": device_id }).to_string(),
+    );
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// GET /api/social/hosts/:device_id/apps — that PC's last-published library.
+async fn api_social_host_apps_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(device_id): AxumPath<String>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, String, String)> = match c
+        .exec(
+            "SELECT game_key, name, cover_ref FROM stream_host_apps \
+             WHERE user_id=:u AND device_id=:d ORDER BY name",
+            params! {"u" => me.id, "d" => &device_id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|(game_key, name, cover_ref)| {
+            serde_json::json!({ "gameKey": game_key, "name": name, "coverRef": cover_ref })
+        })
+        .collect();
+    Json(serde_json::json!({ "apps": items })).into_response()
+}
+
+#[derive(Deserialize)]
+struct StreamHostApp {
+    #[serde(rename = "gameKey")]
+    game_key: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "coverRef")]
+    cover_ref: String,
+}
+
+#[derive(Deserialize)]
+struct StreamHostAppsBody {
+    #[serde(default)]
+    apps: Vec<StreamHostApp>,
+}
+
+// PUT /api/social/hosts/:device_id/apps — publish the caller's library for one of
+// the caller's own devices (full replace). cover_ref must be a RELATIVE art ref.
+async fn api_social_host_apps_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(device_id): AxumPath<String>,
+    Json(body): Json<StreamHostAppsBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let device_id = device_id.chars().take(64).collect::<String>();
+    if device_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing deviceId").into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    // Full replace: clear the device's old library, then insert the new set.
+    if let Err(e) = c
+        .exec_drop(
+            "DELETE FROM stream_host_apps WHERE user_id=:u AND device_id=:d",
+            params! {"u" => me.id, "d" => &device_id},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    let t = now();
+    for app in body.apps.into_iter().take(2000) {
+        let game_key = app.game_key.chars().take(128).collect::<String>();
+        if game_key.is_empty() {
+            continue;
+        }
+        let name = app.name.chars().take(255).collect::<String>();
+        let cover_ref = app.cover_ref.chars().take(512).collect::<String>();
+        let _ = c
+            .exec_drop(
+                "INSERT INTO stream_host_apps (user_id, device_id, game_key, name, cover_ref, last_seen) \
+                 VALUES (:u, :d, :k, :n, :c, :t) \
+                 ON DUPLICATE KEY UPDATE name=:n, cover_ref=:c, last_seen=:t",
+                params! {
+                    "u" => me.id, "d" => &device_id, "k" => game_key,
+                    "n" => name, "c" => cover_ref, "t" => t,
+                },
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     #[serde(default)]
@@ -2288,6 +2572,43 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
                         "type": "voice_signal",
                         "fromId": uid,
                         "payload": env.payload,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        "stream_host_announce" => {
+            // T12k-7 heartbeat: the caller advertises its own device. Gated on the
+            // account (the WS session IS authenticated as uid), NOT on are_friends —
+            // this only ever touches the caller's own rows. Upsert + refresh
+            // last_seen, then notify the caller's OTHER sockets so their My PCs
+            // refreshes. The hub keys user_id → Vec<Conn>, so "all my devices" is free.
+            let p = &env.payload;
+            let s = |k: &str, n: usize| {
+                p.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(n)
+                    .collect::<String>()
+            };
+            let device_id = s("deviceId", 64);
+            if !device_id.is_empty() {
+                upsert_stream_host(
+                    &st.db,
+                    uid,
+                    &device_id,
+                    &s("name", 128),
+                    &s("lanAddr", 128),
+                    &s("meshAddr", 128),
+                    &s("certFp", 128),
+                )
+                .await;
+                social_hub().push(
+                    uid,
+                    &serde_json::json!({
+                        "type": "stream_host_update",
+                        "deviceId": device_id,
                     })
                     .to_string(),
                 );

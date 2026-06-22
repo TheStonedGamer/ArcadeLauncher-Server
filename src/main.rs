@@ -181,6 +181,14 @@ async fn main() -> Result<()> {
         .route("/api/social/screenshot/:id", delete(api_social_screenshot_delete))
         .route("/api/social/screenshots/:id", get(api_social_screenshots_get))
         .route("/api/social/turn", get(api_social_turn))
+        // T12k-7 / T12k-9: account-brokered "My PCs" device discovery + per-PC library.
+        .route("/api/social/hosts", get(api_social_hosts_get))
+        .route("/api/social/hosts/register", post(api_social_hosts_register))
+        .route("/api/social/hosts/:device_id", delete(api_social_host_forget))
+        .route(
+            "/api/social/hosts/:device_id/apps",
+            get(api_social_host_apps_get).put(api_social_host_apps_put),
+        )
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))
         .route("/api/social/attachments/:id", get(api_social_attachment_get))
         .route("/api/social/messages/:id", get(api_social_history))
