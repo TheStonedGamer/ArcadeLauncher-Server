@@ -73,6 +73,7 @@ include!("users_api.rs");
 include!("fanout.rs");
 include!("s3.rs");
 include!("social_api.rs");
+include!("mesh_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");
 
@@ -189,6 +190,8 @@ async fn main() -> Result<()> {
             "/api/social/hosts/:device_id/apps",
             get(api_social_host_apps_get).put(api_social_host_apps_put),
         )
+        // T12k-8: mint a short-lived Headscale pre-auth key for play-from-anywhere.
+        .route("/api/social/mesh/preauth", post(api_social_mesh_preauth))
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))
         .route("/api/social/attachments/:id", get(api_social_attachment_get))
         .route("/api/social/messages/:id", get(api_social_history))
