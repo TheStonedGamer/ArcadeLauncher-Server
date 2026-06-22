@@ -351,55 +351,55 @@ async fn social_test_page_html(st: &AppState, admin: Option<User>, message: &str
             {notice}
 
             <section class="section"><div class="section-heading"><h2>Spawn Fake Friend</h2><span class="muted">Creates a puppet account ([bot]) and instantly friends it to the target. Puppets are tagged by email so cleanup is safe.</span></div>
-              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_spawn">
                 <label>Target<select name="target_id">{target_opts}</select></label>
                 <input name="bot_name" placeholder="Bot username (e.g. TestPal)">
-                <button name="action" value="bot_spawn">Spawn &amp; Friend</button>
+                <button type="submit">Spawn &amp; Friend</button>
               </form>
             </section>
 
             <section class="section"><div class="section-heading"><h2>Set Status / Presence</h2><span class="muted">Pushes a live presence diff to the bot's friends. Presence goes stale after ~70s; re-apply to refresh.</span></div>
               {no_bots_note}
-              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_set_status">
                 <label>Bot<select name="bot_id">{bot_opts}</select></label>
                 <label>State<select name="presence_state">{state_opts}</select></label>
                 <input name="status_text" placeholder="Custom status (optional)">
                 <input name="game_id" placeholder="Game id (for in-game)">
                 <input name="game_title" placeholder="Game title (for in-game)">
-                <button name="action" value="bot_set_status">Apply Status</button>
+                <button type="submit">Apply Status</button>
               </form>
             </section>
 
             <section class="section"><div class="section-heading"><h2>Post Activity</h2><span class="muted">Injects a feed entry authored by the bot. Appears in the target's Activity tab on refresh. Value = seconds played / 0–5 rating.</span></div>
-              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_post_activity">
                 <label>Bot<select name="bot_id">{bot_opts}</select></label>
                 <label>Kind<select name="activity_kind">{kind_opts}</select></label>
                 <input name="game_id" placeholder="Game id (optional)">
                 <input name="activity_value" type="number" value="0">
-                <button name="action" value="bot_post_activity">Post Activity</button>
+                <button type="submit">Post Activity</button>
               </form>
             </section>
 
             <section class="section"><div class="section-heading"><h2>Send DM</h2><span class="muted">Delivers a chat message from the bot to the target, live over the gateway.</span></div>
-              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_send_dm">
                 <label>From bot<select name="bot_id">{bot_opts}</select></label>
                 <label>To<select name="target_id">{all_target_opts}</select></label>
                 <input name="message_body" placeholder="Message text">
-                <button name="action" value="bot_send_dm">Send DM</button>
+                <button type="submit">Send DM</button>
               </form>
             </section>
 
             <section class="section"><div class="section-heading"><h2>Send Friend Request</h2><span class="muted">Creates a pending incoming request from the bot (tests the Requests tab + badge).</span></div>
-              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_send_request">
                 <label>From bot<select name="bot_id">{bot_opts}</select></label>
                 <label>To<select name="target_id">{all_target_opts}</select></label>
-                <button name="action" value="bot_send_request">Send Request</button>
+                <button type="submit">Send Request</button>
               </form>
             </section>
 
             <section class="section"><div class="section-heading"><h2>Cleanup</h2><span class="muted">Deletes all {bot_count} test bot(s) and their friendships, messages, presence, and activity.</span></div>
-              <form method="post" class="inline" onsubmit="return confirm('Delete all test bots and their social data?');"><input type="hidden" name="return_to" value="social-test">
-                <button name="action" value="bot_cleanup" class="danger">Remove All Test Bots</button>
+              <form method="post" class="inline" onsubmit="return confirm('Delete all test bots and their social data?');"><input type="hidden" name="return_to" value="social-test"><input type="hidden" name="action" value="bot_cleanup">
+                <button type="submit" class="danger">Remove All Test Bots</button>
               </form>
             </section>
           </div>
