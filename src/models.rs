@@ -113,6 +113,12 @@ struct Config {
     // when the shared secret + at least one TURN URL are set; otherwise
     // /api/social/turn returns STUN-only and voice falls back to STUN.
     turn: Option<TurnConfig>,
+    // Optional Headscale mesh-VPN control for play-from-anywhere (ROADMAP
+    // T12k-8). Some(...) only when the API URL + API key are set; otherwise
+    // /api/social/mesh/preauth returns 503 and remote-play-over-internet is
+    // dormant (like Redis/S3/TURN above). The launcher uses a minted pre-auth
+    // key to silently join the overlay so its bundled tailscaled reaches a host.
+    headscale: Option<HeadscaleConfig>,
     // Self-service registration (ROADMAP TSd). Closed by default: deploying the
     // binary never silently opens signup — flip ARCADE_REGISTRATION_OPEN=true.
     registration_open: bool,
@@ -148,6 +154,27 @@ struct TurnConfig {
     stun_urls: Vec<String>,
     // Credential lifetime in seconds.
     ttl: i64,
+}
+
+// Headscale control-server connection for the mesh VPN (T12k-8). The server
+// mints short-lived single-use pre-auth keys via Headscale's REST API
+// (`POST {api_url}/api/v1/preauthkey`, `Authorization: Bearer {api_key}`) so a
+// launcher can join the overlay without any interactive Tailscale login. The
+// API key is the Headscale `apikeys create` token and never leaves the server.
+#[derive(Clone)]
+struct HeadscaleConfig {
+    // Control-server base URL, e.g. https://headscale.orlandoaio.net (no trailing
+    // slash). Same host the launcher's bundled tailscaled joins as login server.
+    api_url: String,
+    // Headscale API key (Bearer) used only for the server→Headscale REST calls.
+    api_key: String,
+    // Headscale user/namespace the device nodes are minted under. For the
+    // single-tenant private library this is "arcade"; per-account isolation is a
+    // future enhancement (one Headscale user per ArcadeLauncher account).
+    user: String,
+    // Lifetime of a minted pre-auth key in seconds. Short by design — the
+    // launcher redeems it immediately on join; default 600 (10 min), floored 60.
+    key_ttl: i64,
 }
 
 // S3-compatible object store (MinIO) connection for DM attachments. Path-style
@@ -255,6 +282,23 @@ impl Config {
                         urls,
                         stun_urls,
                         ttl: (env_u64("ARCADE_TURN_TTL", 3600) as i64).max(60),
+                    })
+                }
+            },
+            headscale: {
+                let api_url = env_string("ARCADE_HEADSCALE_API_URL", "").trim_end_matches('/').to_string();
+                let api_key = env_string("ARCADE_HEADSCALE_API_KEY", "");
+                if api_url.is_empty() || api_key.is_empty() {
+                    None
+                } else {
+                    Some(HeadscaleConfig {
+                        api_url,
+                        api_key,
+                        user: {
+                            let u = env_string("ARCADE_HEADSCALE_USER", "arcade");
+                            if u.is_empty() { "arcade".to_string() } else { u }
+                        },
+                        key_ttl: (env_u64("ARCADE_HEADSCALE_KEY_TTL", 600) as i64).max(60),
                     })
                 }
             },
