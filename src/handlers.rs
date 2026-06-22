@@ -379,11 +379,47 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                     .unwrap_or_else(|e| e.to_string()),
                 None => "missing changelog id".to_string(),
             },
+            // ── Social test harness (Social Test admin page) ──
+            "bot_spawn" => match form.target_id {
+                Some(target) => st_spawn_bot(&st, target, form.bot_name.as_deref().unwrap_or("")).await,
+                None => "missing target".to_string(),
+            },
+            "bot_set_status" => match form.bot_id {
+                Some(bot) => st_set_status(
+                    &st,
+                    bot,
+                    form.presence_state.as_deref().unwrap_or("online"),
+                    form.status_text.as_deref().unwrap_or(""),
+                    form.game_id.as_deref().unwrap_or(""),
+                    form.game_title.as_deref().unwrap_or(""),
+                ).await,
+                None => "missing bot".to_string(),
+            },
+            "bot_post_activity" => match form.bot_id {
+                Some(bot) => st_post_activity(
+                    &st,
+                    bot,
+                    form.activity_kind.as_deref().unwrap_or("played"),
+                    form.game_id.as_deref().unwrap_or(""),
+                    form.activity_value.unwrap_or(0),
+                ).await,
+                None => "missing bot".to_string(),
+            },
+            "bot_send_dm" => match (form.bot_id, form.target_id) {
+                (Some(bot), Some(target)) => st_send_dm(&st, bot, target, form.message_body.as_deref().unwrap_or("")).await,
+                _ => "missing bot or target".to_string(),
+            },
+            "bot_send_request" => match (form.bot_id, form.target_id) {
+                (Some(bot), Some(target)) => st_send_request(&st, bot, target).await,
+                _ => "missing bot or target".to_string(),
+            },
+            "bot_cleanup" => st_cleanup_bots(&st).await,
             _ => "No action taken.".to_string(),
         };
         match return_to.as_str() {
             "accounts" => Html(accounts_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
             "requests" => Html(requests_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+            "social-test" => Html(social_test_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
             _ => Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
         }
     }

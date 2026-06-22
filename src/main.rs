@@ -235,6 +235,7 @@ async fn main() -> Result<()> {
         .route("/admin/metadata", get(admin_metadata_page).post(admin_metadata_post))
         .route("/admin/accounts", get(admin_accounts_page).post(admin_post))
         .route("/admin/requests", get(admin_requests_page).post(admin_post))
+        .route("/admin/social-test", get(admin_social_test_page).post(admin_post))
         .route("/admin/login", get(admin_page).post(admin_post))
         .route("/admin/logout", get(admin_logout))
         .route("/admin/scan-status", get(admin_scan_status))

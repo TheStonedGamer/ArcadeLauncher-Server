@@ -6,6 +6,18 @@ _Last updated: 2026-06-21_
 admin HTML UI rendered via `format!`. Serves the `ArcadeLauncher-Client` Windows launcher. See the
 client's `HANDOFF.md` for the full cross-cutting picture; this file is server-/infra-focused.
 
+## Social test harness — admin page (2026-06-21)
+- New admin-only page **`/admin/social-test`** (sidebar entry "Social Test") drives the social
+  subsystem with puppet accounts so friends/status/activity/DMs can be tested against one live
+  client. Spawn `[bot]` accounts (tagged `@bot.invalid`) + auto-friend a target; set presence
+  (live diff); inject activity-feed entries; send DMs + pending friend requests; one-click cleanup.
+- Reuses the production paths (`set_presence`/`push_presence_diff`, `record_activity`,
+  `notify_relationship`, `social_hub`) so a connected client sees exactly what a real peer would.
+- Files: `social_api.rs` (`st_*` helpers), `admin_extra.rs` (page+GET+subnav), `handlers.rs`
+  (`bot_*` action arms), `models.rs` (`AdminForm` fields), `main.rs` (route). Additive/server-only
+  → **patch** bump, no client lockstep impact. Caveat: bot presence goes stale after ~70s (no real
+  WS session) — re-apply to refresh; noted in the page help text.
+
 ## Roadmap 2.4-3.7 server slices (2026-06-21, prod **0.10.12** LIVE)
 - Shipped + deployed to CT `10.0.0.210` and verified (`/api/health` = 0.10.12, new endpoints
   return data / clean 401s; schema migrated clean on boot):

@@ -460,6 +460,16 @@ struct AdminForm {
     // Game-request triage (set_request_status / delete_request actions).
     request_id: Option<u64>,
     request_status: Option<String>,
+    // Social test harness (bot_* actions on the Social Test admin page).
+    target_id: Option<u64>,
+    bot_id: Option<u64>,
+    bot_name: Option<String>,
+    presence_state: Option<String>,
+    status_text: Option<String>,
+    game_title: Option<String>,
+    activity_kind: Option<String>,
+    activity_value: Option<i64>,
+    message_body: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

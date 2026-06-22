@@ -3578,3 +3578,218 @@ async fn api_library_collection_items(
         .await;
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
+
+// ============================================================================
+// Admin social test harness
+// ----------------------------------------------------------------------------
+// Admin-only tooling (rendered by the "Social Test" admin page) that drives the
+// real social subsystem with puppet accounts so friends/status/activity/DMs can
+// be exercised against a live test account without standing up several clients.
+// Every helper reuses the production paths (set_presence/push_presence_diff,
+// record_activity, notify_relationship, social_hub) so the connected client sees
+// exactly what a genuine peer would. Puppets are marked by the bot email domain
+// so cleanup is unambiguous.
+// ============================================================================
+
+/// Email domain stamped on every puppet account; the marker `st_cleanup_bots`
+/// keys off and the only thing that distinguishes a bot from a real account.
+const ST_BOT_DOMAIN: &str = "bot.invalid";
+
+/// All enabled accounts as (id, username) — populates the target/bot dropdowns.
+async fn st_list_accounts(db: &Pool) -> Vec<(u64, String)> {
+    let Ok(mut c) = db.get_conn().await else { return Vec::new(); };
+    c.query("SELECT id, username FROM admin_users WHERE enabled=TRUE ORDER BY username")
+        .await
+        .unwrap_or_default()
+}
+
+/// Just the puppet accounts created by this harness, as (id, username).
+async fn st_list_bots(db: &Pool) -> Vec<(u64, String)> {
+    let Ok(mut c) = db.get_conn().await else { return Vec::new(); };
+    c.exec(
+        "SELECT id, username FROM admin_users WHERE email LIKE :d ORDER BY username",
+        params! {"d" => format!("%@{ST_BOT_DOMAIN}")},
+    )
+    .await
+    .unwrap_or_default()
+}
+
+async fn st_username(db: &Pool, id: u64) -> Option<String> {
+    let Ok(mut c) = db.get_conn().await else { return None; };
+    c.exec_first("SELECT username FROM admin_users WHERE id=:i", params! {"i" => id})
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Upsert a friendship row between bot and target. `accepted` → an instant
+/// friendship; otherwise a pending request from the bot. Idempotent.
+async fn st_force_friend(db: &Pool, bot_id: u64, target_id: u64, accepted: bool) -> Result<()> {
+    let (lo, hi) = pair(bot_id, target_id);
+    let status = if accepted { "accepted" } else { "pending" };
+    let mut c = db.get_conn().await?;
+    c.exec_drop(
+        r#"INSERT INTO social_friendships (user_lo, user_hi, status, requested_by, created_at, updated_at, expires_at)
+           VALUES (:lo, :hi, :s, :rb, :t, :t, NULL)
+           ON DUPLICATE KEY UPDATE status=:s, requested_by=:rb, updated_at=:t, expires_at=NULL"#,
+        params! {"lo" => lo, "hi" => hi, "s" => status, "rb" => bot_id, "t" => now()},
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create a puppet account, friend it to the target, and bring it online.
+async fn st_spawn_bot(st: &AppState, target_id: u64, name: &str) -> String {
+    let uname = name.trim();
+    if uname.is_empty() {
+        return "Bot name is required.".into();
+    }
+    let email = format!("{}@{}", uname.to_lowercase().replace(' ', "_"), ST_BOT_DOMAIN);
+    // Bots never sign in interactively; a clock-derived password is plenty.
+    let pw = format!("bot-{}-{}-pw", now(), target_id);
+    if let Err(e) = create_user(&st.db, uname, &email, &pw, false).await {
+        return format!("Could not create bot '{uname}': {e}");
+    }
+    let Some(bot_id) = st_user_id(&st.db, uname).await else {
+        return "Bot created but its id could not be resolved.".into();
+    };
+    if let Err(e) = st_force_friend(&st.db, bot_id, target_id, true).await {
+        return format!("Bot {bot_id} created but friending failed: {e}");
+    }
+    // Live roster update on both ends + an initial online presence.
+    notify_relationship(st, bot_id, target_id, "friend_accepted").await;
+    set_presence(&st.db, bot_id, "online", None, None, None).await;
+    push_presence_diff(st, bot_id).await;
+    format!("Spawned bot '{uname}' (id {bot_id}) and friended the target.")
+}
+
+async fn st_user_id(db: &Pool, username: &str) -> Option<u64> {
+    let Ok(mut c) = db.get_conn().await else { return None; };
+    c.exec_first("SELECT id FROM admin_users WHERE username=:u", params! {"u" => username})
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Set a puppet's presence and push the diff to its friends. Note: presence goes
+/// stale after ~70s (PRESENCE_STALE_SECS) since a bot holds no real WS session,
+/// so re-apply to keep it showing — fine for manual testing.
+async fn st_set_status(
+    st: &AppState,
+    bot_id: u64,
+    state: &str,
+    status_text: &str,
+    game_id: &str,
+    game_title: &str,
+) -> String {
+    let stext = status_text.trim();
+    let gid = game_id.trim();
+    let gtitle = game_title.trim();
+    set_presence(
+        &st.db,
+        bot_id,
+        state,
+        (!gid.is_empty()).then_some(gid),
+        (!gtitle.is_empty()).then_some(gtitle),
+        (!stext.is_empty()).then_some(stext),
+    )
+    .await;
+    push_presence_diff(st, bot_id).await;
+    format!("Set bot {bot_id} presence → {state}.")
+}
+
+/// Inject one activity-feed entry authored by the puppet (shows in the target's
+/// feed on next refresh, since the bot is an accepted friend).
+async fn st_post_activity(st: &AppState, bot_id: u64, kind: &str, game_id: &str, value: i64) -> String {
+    let gid = game_id.trim();
+    let payload = match kind {
+        "played" => Some(serde_json::json!({ "secs": value.max(0) })),
+        "review" => Some(serde_json::json!({ "rating": value.clamp(0, 5) })),
+        _ => None,
+    };
+    record_activity(st, bot_id, kind, (!gid.is_empty()).then_some(gid), payload).await;
+    format!("Recorded '{kind}' activity for bot {bot_id}.")
+}
+
+/// Send a DM from the puppet to the target, delivered live over the gateway.
+async fn st_send_dm(st: &AppState, bot_id: u64, target_id: u64, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "Message body is required.".into();
+    }
+    let ts = now();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return e.to_string(),
+    };
+    let ins = c
+        .exec_iter(
+            "INSERT INTO social_messages (sender_id, receiver_id, body, created_at, reply_to) VALUES (:s, :r, :b, :t, NULL)",
+            params! {"s" => bot_id, "r" => target_id, "b" => trimmed, "t" => ts},
+        )
+        .await;
+    let msg_id = match ins {
+        Ok(r) => r.last_insert_id().unwrap_or(0),
+        Err(e) => return e.to_string(),
+    };
+    let evt = serde_json::json!({
+        "type": "chat",
+        "messageId": msg_id,
+        "senderId": bot_id,
+        "receiverId": target_id,
+        "text": trimmed,
+        "timestamp": ts,
+        "replyTo": serde_json::Value::Null,
+    })
+    .to_string();
+    social_hub().push(target_id, &evt);
+    format!("Sent DM from bot {bot_id} to target {target_id}.")
+}
+
+/// Create a pending friend request from the puppet to the target and push the
+/// live `friend_request` event + durable notification (tests the Requests tab).
+async fn st_send_request(st: &AppState, bot_id: u64, target_id: u64) -> String {
+    if let Err(e) = st_force_friend(&st.db, bot_id, target_id, false).await {
+        return format!("Could not create request: {e}");
+    }
+    let uname = st_username(&st.db, bot_id).await.unwrap_or_default();
+    social_hub().push(
+        target_id,
+        &serde_json::json!({ "type": "friend_request", "fromId": bot_id, "fromUsername": uname }).to_string(),
+    );
+    store_notification(
+        st,
+        target_id,
+        "friend_request",
+        Some(bot_id),
+        Some(&uname),
+        Some(&format!("{uname} sent you a friend request")),
+        Some(serde_json::json!({ "fromId": bot_id, "fromUsername": uname })),
+    )
+    .await;
+    format!("Pending request from bot {bot_id} → target {target_id}.")
+}
+
+/// Delete every puppet account and all of its social rows; notify any remaining
+/// friends so their rosters drop the bot live.
+async fn st_cleanup_bots(st: &AppState) -> String {
+    let bots = st_list_bots(&st.db).await;
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return e.to_string(),
+    };
+    let mut n = 0u32;
+    for (id, _) in &bots {
+        for f in friend_ids(&st.db, *id).await {
+            notify_relationship(st, *id, f, "friend_removed").await;
+        }
+        let _ = c.exec_drop("DELETE FROM social_friendships WHERE user_lo=:i OR user_hi=:i", params! {"i" => id}).await;
+        let _ = c.exec_drop("DELETE FROM social_messages WHERE sender_id=:i OR receiver_id=:i", params! {"i" => id}).await;
+        let _ = c.exec_drop("DELETE FROM social_presence WHERE user_id=:i", params! {"i" => id}).await;
+        let _ = c.exec_drop("DELETE FROM social_activity WHERE user_id=:i", params! {"i" => id}).await;
+        let _ = c.exec_drop("DELETE FROM social_notifications WHERE user_id=:i OR actor_id=:i", params! {"i" => id}).await;
+        let _ = c.exec_drop("DELETE FROM admin_users WHERE id=:i", params! {"i" => id}).await;
+        n += 1;
+    }
+    format!("Removed {n} test bot(s) and their social data.")
+}

@@ -231,6 +231,14 @@ social gateway, account management, and an HTML admin UI.
 - **Game-request triage page** (`/admin/requests`) — set each community request's
   status (pending / approved / fulfilled / declined) or delete it. This replaces
   the inline admin status dropdown that used to live on the client Requests board.
+- **Social test harness** (`/admin/social-test`) — developer tooling to exercise
+  the social subsystem against a live account without standing up several clients:
+  spawn `[bot]` puppet accounts and instantly friend them to a target, drive their
+  status/presence (online/away/busy/in-game/invisible + custom status + rich
+  presence) with a live presence diff, inject activity-feed entries
+  (played/review/screenshot), send DMs and pending friend requests over the
+  gateway, and one-click **Remove All Test Bots** to delete every puppet and its
+  social data. Bots are tagged by a reserved email domain so cleanup is exact.
 - **New-signup notifications** email **every enabled admin** (each admin's own
   address) with HTML **Accept / Deny** buttons.
 - **First-boot bootstrap** of an admin account from environment variables when no

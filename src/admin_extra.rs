@@ -133,9 +133,10 @@ fn admin_subnav(active: &str) -> String {
     format!(
         "<aside class=\"sidebar\"><div class=\"brand-block\"><div class=\"brand-mark\">AL</div>\
          <div><div class=\"brand-title\">ArcadeLauncher</div><div class=\"brand-subtitle\">Rust Server</div></div></div>\
-         <nav><a href=\"/admin\">Dashboard</a><a href=\"/admin/metadata\">Metadata</a>{}{}</nav></aside>",
+         <nav><a href=\"/admin\">Dashboard</a><a href=\"/admin/metadata\">Metadata</a>{}{}{}</nav></aside>",
         item("/admin/accounts", "Accounts", "accounts"),
         item("/admin/requests", "Game Requests", "requests"),
+        item("/admin/social-test", "Social Test", "social-test"),
     )
 }
 
@@ -296,6 +297,124 @@ async fn admin_requests_page(State(st): State<AppState>, headers: HeaderMap) -> 
     match current_admin(&st.db, &headers).await {
         Ok(Some(admin)) => Html(
             requests_page_html(&st, Some(admin), "").await.unwrap_or_else(|e| format!("error: {e}")),
+        )
+        .into_response(),
+        _ => Html(login_html("Please sign in first.")).into_response(),
+    }
+}
+
+// ── Social test harness page ─────────────────────────────────────────────────
+
+/// Build <option> tags for an account/bot dropdown; `selected_first` pre-selects
+/// the first row so a form always submits a valid id.
+fn st_options(rows: &[(u64, String)]) -> String {
+    rows.iter()
+        .map(|(id, name)| format!("<option value='{id}'>{} (#{id})</option>", esc(name)))
+        .collect()
+}
+
+async fn social_test_page_html(st: &AppState, admin: Option<User>, message: &str) -> Result<String> {
+    let accounts = st_list_accounts(&st.db).await;
+    let bots = st_list_bots(&st.db).await;
+    let real: Vec<(u64, String)> = accounts
+        .iter()
+        .filter(|(id, _)| !bots.iter().any(|(b, _)| b == id))
+        .cloned()
+        .collect();
+    let target_opts = st_options(&real);
+    let all_target_opts = st_options(&accounts);
+    let bot_opts = st_options(&bots);
+    let signed = admin.map(|a| a.username).unwrap_or_default();
+
+    let state_opts = ["online", "away", "busy", "ingame", "invisible", "offline"]
+        .iter()
+        .map(|s| format!("<option value='{s}'>{}</option>", cap_first(s)))
+        .collect::<String>();
+    let kind_opts = ["played", "review", "screenshot"]
+        .iter()
+        .map(|k| format!("<option value='{k}'>{}</option>", cap_first(k)))
+        .collect::<String>();
+
+    let bot_count = bots.len();
+    let no_bots_note = if bots.is_empty() {
+        "<p class=\"muted\">No test bots yet — spawn one above to enable the status / activity / DM controls.</p>"
+    } else {
+        ""
+    };
+
+    Ok(shell(&format!(
+        r##"
+        <div class="admin-layout">
+          {subnav}
+          <div class="content">
+            <section class="topbar"><div><div class="eyebrow">Development</div><h1>Social Test Harness</h1></div><div class="account-box"><span>Signed in as <strong>{signed}</strong></span><a class="buttonlink" href="/admin/logout">Sign Out</a></div></section>
+            {notice}
+
+            <section class="section"><div class="section-heading"><h2>Spawn Fake Friend</h2><span class="muted">Creates a puppet account ([bot]) and instantly friends it to the target. Puppets are tagged by email so cleanup is safe.</span></div>
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+                <label>Target<select name="target_id">{target_opts}</select></label>
+                <input name="bot_name" placeholder="Bot username (e.g. TestPal)">
+                <button name="action" value="bot_spawn">Spawn &amp; Friend</button>
+              </form>
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Set Status / Presence</h2><span class="muted">Pushes a live presence diff to the bot's friends. Presence goes stale after ~70s; re-apply to refresh.</span></div>
+              {no_bots_note}
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+                <label>Bot<select name="bot_id">{bot_opts}</select></label>
+                <label>State<select name="presence_state">{state_opts}</select></label>
+                <input name="status_text" placeholder="Custom status (optional)">
+                <input name="game_id" placeholder="Game id (for in-game)">
+                <input name="game_title" placeholder="Game title (for in-game)">
+                <button name="action" value="bot_set_status">Apply Status</button>
+              </form>
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Post Activity</h2><span class="muted">Injects a feed entry authored by the bot. Appears in the target's Activity tab on refresh. Value = seconds played / 0–5 rating.</span></div>
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+                <label>Bot<select name="bot_id">{bot_opts}</select></label>
+                <label>Kind<select name="activity_kind">{kind_opts}</select></label>
+                <input name="game_id" placeholder="Game id (optional)">
+                <input name="activity_value" type="number" value="0">
+                <button name="action" value="bot_post_activity">Post Activity</button>
+              </form>
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Send DM</h2><span class="muted">Delivers a chat message from the bot to the target, live over the gateway.</span></div>
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+                <label>From bot<select name="bot_id">{bot_opts}</select></label>
+                <label>To<select name="target_id">{all_target_opts}</select></label>
+                <input name="message_body" placeholder="Message text">
+                <button name="action" value="bot_send_dm">Send DM</button>
+              </form>
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Send Friend Request</h2><span class="muted">Creates a pending incoming request from the bot (tests the Requests tab + badge).</span></div>
+              <form method="post" class="row"><input type="hidden" name="return_to" value="social-test">
+                <label>From bot<select name="bot_id">{bot_opts}</select></label>
+                <label>To<select name="target_id">{all_target_opts}</select></label>
+                <button name="action" value="bot_send_request">Send Request</button>
+              </form>
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Cleanup</h2><span class="muted">Deletes all {bot_count} test bot(s) and their friendships, messages, presence, and activity.</span></div>
+              <form method="post" class="inline" onsubmit="return confirm('Delete all test bots and their social data?');"><input type="hidden" name="return_to" value="social-test">
+                <button name="action" value="bot_cleanup" class="danger">Remove All Test Bots</button>
+              </form>
+            </section>
+          </div>
+        </div>
+        "##,
+        subnav = admin_subnav("social-test"),
+        signed = esc(&signed),
+        notice = notice(message),
+    )))
+}
+
+async fn admin_social_test_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match current_admin(&st.db, &headers).await {
+        Ok(Some(admin)) => Html(
+            social_test_page_html(&st, Some(admin), "").await.unwrap_or_else(|e| format!("error: {e}")),
         )
         .into_response(),
         _ => Html(login_html("Please sign in first.")).into_response(),
