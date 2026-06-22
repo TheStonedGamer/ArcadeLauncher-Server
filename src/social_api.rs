@@ -873,9 +873,13 @@ async fn api_social_friends(State(st): State<AppState>, headers: HeaderMap) -> R
             "username": uname,
             "relation": relation,
             "presence": pstate,
-            "currentGameId": gid,
-            "currentGameTitle": gtitle,
-            "statusText": status,
+            // Coerce to "" (never null): the unified client's Rust `Friend` model
+            // types these as non-optional `String`, and serde rejects a present
+            // `null` for a String — which fails the WHOLE friends parse and leaves
+            // the client roster empty. Empty string is valid for every client.
+            "currentGameId": gid.unwrap_or_default(),
+            "currentGameTitle": gtitle.unwrap_or_default(),
+            "statusText": status.unwrap_or_default(),
             "note": note,
             "groups": groups,
             "pinned": pinned,
