@@ -190,6 +190,12 @@ async fn main() -> Result<()> {
             "/api/social/hosts/:device_id/apps",
             get(api_social_host_apps_get).put(api_social_host_apps_put),
         )
+        // Cert pre-authorization registry (brokered zero-PIN auto-pair): clients publish their
+        // streaming-client cert; hosts fetch the account's list to seed Sunshine's trust store.
+        .route(
+            "/api/social/client-certs",
+            get(api_social_client_certs_get).post(api_social_client_certs_register),
+        )
         // T12k-8: mint a short-lived Headscale pre-auth key for play-from-anywhere.
         .route("/api/social/mesh/preauth", post(api_social_mesh_preauth))
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))

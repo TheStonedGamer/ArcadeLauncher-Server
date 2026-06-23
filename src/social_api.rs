@@ -339,6 +339,26 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
           lan_addr VARCHAR(128) NOT NULL DEFAULT '',
           mesh_addr VARCHAR(128) NOT NULL DEFAULT '',
           cert_fp VARCHAR(128) NOT NULL DEFAULT '',
+          server_cert_pem TEXT NULL,
+          last_seen BIGINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Cert pre-authorization (brokered zero-PIN auto-pair): clients pin the host's full server cert,
+    // not just its fingerprint. Add the column for deployments whose stream_hosts predates it.
+    let _ = c
+        .query_drop("ALTER TABLE stream_hosts ADD COLUMN IF NOT EXISTS server_cert_pem TEXT NULL")
+        .await;
+    // The account's registered client certs: every PC, as a streaming *client*, publishes its stable
+    // self-signed cert here so any host on the same account can seed it into Sunshine's trust store
+    // (named_devices) and accept it with no PIN. Keyed by device so a PC has exactly one current cert.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS stream_client_certs (
+          user_id BIGINT UNSIGNED NOT NULL,
+          device_id VARCHAR(64) NOT NULL,
+          name VARCHAR(128) NOT NULL DEFAULT '',
+          cert_pem TEXT NOT NULL,
           last_seen BIGINT NOT NULL DEFAULT 0,
           PRIMARY KEY (user_id, device_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
@@ -1592,16 +1612,21 @@ async fn upsert_stream_host(
     lan_addr: &str,
     mesh_addr: &str,
     cert_fp: &str,
+    server_cert_pem: &str,
 ) {
     let Ok(mut c) = db.get_conn().await else { return; };
+    // Don't clobber a stored server cert with an empty heartbeat: COALESCE keeps the existing PEM
+    // when the caller sends none (the WS announce frame carries no cert).
+    let cert = if server_cert_pem.is_empty() { None } else { Some(server_cert_pem) };
     let _ = c
         .exec_drop(
-            r#"INSERT INTO stream_hosts (user_id, device_id, name, lan_addr, mesh_addr, cert_fp, last_seen)
-               VALUES (:u, :d, :n, :l, :m, :f, :t)
-               ON DUPLICATE KEY UPDATE name=:n, lan_addr=:l, mesh_addr=:m, cert_fp=:f, last_seen=:t"#,
+            r#"INSERT INTO stream_hosts (user_id, device_id, name, lan_addr, mesh_addr, cert_fp, server_cert_pem, last_seen)
+               VALUES (:u, :d, :n, :l, :m, :f, :sc, :t)
+               ON DUPLICATE KEY UPDATE name=:n, lan_addr=:l, mesh_addr=:m, cert_fp=:f,
+                 server_cert_pem=COALESCE(:sc, server_cert_pem), last_seen=:t"#,
             params! {
                 "u" => user_id, "d" => device_id, "n" => name,
-                "l" => lan_addr, "m" => mesh_addr, "f" => cert_fp, "t" => now(),
+                "l" => lan_addr, "m" => mesh_addr, "f" => cert_fp, "sc" => cert, "t" => now(),
             },
         )
         .await;
@@ -1617,9 +1642,9 @@ async fn api_social_hosts_get(State(st): State<AppState>, headers: HeaderMap) ->
         Ok(c) => c,
         Err(e) => return server_error(e),
     };
-    let rows: Vec<(String, String, String, String, String, i64)> = match c
+    let rows: Vec<(String, String, String, String, String, Option<String>, i64)> = match c
         .exec(
-            "SELECT device_id, name, lan_addr, mesh_addr, cert_fp, last_seen \
+            "SELECT device_id, name, lan_addr, mesh_addr, cert_fp, server_cert_pem, last_seen \
              FROM stream_hosts WHERE user_id=:u ORDER BY name",
             params! {"u" => me.id},
         )
@@ -1631,13 +1656,15 @@ async fn api_social_hosts_get(State(st): State<AppState>, headers: HeaderMap) ->
     let t = now();
     let items: Vec<_> = rows
         .into_iter()
-        .map(|(device_id, name, lan_addr, mesh_addr, cert_fp, last_seen)| {
+        .map(|(device_id, name, lan_addr, mesh_addr, cert_fp, server_cert_pem, last_seen)| {
             serde_json::json!({
                 "deviceId": device_id,
                 "name": name,
                 "lanAddr": lan_addr,
                 "meshAddr": mesh_addr,
                 "certFp": cert_fp,
+                // The host's pinned server cert PEM for zero-PIN auto-pair ("" if not yet published).
+                "serverCertPem": server_cert_pem.unwrap_or_default(),
                 "online": (t - last_seen) < PRESENCE_STALE_SECS,
                 "lastSeen": last_seen,
             })
@@ -1658,6 +1685,10 @@ struct StreamHostBody {
     mesh_addr: String,
     #[serde(default, rename = "certFp")]
     cert_fp: String,
+    // The host's Sunshine server cert PEM (zero-PIN auto-pair). Optional — a heartbeat may omit it;
+    // upsert_stream_host preserves the stored value when this is empty.
+    #[serde(default, rename = "serverCertPem")]
+    server_cert_pem: String,
 }
 
 // POST /api/social/hosts/register — durable upsert of the caller's own device.
@@ -1680,13 +1711,96 @@ async fn api_social_hosts_register(
     let lan_addr = body.lan_addr.chars().take(128).collect::<String>();
     let mesh_addr = body.mesh_addr.chars().take(128).collect::<String>();
     let cert_fp = body.cert_fp.chars().take(128).collect::<String>();
-    upsert_stream_host(&st.db, me.id, &device_id, &name, &lan_addr, &mesh_addr, &cert_fp).await;
+    // Cert PEMs are bounded (RSA-2048 self-signed ≈ 1–2 KiB); cap generously to bound abuse.
+    let server_cert_pem = body.server_cert_pem.chars().take(8192).collect::<String>();
+    upsert_stream_host(
+        &st.db, me.id, &device_id, &name, &lan_addr, &mesh_addr, &cert_fp, &server_cert_pem,
+    )
+    .await;
     // Tell the caller's other devices a host changed so their My PCs refreshes.
     social_hub().push(
         me.id,
         &serde_json::json!({ "type": "stream_host_update", "deviceId": device_id }).to_string(),
     );
     Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ClientCertBody {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "certPem")]
+    cert_pem: String,
+}
+
+// POST /api/social/client-certs — publish this device's streaming-client cert so every host on the
+// account can pre-authorize it (zero-PIN auto-pair). Idempotent per device (PK user_id+device_id).
+async fn api_social_client_certs_register(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ClientCertBody>,
+) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let device_id = body.device_id.chars().take(64).collect::<String>();
+    let cert_pem = body.cert_pem.chars().take(8192).collect::<String>();
+    if device_id.is_empty() || cert_pem.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing deviceId or certPem").into_response();
+    }
+    let name = body.name.chars().take(128).collect::<String>();
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            r#"INSERT INTO stream_client_certs (user_id, device_id, name, cert_pem, last_seen)
+               VALUES (:u, :d, :n, :c, :t)
+               ON DUPLICATE KEY UPDATE name=:n, cert_pem=:c, last_seen=:t"#,
+            params! {"u" => me.id, "d" => &device_id, "n" => name, "c" => cert_pem, "t" => now()},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    // A new/rotated client cert means every host on the account should re-seed its trust store.
+    social_hub().push(
+        me.id,
+        &serde_json::json!({ "type": "client_cert_update", "deviceId": device_id }).to_string(),
+    );
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+// GET /api/social/client-certs — every client cert registered to the account. Hosts fetch this on
+// enable (and on a client_cert_update push) to seed Sunshine's named_devices trust store.
+async fn api_social_client_certs_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(String, String, String)> = match c
+        .exec(
+            "SELECT device_id, name, cert_pem FROM stream_client_certs WHERE user_id=:u ORDER BY name",
+            params! {"u" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let items: Vec<_> = rows
+        .into_iter()
+        .map(|(device_id, name, cert_pem)| {
+            serde_json::json!({ "deviceId": device_id, "name": name, "certPem": cert_pem })
+        })
+        .collect();
+    Json(serde_json::json!({ "certs": items })).into_response()
 }
 
 // DELETE /api/social/hosts/:device_id — forget one of my devices and its apps.
@@ -2602,6 +2716,7 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
                     &s("lanAddr", 128),
                     &s("meshAddr", 128),
                     &s("certFp", 128),
+                    "",  // WS heartbeat carries no server cert; COALESCE keeps the stored one
                 )
                 .await;
                 social_hub().push(
