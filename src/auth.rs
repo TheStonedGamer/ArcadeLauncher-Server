@@ -325,8 +325,8 @@ async fn api_account_password(State(st): State<AppState>, headers: HeaderMap, Fo
     if !verify_password_any(&form.current_password, &user.password_hash) {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "current password is incorrect"}))).into_response();
     }
-    if form.new_password.len() < 10 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password must be at least 10 characters"}))).into_response();
+    if form.new_password.len() < 6 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "new password must be at least 6 characters"}))).into_response();
     }
     let hash = match hash_password_argon2(&form.new_password) {
         Ok(h) => h,

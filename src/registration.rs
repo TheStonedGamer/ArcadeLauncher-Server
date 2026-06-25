@@ -28,7 +28,7 @@ struct RegTokenQuery {
 
 // Pure validation of a signup request. Ok(()) or a human-readable reason.
 // Username: 3..=32 chars, ASCII alphanumeric plus '_'/'-'/'.', must start with an
-// alphanumeric. Email: a minimal shape check. Password: >=10 chars (matches the
+// alphanumeric. Email: a minimal shape check. Password: >=6 chars (matches the
 // change-password rule in api_account_password).
 fn validate_registration(username: &str, email: &str, password: &str) -> Result<(), &'static str> {
     let u = username.trim();
@@ -48,8 +48,8 @@ fn validate_registration(username: &str, email: &str, password: &str) -> Result<
     if !is_plausible_email(email) {
         return Err("enter a valid email address");
     }
-    if password.len() < 10 {
-        return Err("password must be at least 10 characters");
+    if password.len() < 6 {
+        return Err("password must be at least 6 characters");
     }
     Ok(())
 }

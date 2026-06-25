@@ -184,10 +184,10 @@ async fn api_users_create(
         return r;
     }
     let is_admin = body.is_admin.unwrap_or(false) || body.role.as_deref() == Some("Admin");
-    if body.username.trim().is_empty() || body.email.trim().is_empty() || body.password.len() < 10 {
+    if body.username.trim().is_empty() || body.email.trim().is_empty() || body.password.len() < 6 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "username, email, and a 10+ character password are required"})),
+            Json(serde_json::json!({"error": "username, email, and a 6+ character password are required"})),
         )
             .into_response();
     }
@@ -235,10 +235,10 @@ async fn api_users_update(
             .into_response();
     }
     if let Some(pw) = &body.password {
-        if pw.len() < 10 {
+        if pw.len() < 6 {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "password must be at least 10 characters"})),
+                Json(serde_json::json!({"error": "password must be at least 6 characters"})),
             )
                 .into_response();
         }
