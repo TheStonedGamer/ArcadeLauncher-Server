@@ -253,8 +253,8 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 let username = form.username.unwrap_or_default();
                 let email = form.email.unwrap_or_default();
                 let password = form.password.unwrap_or_default();
-                if username.is_empty() || email.is_empty() || password.len() < 6 {
-                    "username, email, and a 6+ character password are required".to_string()
+                if username.is_empty() || email.is_empty() || password.len() < 8 {
+                    "username, email, and a 8+ character password are required".to_string()
                 } else {
                     match create_user(&st.db, &username, &email, &password, form.is_admin.as_deref() == Some("1")).await {
                         Ok(_) => format!("Created user {username}."),
@@ -292,8 +292,8 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                         let removes_admin = target.is_admin && target.enabled && (!new_admin || !new_enabled);
                         let pw = form.password.as_deref().map(str::trim).filter(|p| !p.is_empty());
                         if let Some(p) = pw {
-                            if p.len() < 6 {
-                                "Password must be at least 6 characters.".to_string()
+                            if p.len() < 8 {
+                                "Password must be at least 8 characters.".to_string()
                             } else {
                                 apply_user_update(&st, &target, form.email.as_deref(), Some(p), new_admin, new_enabled, removes_admin).await
                             }

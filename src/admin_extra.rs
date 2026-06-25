@@ -187,7 +187,7 @@ async fn accounts_page_html(st: &AppState, admin: Option<User>, message: &str) -
             {notice}
             {pending_section}
             <section class="section"><div class="section-heading"><h2>Create User</h2><span class="muted">Admins are created here directly; regular accounts can also self-register and be approved above.</span></div>
-              <form method="post" class="row"><input type="hidden" name="return_to" value="accounts"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password (6+ chars)"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form>
+              <form method="post" class="row"><input type="hidden" name="return_to" value="accounts"><input name="username" placeholder="Username"><input name="email" type="email" placeholder="Email"><input name="password" type="password" placeholder="Password (8+ chars)"><label class="checkline"><input type="checkbox" name="is_admin" value="1"> Admin</label><button name="action" value="add_user">Create User</button></form>
             </section>
             <section class="section"><div class="section-heading"><h2>Users</h2><span class="muted">Edit email, role, status, or reset a password; manage 2FA and deletion.</span></div>{user_mgmt}</section>
             <section class="section"><div class="section-heading"><h2>Issued Tokens</h2><span class="muted">Bearer tokens issued to launcher clients.</span></div>

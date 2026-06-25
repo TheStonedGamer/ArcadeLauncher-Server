@@ -94,14 +94,14 @@ fn reset_form_page(token: &str, error: Option<&str>) -> Response {
          <form method=\"post\" action=\"/api/auth/reset\" onsubmit=\"return chk()\">\
          <input type=\"hidden\" name=\"token\" value=\"{token}\">\
          <label for=\"p\">New password</label>\
-         <input id=\"p\" name=\"password\" type=\"password\" minlength=\"6\" required autocomplete=\"new-password\">\
+         <input id=\"p\" name=\"password\" type=\"password\" minlength=\"8\" required autocomplete=\"new-password\">\
          <label for=\"p2\">Confirm new password</label>\
-         <input id=\"p2\" type=\"password\" minlength=\"6\" required autocomplete=\"new-password\">\
-         <p class=\"hint\">At least 6 characters.</p>\
+         <input id=\"p2\" type=\"password\" minlength=\"8\" required autocomplete=\"new-password\">\
+         <p class=\"hint\">At least 8 characters.</p>\
          <button type=\"submit\">Reset password</button></form>\
          <script>function chk(){{var a=document.getElementById('p').value,\
-         b=document.getElementById('p2').value;if(a.length<6){{alert('Password must be at \
-         least 6 characters.');return false}}if(a!==b){{alert('Passwords do not match.');\
+         b=document.getElementById('p2').value;if(a.length<8){{alert('Password must be at \
+         least 8 characters.');return false}}if(a!==b){{alert('Passwords do not match.');\
          return false}}return true}}</script></div></body></html>",
         token = esc(token),
     );
@@ -247,8 +247,8 @@ async fn api_auth_reset_submit(
         }
         Err(e) => return server_error(e),
     };
-    if form.password.len() < 6 {
-        return reset_form_page(&token, Some("Password must be at least 6 characters."));
+    if form.password.len() < 8 {
+        return reset_form_page(&token, Some("Password must be at least 8 characters."));
     }
     let hash = match hash_password_argon2(&form.password) {
         Ok(h) => h,
