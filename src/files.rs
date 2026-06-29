@@ -49,7 +49,15 @@ async fn stream_file(path: PathBuf, range: Option<&HeaderValue>) -> Result<Respo
     } else {
         (0, size.saturating_sub(1), StatusCode::OK)
     };
-    let len = end.saturating_sub(start).saturating_add(1);
+    // Empty files: `end` saturates to 0, so the naive `end - start + 1` would
+    // claim a 1-byte body while `take(len)` streams 0 bytes. nginx then reports
+    // "upstream prematurely closed connection" (502) and clients fail to decode
+    // the truncated body. Serve a genuine 0-length body for empty files.
+    let len = if size == 0 {
+        0
+    } else {
+        end.saturating_sub(start).saturating_add(1)
+    };
     let mut file = File::open(&path).await?;
     file.seek(SeekFrom::Start(start)).await?;
     let stream = ReaderStream::new(file.take(len)).map_ok(Bytes::from);
