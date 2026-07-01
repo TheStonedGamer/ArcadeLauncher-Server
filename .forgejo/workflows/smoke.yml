@@ -1,0 +1,10 @@
+name: forgejo-smoke-test
+on:
+  push:
+    branches: [forgejo-ci-smoke]
+jobs:
+  smoke:
+    runs-on: linux
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "hello from forgejo actions on a real prod repo" && cat Cargo.toml | head -5
