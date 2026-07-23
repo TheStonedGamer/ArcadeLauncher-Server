@@ -2276,6 +2276,12 @@ struct WsEnvelope {
     status: String,
     #[serde(default)]
     message: String,
+    // Sign-in approval (0.14): which raised request, and the owner's answer.
+    #[serde(default)]
+    #[serde(rename = "requestId")]
+    request_id: String,
+    #[serde(default)]
+    action: String,
 }
 
 // Broadcast the account's current device list to its own sockets. Local-only on
@@ -2377,6 +2383,22 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
                     .to_string(),
                 );
             }
+        }
+        "guard_decision" => {
+            // The owner tapped approve/deny on a sign-in push. The store checks
+            // that the request belongs to this account and that it has not
+            // already been answered; a replayed frame is refused, not applied.
+            let state = guard_decide(uid, env.request_id.trim(), env.action.trim());
+            social_hub().deliver_local(
+                uid,
+                &serde_json::json!({
+                    "type": "guard_decision_ack",
+                    "requestId": env.request_id,
+                    "state": state.map(|s| s.as_str()),
+                    "ok": state.is_some(),
+                })
+                .to_string(),
+            );
         }
         "devices" => {
             // The phone asks for the picker contents; everyone on the account

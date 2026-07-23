@@ -101,6 +101,13 @@ struct VerifyForm {
     proof: String,
     #[serde(default, alias = "totpCode")]
     totp_code: String,
+    // Push approval (0.14): the id of a request already raised on the owner's
+    // phone. Empty on the first attempt; the client echoes it back while polling.
+    #[serde(default, alias = "approvalId")]
+    approval_id: String,
+    // Shown on the phone so the owner can tell which machine is asking.
+    #[serde(default, alias = "deviceName")]
+    device_name: String,
 }
 
 // Password-derived shared secret, identical on client and server.
@@ -138,6 +145,117 @@ fn hmac_ctr_xor(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         bi += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in approval store (glue for guard.rs)
+// ---------------------------------------------------------------------------
+
+// Kept in memory alongside the challenge nonces rather than in a table: an
+// approval is answerable for two minutes, so a restart costs the user one
+// retry, which is cheaper than a migration.
+static APPROVALS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Approval>>> =
+    std::sync::OnceLock::new();
+
+fn approvals() -> &'static std::sync::Mutex<std::collections::HashMap<String, Approval>> {
+    APPROVALS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// What the login handler should do about a missing 2FA code.
+enum GuardOutcome {
+    // A phone already approved this sign-in; let it through.
+    Allow,
+    // Raised or still waiting — the client should re-verify with this id.
+    Pending(String),
+    // The owner said no.
+    Denied,
+    // No phone to ask. The user must type their code.
+    Unavailable,
+}
+
+// Record a decision made on a phone. Returns the resulting state so the caller
+// can tell the phone whether its tap actually landed.
+fn guard_decide(user_id: u64, request_id: &str, action: &str) -> Option<ApprovalState> {
+    let now = now() as u64;
+    let mut map = approvals().lock().ok()?;
+    let approval = map.get(request_id)?;
+    // A phone may only answer its own account's requests.
+    if approval.user_id != user_id {
+        return None;
+    }
+    let next = decide(approval, action, now).ok()?;
+    map.get_mut(request_id)?.state = next;
+    Some(next)
+}
+
+// Decide what to do when a 2FA-enabled account logged in without a code.
+async fn guard_gate(user: &User, approval_id: &str, ip: Option<&str>, device_name: &str) -> GuardOutcome {
+    let now = now() as u64;
+
+    // Polling an existing request.
+    if !approval_id.is_empty() {
+        let mut map = match approvals().lock() {
+            Ok(m) => m,
+            Err(_) => return GuardOutcome::Unavailable,
+        };
+        if let Some(existing) = map.get(approval_id) {
+            if can_consume(existing, user.id, now) {
+                // Spending removes it, so one approval buys exactly one login.
+                map.remove(approval_id);
+                return GuardOutcome::Allow;
+            }
+            match effective_state(existing, now) {
+                ApprovalState::Pending => return GuardOutcome::Pending(approval_id.to_string()),
+                ApprovalState::Denied => return GuardOutcome::Denied,
+                // Expired or spent-by-someone-else: fall through and raise a
+                // fresh request rather than stranding the user.
+                _ => {}
+            }
+        }
+    }
+
+    // Raise a new one — but only to phones. A desktop must not be able to
+    // approve a sign-in happening on a desktop, or the second factor is not a
+    // second factor.
+    let phones: Vec<Device> = social_hub()
+        .devices_for(user.id)
+        .into_iter()
+        .filter(|d| d.kind == "mobile")
+        .collect();
+    if phones.is_empty() {
+        return GuardOutcome::Unavailable;
+    }
+
+    let id = random_token(18);
+    let approval = Approval {
+        id: id.clone(),
+        user_id: user.id,
+        device_name: device_name.trim().to_string(),
+        ip: ip.unwrap_or_default().to_string(),
+        created_at: now,
+        state: ApprovalState::Pending,
+    };
+    let prompt = approval_prompt(&approval.device_name, &approval.ip);
+    if let Ok(mut map) = approvals().lock() {
+        map.retain(|_, a| !is_evictable(a, now));
+        map.insert(id.clone(), approval);
+    } else {
+        return GuardOutcome::Unavailable;
+    }
+
+    let msg = serde_json::json!({
+        "type": "guard_request",
+        "requestId": id,
+        "prompt": prompt,
+        "deviceName": if device_name.trim().is_empty() { "A PC" } else { device_name.trim() },
+        "ip": display_ip(ip.unwrap_or_default()),
+        "expiresIn": APPROVAL_TTL_SECONDS,
+    })
+    .to_string();
+    for phone in &phones {
+        social_hub().send_to_device(user.id, &phone.id, &msg);
+    }
+    GuardOutcome::Pending(id)
 }
 
 async fn api_auth_challenge(State(st): State<AppState>, Query(q): Query<ChallengeQuery>) -> Response {
@@ -180,10 +298,47 @@ async fn api_auth_verify(State(st): State<AppState>, headers: HeaderMap, Form(fo
         return server_error(anyhow!("corrupt auth key"));
     };
     let expected = hex::encode(hmac_sha256(&key_bytes, nonce.as_bytes()));
-    if !constant_eq(expected.as_bytes(), form.proof.trim().as_bytes()) || !verify_user_totp(&user, &form.totp_code) {
+    let bad_2fa = || {
+        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials or 2FA code"}))).into_response()
+    };
+    if !constant_eq(expected.as_bytes(), form.proof.trim().as_bytes()) {
         st.record_login_failure(&username);
         audit(&st.db, Some(user.id), Some(&user.username), "login_failed", ip.as_deref(), Some("challenge")).await;
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials or 2FA code"}))).into_response();
+        return bad_2fa();
+    }
+    // Second factor. A typed code still works exactly as before; if the code is
+    // wrong or absent we fall back to asking the owner's phone. The push is an
+    // ALTERNATIVE to the code, never an extra hurdle — a flat phone must not be
+    // able to lock the owner out of their own launcher.
+    if user.totp_enabled && !verify_user_totp(&user, &form.totp_code) {
+        match guard_gate(&user, form.approval_id.trim(), ip.as_deref(), &form.device_name).await {
+            GuardOutcome::Allow => {
+                audit(&st.db, Some(user.id), Some(&user.username), "login_approved", ip.as_deref(), Some("guard push")).await;
+            }
+            GuardOutcome::Pending(id) => {
+                // Not a failure: do not count it against the throttle, or a
+                // slow tap on the phone would lock the account out.
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "approvalId": id,
+                        "status": "pending",
+                        "expiresIn": APPROVAL_TTL_SECONDS,
+                    })),
+                )
+                    .into_response();
+            }
+            GuardOutcome::Denied => {
+                st.record_login_failure(&username);
+                audit(&st.db, Some(user.id), Some(&user.username), "login_denied", ip.as_deref(), Some("guard push")).await;
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "sign-in denied on your phone"}))).into_response();
+            }
+            GuardOutcome::Unavailable => {
+                st.record_login_failure(&username);
+                audit(&st.db, Some(user.id), Some(&user.username), "login_failed", ip.as_deref(), Some("2fa")).await;
+                return bad_2fa();
+            }
+        }
     }
     st.clear_login_failures(&username);
     let token = match issue_user_token(&st.db, user.id, &user.username).await {
