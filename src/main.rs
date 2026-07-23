@@ -72,6 +72,7 @@ include!("discord.rs");
 include!("users_api.rs");
 include!("fanout.rs");
 include!("s3.rs");
+include!("devices.rs");
 include!("social_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");

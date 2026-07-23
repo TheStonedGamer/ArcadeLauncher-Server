@@ -569,6 +569,10 @@ enum OutMsg {
 struct SocialConn {
     conn_id: u64,
     tx: tokio::sync::mpsc::UnboundedSender<OutMsg>,
+    // Which machine this socket is. None for clients that predate device
+    // identity (they still get chat and presence; they just never appear in the
+    // phone's remote-install picker). See devices.rs for the naming rules.
+    device: Option<Device>,
 }
 
 struct SocialHub {
@@ -592,11 +596,45 @@ fn social_hub() -> &'static SocialHub {
 }
 
 impl SocialHub {
-    fn register(&self, user_id: u64, tx: tokio::sync::mpsc::UnboundedSender<OutMsg>) -> u64 {
+    fn register(
+        &self,
+        user_id: u64,
+        tx: tokio::sync::mpsc::UnboundedSender<OutMsg>,
+        device: Option<Device>,
+    ) -> u64 {
         let conn_id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.conns.lock().unwrap();
-        g.entry(user_id).or_default().push(SocialConn { conn_id, tx });
+        g.entry(user_id).or_default().push(SocialConn { conn_id, tx, device });
         conn_id
+    }
+
+    // The machines this user is currently signed in on, collapsed one row per
+    // device. Only this instance's sockets are visible: remote install targets a
+    // live socket, so a device held by a peer instance is genuinely not
+    // addressable from here and must not be offered as if it were.
+    fn devices_for(&self, user_id: u64) -> Vec<Device> {
+        let g = self.conns.lock().unwrap();
+        let list = g
+            .get(&user_id)
+            .map(|v| v.iter().filter_map(|c| c.device.clone()).collect())
+            .unwrap_or_default();
+        collapse_devices(list)
+    }
+
+    // Deliver to the single most recently registered socket for one device.
+    // Returns false when that device has no live socket here, so the caller can
+    // tell the phone the PC went away rather than silently dropping the command.
+    fn send_to_device(&self, user_id: u64, device_id: &str, msg: &str) -> bool {
+        let g = self.conns.lock().unwrap();
+        let Some(v) = g.get(&user_id) else { return false };
+        let Some(conn) = v
+            .iter()
+            .rev()
+            .find(|c| c.device.as_ref().is_some_and(|d| d.id == device_id))
+        else {
+            return false;
+        };
+        conn.tx.send(OutMsg::Text(msg.to_string())).is_ok()
     }
 
     fn unregister(&self, user_id: u64, conn_id: u64) -> bool {
@@ -2033,6 +2071,15 @@ async fn attachments_for_messages(
 struct WsAuthQuery {
     #[serde(default)]
     token: String,
+    // Device identity (0.14): optional so older launchers keep connecting.
+    #[serde(default, rename = "deviceId")]
+    device_id: String,
+    #[serde(default, rename = "deviceName")]
+    device_name: String,
+    #[serde(default, rename = "deviceKind")]
+    device_kind: String,
+    #[serde(default, rename = "appVersion")]
+    app_version: String,
 }
 
 async fn ws_social(
@@ -2056,22 +2103,31 @@ async fn ws_social(
         return unauthorized();
     };
     let uid = user.id;
-    ws.on_upgrade(move |socket| social_socket(st, uid, socket))
+    let device = parse_device(&q.device_id, &q.device_name, &q.device_kind, &q.app_version);
+    ws.on_upgrade(move |socket| social_socket(st, uid, device, socket))
 }
 
-async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSocket) {
+async fn social_socket(
+    st: AppState,
+    uid: u64,
+    device: Option<Device>,
+    socket: axum::extract::ws::WebSocket,
+) {
     use axum::extract::ws::Message;
     use futures_util::SinkExt;
 
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OutMsg>();
-    let conn_id = social_hub().register(uid, tx.clone());
+    let my_device = device.as_ref().map(|d| d.id.clone());
+    let conn_id = social_hub().register(uid, tx.clone(), device);
     fanout_set_online(uid); // cross-instance online registry (no-op without Redis)
 
     // First frame tells the client its own account id so it can align sent vs
-    // received messages and ignore self-presence echoes.
+    // received messages and ignore self-presence echoes. `deviceId` echoes back
+    // the identity the server actually accepted — a client whose id failed
+    // validation sees null and knows it will not be an install target.
     let _ = tx.send(OutMsg::Text(
-        serde_json::json!({ "type": "hello", "selfId": uid }).to_string(),
+        serde_json::json!({ "type": "hello", "selfId": uid, "deviceId": my_device.clone() }).to_string(),
     ));
 
     // Redeliver anything that happened while this user was offline.
@@ -2089,6 +2145,10 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
         set_presence(&st.db, uid, "online", None, None, None).await;
         push_presence_diff(&st, uid).await;
     }
+
+    // Every one of this account's own sockets learns the new device list, so a
+    // phone that is already open sees a PC appear without polling.
+    push_device_list(uid);
 
     // Outbound pump: drains the hub channel to the socket. Also emits a server
     // heartbeat every 25s so idle connections (and proxies) stay alive.
@@ -2128,7 +2188,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
         while let Some(Ok(frame)) = stream.next().await {
             match frame {
                 Message::Text(txt) => {
-                    handle_ws_message(&st_in, uid, &txt).await;
+                    handle_ws_message(&st_in, uid, my_device.as_deref(), &txt).await;
                 }
                 Message::Binary(data) => {
                     handle_ws_audio(uid, &data);
@@ -2147,6 +2207,7 @@ async fn social_socket(st: AppState, uid: u64, socket: axum::extract::ws::WebSoc
 
     // Teardown: drop this connection; if it was the last, go offline + notify.
     let last = social_hub().unregister(uid, conn_id);
+    push_device_list(uid);
     if last {
         social_hub().drop_voice_for(uid);
         fanout_clear_online(uid); // remove from cross-instance registry
@@ -2206,9 +2267,29 @@ struct WsEnvelope {
     status_text: String,
     #[serde(default)]
     dnd: bool,
+    // Remote install (0.14): the device to act on, and the status a desktop
+    // reports back once it has acted.
+    #[serde(default)]
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    message: String,
 }
 
-async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
+// Broadcast the account's current device list to its own sockets. Local-only on
+// purpose: the list describes sockets held by *this* instance, so fanning it out
+// over Redis would let a peer instance advertise targets it cannot reach.
+fn push_device_list(uid: u64) {
+    let devices = social_hub().devices_for(uid);
+    social_hub().deliver_local(
+        uid,
+        &serde_json::json!({ "type": "devices", "devices": devices }).to_string(),
+    );
+}
+
+async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt: &str) {
     let Ok(env) = serde_json::from_str::<WsEnvelope>(txt) else {
         return;
     };
@@ -2296,6 +2377,75 @@ async fn handle_ws_message(st: &AppState, uid: u64, txt: &str) {
                     .to_string(),
                 );
             }
+        }
+        "devices" => {
+            // The phone asks for the picker contents; everyone on the account
+            // gets the same answer so no socket holds a stale list.
+            push_device_list(uid);
+        }
+        "remote_install" => {
+            // Install a game on another machine *of the same account*. There is
+            // no cross-account addressing here at all: the candidate list is
+            // this user's own live sockets, so nothing to authorise beyond the
+            // token that already opened this connection.
+            let devices = social_hub().devices_for(uid);
+            match check_install_target(&env.device_id, &env.game_id, &devices) {
+                Ok(target) => {
+                    let cmd = serde_json::json!({
+                        "type": "remote_install",
+                        "gameId": env.game_id,
+                        "gameTitle": env.game_title,
+                        "fromDeviceId": my_device,
+                    })
+                    .to_string();
+                    let delivered = social_hub().send_to_device(uid, &target, &cmd);
+                    // Report acceptance to every socket on the account, not just
+                    // the requester, so a second phone sees the install too.
+                    social_hub().deliver_local(
+                        uid,
+                        &serde_json::json!({
+                            "type": "remote_install_ack",
+                            "deviceId": target,
+                            "gameId": env.game_id,
+                            "ok": delivered,
+                            "error": if delivered { serde_json::Value::Null }
+                                     else { serde_json::json!(InstallReject::UnknownDevice.code()) },
+                            "message": if delivered { "Sent to your PC." }
+                                       else { InstallReject::UnknownDevice.message() },
+                        })
+                        .to_string(),
+                    );
+                }
+                Err(reject) => {
+                    social_hub().deliver_local(
+                        uid,
+                        &serde_json::json!({
+                            "type": "remote_install_ack",
+                            "deviceId": env.device_id,
+                            "gameId": env.game_id,
+                            "ok": false,
+                            "error": reject.code(),
+                            "message": reject.message(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+        "remote_install_result" => {
+            // A desktop reporting what happened. Relayed unchanged to the
+            // account's sockets; the server holds no install state of its own.
+            social_hub().deliver_local(
+                uid,
+                &serde_json::json!({
+                    "type": "remote_install_result",
+                    "deviceId": my_device,
+                    "gameId": env.game_id,
+                    "status": env.status,
+                    "message": env.message,
+                })
+                .to_string(),
+            );
         }
         _ => {}
     }
