@@ -1,0 +1,52 @@
+# The single catalog-scanner instance. Owns the filesystem watcher + auto-rescan
+# (ARCADE_ENABLE_SCANNER defaults on). Exactly one replica and Recreate strategy
+# so the shared library is never scanned by two processes at once. It mounts the
+# library read-WRITE (art cache writes, texture packs) unlike the read-only API.
+#
+# It runs the same binary and also binds :8721/:8722, but no Service points at it,
+# so it takes no client/API traffic — it just keeps the catalog fresh in MariaDB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arcade-scanner
+  namespace: arcade
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # never two scanners overlapping during a rollout
+  selector:
+    matchLabels:
+      app: arcade-scanner
+  template:
+    metadata:
+      labels:
+        app: arcade-scanner
+    spec:
+      containers:
+        - name: server
+          image: brianthemint/arcadelauncher-server:0.13.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # Same generated arcade-secrets as the API pods (see deploy README).
+            - secretRef:    { name: arcade-secrets }
+          env:
+            - name: ARCADE_ENABLE_SCANNER
+              value: "true"
+          ports:
+            - name: api
+              containerPort: 8721
+          volumeMounts:
+            - name: library
+              mountPath: /srv/arcade-library
+              readOnly: false
+          readinessProbe:
+            httpGet: { path: /api/health, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+      volumes:
+        - name: library
+          persistentVolumeClaim:
+            claimName: arcade-library

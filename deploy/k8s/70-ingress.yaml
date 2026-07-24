@@ -1,0 +1,60 @@
+# Cluster entry point for the public API. TLS is still terminated at the existing
+# public nginx (10.0.0.203) — at cutover its upstream changes from 10.0.0.210:8721
+# to this ingress (or the NodePort below), so nothing about the public certificate
+# or arcade.orlandoaio.net domain changes.
+#
+# k3s ships Traefik, which upgrades WebSocket (/ws/social) transparently — no extra
+# annotation needed. If you disabled Traefik for another controller, port /ws/.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: arcade-api
+  namespace: arcade
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: arcade.orlandoaio.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: arcade-api
+                port:
+                  number: 8721
+---
+# LIVE cutover path: the public nginx (10.0.0.203) proxies to this NodePort
+# (upstream = 10.0.0.112:30721) rather than the Traefik Ingress, avoiding
+# Host-routing coupling. This is what serves arcade.orlandoaio.net today.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-api-nodeport
+  namespace: arcade
+spec:
+  type: NodePort
+  selector:
+    app: arcade-api
+  ports:
+    - name: api
+      port: 8721
+      targetPort: api
+      nodePort: 30721
+---
+# Admin console (same binary, port 8722) exposed on the LAN only — NOT routed
+# through the public nginx. Reach it at http://<node-ip>:30722/admin.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-admin-nodeport
+  namespace: arcade
+spec:
+  type: NodePort
+  selector:
+    app: arcade-api
+  ports:
+    - name: admin
+      port: 8722
+      targetPort: admin
+      nodePort: 30722

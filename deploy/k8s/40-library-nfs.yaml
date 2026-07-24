@@ -1,0 +1,42 @@
+# Shared game library, mounted read-only by every API replica and read-write by
+# the single scanner pod. Content stays where it is (no object-store migration).
+#
+# Single-node cluster (arcade-k3s @ 10.0.0.112): the library is staged on the node
+# host at /srv/arcade-library, where
+#   /srv/arcade-library/games   = NFS mount of the NAS roms export
+#                                 (10.0.0.102:/mnt/Assets Pool/Roms, ~1.3 TiB)
+#   /srv/arcade-library/*       = emulators + metadata rsynced from the app CT
+# so a hostPath PV is the simplest correct binding (all pods land on this one node).
+# If this ever becomes multi-node, swap this PV for an NFS PV exported to every node.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: arcade-library
+  labels:
+    volume: arcade-library
+spec:
+  capacity:
+    storage: 2Ti            # nominal; hostPath is not size-enforced
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /srv/arcade-library
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arcade-library
+  namespace: arcade
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""      # bind statically to the PV above (no dynamic provisioner)
+  resources:
+    requests:
+      storage: 2Ti
+  selector:
+    matchLabels:
+      volume: arcade-library

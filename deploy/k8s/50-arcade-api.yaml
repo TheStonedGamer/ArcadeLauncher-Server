@@ -1,0 +1,103 @@
+# Stateless public API + WebSocket gateway. Scales horizontally: all session,
+# auth, config and stats state is in MariaDB, and cross-pod social fan-out goes
+# through Redis (src/fanout.rs). Scanner is DISABLED here — a dedicated pod owns
+# it (60-arcade-scanner.yaml) so the shared library is never scanned concurrently.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arcade-api
+  namespace: arcade
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: arcade-api
+  template:
+    metadata:
+      labels:
+        app: arcade-api
+    spec:
+      containers:
+        - name: server
+          image: brianthemint/arcadelauncher-server:0.13.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # arcade-secrets is generated from the app CT's env file (with cluster
+            # overrides) so runtime config matches prod exactly — see deploy README.
+            - secretRef:    { name: arcade-secrets }
+          env:
+            - name: ARCADE_ENABLE_SCANNER   # API replicas never run the watcher
+              value: "false"
+          ports:
+            - name: api
+              containerPort: 8721
+            - name: admin
+              containerPort: 8722
+          volumeMounts:
+            - name: library
+              mountPath: /srv/arcade-library
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /api/health, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: api }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "150m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+      volumes:
+        - name: library
+          persistentVolumeClaim:
+            claimName: arcade-library
+---
+# Public API Service (fronted by the Ingress). Only the API port is exposed here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-api
+  namespace: arcade
+spec:
+  selector:
+    app: arcade-api
+  ports:
+    - name: api
+      port: 8721
+      targetPort: api
+---
+# Admin console — internal ClusterIP only, never routed through the public Ingress.
+# Reach it via port-forward or an internal-only vhost (kept off the public domain).
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-admin
+  namespace: arcade
+spec:
+  selector:
+    app: arcade-api
+  ports:
+    - name: admin
+      port: 8722
+      targetPort: admin
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: arcade-api
+  namespace: arcade
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: arcade-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
