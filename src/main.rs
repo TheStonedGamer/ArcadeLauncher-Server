@@ -38,6 +38,7 @@ use tokio::{
     process::Command,
 };
 use tokio_util::io::ReaderStream;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -72,9 +73,15 @@ include!("discord.rs");
 include!("users_api.rs");
 include!("fanout.rs");
 include!("s3.rs");
+include!("devices.rs");
+include!("guard.rs");
 include!("social_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");
+include!("store_api.rs");
+include!("store_auth.rs");
+include!("store_lib.rs");
+include!("store_downloads.rs");
 
 // The former standalone Requests service, folded in as a real module (NOT an
 // include!) so its same-named helpers stay namespaced. Mounted under /requests
@@ -152,6 +159,29 @@ async fn main() -> Result<()> {
         .route("/api/config", get(api_config_all))
         .route("/api/config/:ns", get(api_config_get).post(api_config_put))
         .route("/api/catalog", get(api_catalog))
+        .route("/api/library", get(api_library))
+        .route(
+            "/api/library/:id",
+            post(api_library_add).delete(api_library_remove),
+        )
+        // Public, unauthenticated storefront (Steam-style browse) — see store_api.rs.
+        .route("/api/store/summary", get(store_summary))
+        .route("/api/store/games", get(store_games))
+        .route("/api/store/games/:id", get(store_game_detail))
+        // Storefront browser sessions (cookie auth) — see store_auth.rs. Register
+        // reuses the launcher's admin-approval flow at /api/auth/register.
+        .route("/api/store/auth/login", post(store_login))
+        .route("/api/store/auth/logout", post(store_logout))
+        .route("/api/store/auth/me", get(store_me))
+        // Steam-style per-user library ("ownership") — see store_lib.rs.
+        .route("/api/store/library", get(store_library_list))
+        .route(
+            "/api/store/library/:id",
+            post(store_library_add).delete(store_library_remove),
+        )
+        // Self-hosted launcher installers — see store_downloads.rs. The files
+        // themselves are served statically by the ServeDir mounted below.
+        .route("/api/downloads/latest", get(store_downloads_latest))
         .route("/api/games/:id/manifest", get(api_manifest))
         .route("/api/games/:id/changelogs", get(api_changelogs))
         .route("/api/social/friends", get(api_social_friends))
@@ -225,6 +255,8 @@ async fn main() -> Result<()> {
         .route("/files/:id/*rel", get(download_file))
         .route("/chunks/:id/:file_index/:chunk_index/*rel", get(download_chunk))
         .route("/textures/:id", get(download_texture))
+        // Static launcher installers, listed by /api/downloads/latest.
+        .nest_service("/downloads", ServeDir::new(&cfg.downloads_dir))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -253,7 +285,14 @@ async fn main() -> Result<()> {
     // polling). spawn_rescan() no-ops while a scan is already running, so an
     // in-progress manual rescan is never disturbed. If the watcher can't be set
     // up we fall back to the old interval poll (auto_rescan_secs; 0 disables).
-    if !start_library_watcher(auto_rescan_state.clone()) {
+    //
+    // Only the scanner-owning process runs this. On k3s the stateless API
+    // replicas set ARCADE_ENABLE_SCANNER=false so they never watch or rescan the
+    // shared library; a single dedicated scanner pod keeps it enabled. Manual
+    // admin rescan (spawn_rescan via the admin UI) still works everywhere.
+    if !auto_rescan_state.cfg.scanner_enabled {
+        info!("catalog scanner disabled (ARCADE_ENABLE_SCANNER=false); this instance serves only");
+    } else if !start_library_watcher(auto_rescan_state.clone()) {
         if auto_rescan_state.cfg.auto_rescan_secs > 0 {
             let st = auto_rescan_state;
             let period = st.cfg.auto_rescan_secs;

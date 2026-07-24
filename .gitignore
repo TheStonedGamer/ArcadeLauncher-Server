@@ -9,3 +9,6 @@ scr111.png
 # Local-only handoff/secrets docs — internal IPs + AD/Cloudflare object IDs, never commit (public repo)
 *.local.md
 ADMIN_ACCESS_HANDOFF.local.md
+
+# Real k3s Secret (MinIO/DB creds) — only the *.example.yaml template is committed
+deploy/k8s/10-secret.yaml

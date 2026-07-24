@@ -91,6 +91,12 @@ struct Config {
     admin_port: u16,
     library_root: PathBuf,
     auto_rescan_secs: u64,
+    // Whether this process owns catalog scanning (the filesystem watcher + the
+    // auto-rescan fallback). Default true preserves single-instance behavior. On
+    // k3s the stateless API replicas set ARCADE_ENABLE_SCANNER=false and a single
+    // dedicated scanner pod keeps it true, so the shared library is scanned once,
+    // never concurrently by every replica.
+    scanner_enabled: bool,
     auth_token: String,
     admin_username: String,
     admin_email: String,
@@ -119,6 +125,10 @@ struct Config {
     // Optional SMTP for sending those approval emails. Some(...) only when host +
     // From are set; otherwise the request is logged with the approve/deny links.
     smtp: Option<SmtpConfig>,
+    // Directory of self-hosted launcher installers served at /downloads and
+    // listed by /api/downloads/latest. Defaults to <library_root>/.arcadelauncher/
+    // downloads; override with ARCADE_DOWNLOADS_DIR. Missing dir ⇒ empty list.
+    downloads_dir: PathBuf,
 }
 
 // Outbound SMTP for admin notifications (registration approvals). Auth is
@@ -196,6 +206,14 @@ impl Config {
                 _ => i += 1,
             }
         }
+        let downloads_dir = {
+            let d = env_string("ARCADE_DOWNLOADS_DIR", "");
+            if d.is_empty() {
+                library_root.join(".arcadelauncher").join("downloads")
+            } else {
+                PathBuf::from(d)
+            }
+        };
         Ok(Self {
             host,
             port,
@@ -203,6 +221,7 @@ impl Config {
             admin_port,
             library_root,
             auto_rescan_secs: env_u64("ARCADE_AUTO_RESCAN_SECS", 1800),
+            scanner_enabled: env_string("ARCADE_ENABLE_SCANNER", "true") != "false",
             auth_token: env_string("ARCADE_AUTH_TOKEN", ""),
             admin_username: env_string("ARCADE_ADMIN_USERNAME", "admin"),
             admin_email: env_string("ARCADE_ADMIN_EMAIL", ""),
@@ -275,6 +294,7 @@ impl Config {
                     })
                 }
             },
+            downloads_dir,
         })
     }
 

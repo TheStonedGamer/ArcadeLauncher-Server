@@ -1,0 +1,43 @@
+# Redis backs the cross-instance social fan-out + presence registry (src/fanout.rs).
+# Ephemeral by design: it carries only live pub/sub frames and TTL'd presence keys,
+# never durable state, so a restart just re-warms as clients heartbeat.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-redis
+  namespace: arcade
+spec:
+  selector:
+    app: arcade-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arcade-redis
+  namespace: arcade
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arcade-redis
+  template:
+    metadata:
+      labels:
+        app: arcade-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { memory: "384Mi" }

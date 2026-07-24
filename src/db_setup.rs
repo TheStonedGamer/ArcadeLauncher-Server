@@ -112,6 +112,32 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // Steam-style ownership. A row means "this user added this game to their
+    // library" — free, but required before the launcher will install/show it.
+    // player_count on the storefront is derived from this table.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS user_library (
+          user_id  BIGINT UNSIGNED NOT NULL,
+          game_id  VARCHAR(190)    NOT NULL,
+          added_at BIGINT          NOT NULL,
+          PRIMARY KEY (user_id, game_id),
+          INDEX idx_lib_game (game_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
+    // Browser sessions for the public storefront (distinct from admin_sessions,
+    // which gate the :8722 admin UI). A cookie carries the token; we store only
+    // its SHA-256 hash. Same shape as admin_sessions.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS user_sessions (
+          token_hash CHAR(64) NOT NULL PRIMARY KEY,
+          user_id    BIGINT UNSIGNED NOT NULL,
+          expires_at BIGINT NOT NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_usess_user (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS games (
           id VARCHAR(96) NOT NULL PRIMARY KEY,

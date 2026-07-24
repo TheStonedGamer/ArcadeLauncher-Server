@@ -1,0 +1,30 @@
+# Non-secret env shared by the API and scanner pods. Secret values (passwords,
+# tokens, keys) live in the arcade-secrets Secret, not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arcade-config
+  namespace: arcade
+data:
+  # Listeners: bind both API and admin on 0.0.0.0 inside the pod. The admin port
+  # is only reachable via the internal arcade-admin Service (never the Ingress).
+  ARCADE_HOST: "0.0.0.0"
+  ARCADE_PORT: "8721"
+  ARCADE_ADMIN_HOST: "0.0.0.0"
+  ARCADE_ADMIN_PORT: "8722"
+  # Shared library mount (NFS RWX). Content paths in the DB are relative to this.
+  ARCADE_LIBRARY_ROOT: "/srv/arcade-library"
+  # Database — the in-cluster MariaDB StatefulSet, reached by its headless Service.
+  ARCADE_DB_HOST: "arcade-mariadb.arcade.svc.cluster.local"
+  ARCADE_DB_PORT: "3306"
+  ARCADE_DB_NAME: "arcadelauncher"
+  ARCADE_DB_USER: "arcade"
+  # Redis enables the cross-instance social fan-out (src/fanout.rs). Required for
+  # correct presence/roster once there is more than one API replica.
+  ARCADE_REDIS_URL: "redis://arcade-redis.arcade.svc.cluster.local:6379"
+  # MinIO / S3 for DM attachments (existing feature). Blank endpoint => dormant.
+  ARCADE_S3_ENDPOINT: "http://10.0.0.220:9000"
+  ARCADE_S3_BUCKET: "arcade-attachments"
+  ARCADE_S3_REGION: "us-east-1"
+  # Registration stays closed unless explicitly opened.
+  ARCADE_REGISTRATION_OPEN: "false"

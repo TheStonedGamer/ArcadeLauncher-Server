@@ -1,0 +1,71 @@
+# In-cluster MariaDB. The server's db_setup.rs is idempotent (CREATE TABLE IF NOT
+# EXISTS + best-effort ALTERs), so a fresh volume self-migrates on first boot —
+# but production data is loaded by the gated migration step (see README, Stage 4).
+apiVersion: v1
+kind: Service
+metadata:
+  name: arcade-mariadb
+  namespace: arcade
+spec:
+  clusterIP: None          # headless: stable DNS for the StatefulSet pod
+  selector:
+    app: arcade-mariadb
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arcade-mariadb
+  namespace: arcade
+spec:
+  serviceName: arcade-mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arcade-mariadb
+  template:
+    metadata:
+      labels:
+        app: arcade-mariadb
+    spec:
+      containers:
+        - name: mariadb
+          image: mariadb:11
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: arcade-secrets, key: MARIADB_ROOT_PASSWORD }
+            - name: MARIADB_DATABASE
+              value: arcadelauncher
+            - name: MARIADB_USER
+              value: arcade
+            - name: MARIADB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: arcade-secrets, key: ARCADE_DB_PASSWORD }
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mariadb-admin ping -h127.0.0.1 -uroot -p$MARIADB_ROOT_PASSWORD"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path   # k3s default provisioner on arcade-k3s
+        resources:
+          requests:
+            storage: 20Gi

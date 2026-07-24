@@ -16,6 +16,102 @@ async fn api_catalog(State(st): State<AppState>, headers: HeaderMap) -> Response
     }
 }
 
+// Steam-style ownership gate. A request bearing a real per-user token may only
+// install/download games in that user's library. The static service token
+// resolves to no user (returns None here) and passes — it's used by internal
+// tooling/admin — as do admins. Returns Some(403) when access should be denied.
+async fn ownership_gate(st: &AppState, headers: &HeaderMap, game_id: &str) -> Option<Response> {
+    let user = launcher_user(st, headers).await?; // no per-user token → not gated
+    if user.is_admin || user_owns(&st.db, user.id, game_id).await {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "not in your library",
+                "detail": "Add this game to your library on the store website before installing.",
+            })),
+        )
+            .into_response(),
+    )
+}
+
+// GET /api/library — the owned-game ids for the launcher account behind the
+// Bearer token, so the client can filter its catalog to the user's library.
+async fn api_library(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    match owned_game_ids(&st.db, user.id).await {
+        Ok(ids) => Json(serde_json::json!({
+            "schemaVersion": 1,
+            "isAdmin": user.is_admin,
+            "gameIds": ids,
+        }))
+        .into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+// POST /api/library/:id — add a game to the launcher account's library. Bearer
+// (native per-user token) counterpart to the cookie-authed store_library_add, so
+// the in-launcher Store tab can add games without a browser session.
+async fn api_library_add(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    match find_game(&st.db, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "game not found"}))).into_response(),
+        Err(e) => return server_error(e),
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            "INSERT INTO user_library (user_id,game_id,added_at) VALUES (:u,:g,:t) \
+             ON DUPLICATE KEY UPDATE added_at = added_at",
+            params! {"u" => user.id, "g" => &id, "t" => now()},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true, "id": id, "owned": true})).into_response()
+}
+
+// DELETE /api/library/:id — remove a game from the launcher account's library.
+async fn api_library_remove(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(user) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            "DELETE FROM user_library WHERE user_id=:u AND game_id=:g",
+            params! {"u" => user.id, "g" => &id},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    Json(serde_json::json!({"ok": true, "id": id, "owned": false})).into_response()
+}
+
 async fn api_manifest(State(st): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<String>) -> Response {
     if !authorized_api(&st, &headers).await {
         return unauthorized();
@@ -25,6 +121,9 @@ async fn api_manifest(State(st): State<AppState>, headers: HeaderMap, AxumPath(i
         Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "game not found"}))).into_response(),
         Err(e) => return server_error(e),
     };
+    if let Some(denied) = ownership_gate(&st, &headers, &game.id).await {
+        return denied;
+    }
     match manifest_for(&st, &headers, &game).await {
         Ok(m) => Json(m).into_response(),
         Err(e) => {
@@ -62,6 +161,9 @@ async fn download_file(
         Ok(None) => return (StatusCode::NOT_FOUND, "game not found").into_response(),
         Err(e) => return server_error(e),
     };
+    if let Some(denied) = ownership_gate(&st, &headers, &game.id).await {
+        return denied;
+    }
     let file_path = match file_path_for(&st.cfg, &game, &rel).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -89,6 +191,9 @@ async fn download_chunk(
         Ok(None) => return (StatusCode::NOT_FOUND, "game not found").into_response(),
         Err(e) => return server_error(e),
     };
+    if let Some(denied) = ownership_gate(&st, &headers, &game.id).await {
+        return denied;
+    }
     let file_path = match file_path_for(&st.cfg, &game, &rel).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
