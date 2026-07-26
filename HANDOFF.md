@@ -1,6 +1,19 @@
 # ArcadeLauncher Server — Session Handoff
 
-_Last updated: 2026-06-21_
+_Last updated: 2026-07-26_
+
+## QR sign-in + storefront favicon (0.14.2)
+
+- Added MariaDB-backed `/api/auth/qr/{start,inspect,decide,poll}` for launcher
+  and storefront passwordless sign-in. Scan and poll secrets are distinct,
+  stored only as SHA-256 hashes, expire after three minutes, and completion is
+  compare-and-swap consumed once across replicas.
+- Approval requires a real launcher-user bearer token. The mobile client also
+  pins scanned QR codes to its current session host before sending that token.
+- Store `/login` now renders/polls QR requests and receives its existing
+  HttpOnly `AL_STORE_SESSION` cookie on completion. Brand favicon/touch assets
+  are already committed in `9fa8c8c`.
+- Validation: `cargo test` 69/69, `cargo check`, and store production build pass.
 
 **Rust / axum 0.7 / tokio** backend with a **MariaDB** (`mysql_async`) catalog, Argon2/TOTP auth, and an
 admin HTML UI rendered via `format!`. Serves the `ArcadeLauncher-Client` Windows launcher. See the

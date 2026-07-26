@@ -138,6 +138,27 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
     )
     .await?;
+    // QR sign-in handoff shared by all API replicas. The QR contains only the
+    // short-lived scan secret; the browser/launcher keeps a different poll
+    // secret, so photographing a QR cannot retrieve the resulting session.
+    c.query_drop(
+        r#"CREATE TABLE IF NOT EXISTS qr_signin_challenges (
+          id          CHAR(32) NOT NULL PRIMARY KEY,
+          scan_hash   CHAR(64) NOT NULL,
+          poll_hash   CHAR(64) NOT NULL,
+          target      VARCHAR(16) NOT NULL,
+          device_name VARCHAR(120) NOT NULL,
+          ip          VARCHAR(64) NULL,
+          user_id     BIGINT UNSIGNED NULL,
+          state       VARCHAR(16) NOT NULL DEFAULT 'pending',
+          expires_at  BIGINT NOT NULL,
+          created_at  BIGINT NOT NULL,
+          consumed_at BIGINT NULL,
+          INDEX idx_qr_expiry (expires_at),
+          INDEX idx_qr_user (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    )
+    .await?;
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS games (
           id VARCHAR(96) NOT NULL PRIMARY KEY,

@@ -44,6 +44,10 @@ export const login = (username, password, totp) =>
 export const logout = () => send('/api/store/auth/logout', 'POST')
 export const register = (username, email, password) =>
   send('/api/auth/register', 'POST', { username, email, password })
+export const startQrSignin = (target, deviceName) =>
+  send('/api/auth/qr/start', 'POST', { target, deviceName })
+export const pollQrSignin = (challengeId, pollToken) =>
+  send('/api/auth/qr/poll', 'POST', { challengeId, pollToken })
 // Resolve the current session, or null when signed out (401 is expected, not an error).
 export async function me() {
   const res = await fetch('/api/store/auth/me', {

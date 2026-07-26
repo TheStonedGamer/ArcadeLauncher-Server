@@ -80,6 +80,7 @@ include!("registration.rs");
 include!("password_reset.rs");
 include!("store_api.rs");
 include!("store_auth.rs");
+include!("qr_auth.rs");
 include!("store_lib.rs");
 include!("store_downloads.rs");
 
@@ -131,6 +132,10 @@ async fn main() -> Result<()> {
         .route("/api/auth/register", post(api_auth_register))
         .route("/api/auth/approve", get(api_auth_approve))
         .route("/api/auth/deny", get(api_auth_deny))
+        .route("/api/auth/qr/start", post(qr_signin_start))
+        .route("/api/auth/qr/inspect", post(qr_signin_inspect))
+        .route("/api/auth/qr/decide", post(qr_signin_decide))
+        .route("/api/auth/qr/poll", post(qr_signin_poll))
         .route("/api/auth/forgot", post(api_auth_forgot))
         .route("/api/auth/reset", get(api_auth_reset_page).post(api_auth_reset_submit))
         .route("/api/account", get(api_account))

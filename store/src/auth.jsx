@@ -44,6 +44,11 @@ export function AuthProvider({ children }) {
     return u
   }, [refreshLibrary])
 
+  const acceptQrLogin = useCallback(async (u) => {
+    setUser(u)
+    await refreshLibrary()
+  }, [refreshLibrary])
+
   const logout = useCallback(async () => {
     try { await api.logout() } catch { /* ignore */ }
     setUser(null)
@@ -70,11 +75,12 @@ export function AuthProvider({ children }) {
     ownedIds,
     isOwned: (id) => ownedIds.has(id),
     login,
+    acceptQrLogin,
     logout,
     addToLibrary,
     removeFromLibrary,
     refreshLibrary,
-  }), [user, loading, ownedIds, login, logout, addToLibrary, removeFromLibrary, refreshLibrary])
+  }), [user, loading, ownedIds, login, acceptQrLogin, logout, addToLibrary, removeFromLibrary, refreshLibrary])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

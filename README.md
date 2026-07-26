@@ -121,6 +121,13 @@ Launcher clients additionally get account self-service against this server:
 and `/api/account/totp/{setup,enable,disable}` (enable/disable TOTP, returns an
 `otpauth://` URI the client renders as a QR code).
 
+Passwordless QR sign-in uses `/api/auth/qr/{start,inspect,decide,poll}`. A
+launcher or storefront creates a three-minute request and keeps a private poll
+capability; the QR carries a different scan capability. Only an authenticated
+mobile bearer session can approve, and polling consumes the completed login
+exactly once. Challenges are stored in MariaDB so polling works across API
+replicas.
+
 Launcher clients may authenticate with either `ARCADE_AUTH_TOKEN` or a named token created in the admin UI. Keep admin access LAN/VPN-only unless you add TLS and stronger authentication.
 
 Password reset emails use these optional SMTP settings:
