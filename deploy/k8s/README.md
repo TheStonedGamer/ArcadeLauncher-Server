@@ -154,7 +154,8 @@ a separate Vite/React SPA (source in `../../store/`) built into an nginx image
   `/api/store/summary` = 2050 games / 9 platforms, `/api/health` = 0.13.0,
   `/art/:id` = 200, `/requests/` = 200, `/api/catalog` = 401 (expected).
 
-The 0.14.2 API and 0.2.0 store image add passwordless QR sign-in. Challenges
+The QR sign-in code entered at 0.14.2; the aligned live deployment uses the
+0.14.4 API and 0.2.0 store images. Challenges
 are in MariaDB (not pod memory), so a start/approve/poll sequence remains valid
 when requests land on different API replicas. The store image also includes the
 Arcade Launcher favicon and touch icons.
