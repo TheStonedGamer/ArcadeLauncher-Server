@@ -14,7 +14,7 @@ export default function App() {
             <span className="brand-text">Arcade Launcher</span>
           </Link>
           <nav className="topnav">
-            <NavLink to="/" end>Store</NavLink>
+            {user && <NavLink to="/" end>Store</NavLink>}
             {user && <NavLink to="/library">Library</NavLink>}
             <NavLink to="/download">Download</NavLink>
           </nav>

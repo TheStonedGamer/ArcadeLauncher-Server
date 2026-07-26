@@ -9,6 +9,7 @@ import Login from './pages/Login.jsx'
 import Register from './pages/Register.jsx'
 import Library from './pages/Library.jsx'
 import Download from './pages/Download.jsx'
+import RequireAuth from './RequireAuth.jsx'
 import './styles.css'
 
 createRoot(document.getElementById('root')).render(
@@ -17,11 +18,11 @@ createRoot(document.getElementById('root')).render(
       <AuthProvider>
         <Routes>
           <Route path="/" element={<App />}>
-            <Route index element={<Home />} />
-            <Route path="game/:id" element={<GameDetail />} />
+            <Route index element={<RequireAuth><Home /></RequireAuth>} />
+            <Route path="game/:id" element={<RequireAuth><GameDetail /></RequireAuth>} />
             <Route path="login" element={<Login />} />
             <Route path="register" element={<Register />} />
-            <Route path="library" element={<Library />} />
+            <Route path="library" element={<RequireAuth><Library /></RequireAuth>} />
             <Route path="download" element={<Download />} />
           </Route>
         </Routes>

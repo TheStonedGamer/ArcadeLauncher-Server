@@ -2,6 +2,13 @@
 
 _Last updated: 2026-07-26_
 
+## Store catalog sign-in gate (0.14.5 / store 0.2.1)
+
+- Anonymous visitors are redirected to `/login` before the store, game-detail,
+  or library routes render. Login, registration, and launcher downloads remain public.
+- `/api/store/summary`, `/api/store/games`, and `/api/store/games/:id` also require
+  a valid `AL_STORE_SESSION`, preventing direct API requests from bypassing the UI.
+
 ## QR sign-in + storefront favicon (0.14.2)
 
 - Added MariaDB-backed `/api/auth/qr/{start,inspect,decide,poll}` for launcher

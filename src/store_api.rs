@@ -1,9 +1,9 @@
-// store_api.rs - public, UNAUTHENTICATED storefront endpoints (Steam-style browse).
+// store_api.rs - authenticated storefront endpoints (Steam-style browse).
 // Assembled via include! at crate-root scope like the other modules, so it shares
 // AppState, Game, list_games/find_game, and the art helpers.
 //
-// SECURITY: every handler here is deliberately public (no authorized_api gate).
-// It must expose ONLY non-sensitive catalog metadata + aggregate community stats.
+// SECURITY: every handler here requires a valid storefront cookie session and
+// exposes only non-sensitive catalog metadata + aggregate community stats.
 // Never surface tokens, user identities, content_path, launch args, or per-user
 // rows. The shaping structs below are the allow-list — do not serialize `Game`
 // directly (it carries content_path / launch).
@@ -91,9 +91,20 @@ async fn owned_set_for_request(st: &AppState, headers: &HeaderMap) -> std::colle
     }
 }
 
-// GET /api/store/games — full public catalog as lightweight cards. No per-game
+fn store_signin_required() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "sign in required"})),
+    )
+        .into_response()
+}
+
+// GET /api/store/games — authenticated catalog as lightweight cards. No per-game
 // stats here (kept fast + cacheable); the detail endpoint carries stats.
 async fn store_games(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if web_user(&st, &headers).await.is_none() {
+        return store_signin_required();
+    }
     match list_games(&st.db).await {
         Ok(mut games) => {
             let base = public_base_url(&st, &headers).await;
@@ -165,6 +176,9 @@ async fn store_game_detail(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if web_user(&st, &headers).await.is_none() {
+        return store_signin_required();
+    }
     let mut game = match find_game(&st.db, &id).await {
         Ok(Some(g)) => g,
         Ok(None) => {
@@ -201,7 +215,10 @@ async fn store_game_detail(
 }
 
 // GET /api/store/summary — landing-page totals across the whole catalog.
-async fn store_summary(State(st): State<AppState>) -> Response {
+async fn store_summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if web_user(&st, &headers).await.is_none() {
+        return store_signin_required();
+    }
     let mut c = match st.db.get_conn().await {
         Ok(c) => c,
         Err(e) => return server_error(e),

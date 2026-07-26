@@ -130,9 +130,10 @@ a separate Vite/React SPA (source in `../../store/`) built into an nginx image
 `brianthemint/arcadelauncher-store` and deployed by `80-store.yaml` (2 replicas +
 `arcade-store-nodeport` on **30080**).
 
-- **Public API surface:** new *unauthenticated* endpoints in `src/store_api.rs`
+- **Store API surface:** endpoints in `src/store_api.rs`
   (server ≥ 0.13.0): `GET /api/store/summary`, `GET /api/store/games`,
-  `GET /api/store/games/:id`. They expose only catalog metadata + aggregate
+  `GET /api/store/games/:id`. As of 0.14.5 they require the storefront's
+  `AL_STORE_SESSION` cookie. They expose only catalog metadata + aggregate
   community stats (playtime/ratings/reviews) — never tokens, user rows, or
   `content_path`. Art (`/art/:id`) was already public. The desktop/mobile client
   endpoints (`/api/catalog`, manifests, saves…) stay auth-gated — a browser hitting
@@ -155,7 +156,7 @@ a separate Vite/React SPA (source in `../../store/`) built into an nginx image
   `/art/:id` = 200, `/requests/` = 200, `/api/catalog` = 401 (expected).
 
 The QR sign-in code entered at 0.14.2; the aligned live deployment uses the
-0.14.4 API and 0.2.0 store images. Challenges
+0.14.5 API and 0.2.1 store images. Challenges
 are in MariaDB (not pod memory), so a start/approve/poll sequence remains valid
 when requests land on different API replicas. The store image also includes the
 Arcade Launcher favicon and touch icons.

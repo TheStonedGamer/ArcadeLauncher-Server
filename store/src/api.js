@@ -2,8 +2,8 @@
 // store_lib.rs). Same-origin in production (nginx proxies /api to the k3s
 // NodePort); the Vite dev proxy handles it during `npm run dev`.
 //
-// Public browse endpoints need no auth. The auth + library endpoints ride a
-// session cookie (AL_STORE_SESSION), so every authed call sends
+// Catalog browse and library endpoints require the browser session cookie
+// (AL_STORE_SESSION), so every authenticated call sends
 // `credentials: 'include'` — the cookie is HttpOnly and never touches JS.
 
 async function getJSON(path) {
@@ -33,7 +33,7 @@ async function send(path, method, form) {
   return data
 }
 
-// --- Public storefront ---
+// --- Authenticated storefront ---
 export const fetchSummary = () => getJSON('/api/store/summary')
 export const fetchGames = () => getJSON('/api/store/games')
 export const fetchGame = (id) => getJSON(`/api/store/games/${encodeURIComponent(id)}`)
