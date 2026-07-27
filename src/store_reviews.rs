@@ -11,7 +11,9 @@
 //
 // SECURITY: reading requires a signed-in storefront session, like the rest of
 // the catalog. Writing only ever touches the caller's own row — the user id
-// comes from the session, never from the request body.
+// comes from the session, never from the request body. The one exception is
+// moderation: `store_review_moderate_delete` can remove anyone's row, and is
+// gated on `user.is_admin` from the session, never on a client-supplied flag.
 
 /// Longest review body we store. Matches the launcher's limit so a review
 /// written on either surface round-trips unchanged.
@@ -98,6 +100,9 @@ async fn store_reviews_get(
     Json(serde_json::json!({
         "schemaVersion": 1,
         "gameId": id,
+        // Lets the page render a remove control on other people's reviews
+        // without a second request. The server re-checks on delete regardless.
+        "canModerate": user.is_admin,
         "count": reviews.len(),
         "average": rating_average(&reviews),
         "histogram": rating_histogram(&reviews),
@@ -187,4 +192,44 @@ async fn store_review_delete(
         return server_error(e);
     }
     Json(serde_json::json!({"ok": true, "gameId": id})).into_response()
+}
+
+// DELETE /api/store/games/:id/reviews/:user_id — admin moderation: remove any
+// user's review. Non-admins get 403 rather than 404, so a mistyped id can't be
+// used to probe which reviews exist.
+async fn store_review_moderate_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((id, target_id)): AxumPath<(String, u64)>,
+) -> Response {
+    let Some(user) = web_user(&st, &headers).await else {
+        return store_signin_required();
+    };
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin required"})),
+        )
+            .into_response();
+    }
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = c
+        .exec_drop(
+            "DELETE FROM game_reviews WHERE user_id=:u AND game_id=:g",
+            params! {"u" => target_id, "g" => &id},
+        )
+        .await
+    {
+        return server_error(e);
+    }
+    tracing::info!(
+        "admin {} removed review by user {} on game {}",
+        user.username,
+        target_id,
+        id
+    );
+    Json(serde_json::json!({"ok": true, "gameId": id, "userId": target_id})).into_response()
 }

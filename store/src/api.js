@@ -47,6 +47,11 @@ export const putReview = (id, rating, body) =>
 export const deleteReview = (id) =>
   send(`/api/store/games/${encodeURIComponent(id)}/review`, 'DELETE')
 
+// Admin-only: remove another user's review. The server re-checks admin status,
+// so this 403s for everyone else regardless of what the UI shows.
+export const moderateDeleteReview = (id, userId) =>
+  send(`/api/store/games/${encodeURIComponent(id)}/reviews/${encodeURIComponent(userId)}`, 'DELETE')
+
 // --- Auth (session cookie) ---
 export const login = (username, password, totp) =>
   send('/api/store/auth/login', 'POST', { username, password, totp: totp || '' })

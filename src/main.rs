@@ -184,6 +184,12 @@ async fn main() -> Result<()> {
             "/api/store/games/:id/review",
             put(store_review_put).delete(store_review_delete),
         )
+        // Admin moderation: remove someone else's review. Gated on the session
+        // user's is_admin inside the handler.
+        .route(
+            "/api/store/games/:id/reviews/:user_id",
+            delete(store_review_moderate_delete),
+        )
         // Storefront browser sessions (cookie auth) — see store_auth.rs. Register
         // reuses the launcher's admin-approval flow at /api/auth/register.
         .route("/api/store/auth/login", post(store_login))

@@ -362,3 +362,12 @@ a:hover { color: #fff; }
   color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
 }
 .review-body { margin: 8px 0 0; white-space: pre-wrap; }
+/* Admin-only moderation control; muted until hover so it doesn't compete with
+   the review itself. Pushed to the right end of the header row. */
+.review-mod-del {
+  margin-left: auto; background: none; border: 1px solid #4a4a4a;
+  color: #8b8b8b; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .5px; padding: 2px 8px; border-radius: 4px; cursor: pointer;
+}
+.review-mod-del:hover:not(:disabled) { color: #ff6b6b; border-color: #ff6b6b; }
+.review-mod-del:disabled { opacity: .5; cursor: default; }

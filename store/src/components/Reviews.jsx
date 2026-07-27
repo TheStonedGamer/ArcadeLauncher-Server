@@ -6,7 +6,7 @@
 // rather than a second post, and there is exactly one review per person.
 
 import { useEffect, useState } from 'react'
-import { deleteReview, fetchReviews, putReview } from '../api.js'
+import { deleteReview, fetchReviews, moderateDeleteReview, putReview } from '../api.js'
 import { useAuth } from '../auth.jsx'
 import Stars from './Stars.jsx'
 
@@ -21,7 +21,7 @@ function fmtWhen(unixSecs) {
   })
 }
 
-function ReviewRow({ r }) {
+function ReviewRow({ r, canModerate, onModerate, busy }) {
   return (
     <li className={`review${r.mine ? ' mine' : ''}`}>
       <div className="review-head">
@@ -29,6 +29,18 @@ function ReviewRow({ r }) {
         <Stars value={r.rating} size={14} />
         <span className="review-when">{fmtWhen(r.updatedAt)}</span>
         {r.mine && <span className="review-badge">Your review</span>}
+        {/* Moderation sits on other people's rows only — an admin removes their
+            own review with the regular Delete button above. */}
+        {canModerate && !r.mine && (
+          <button
+            className="review-mod-del"
+            onClick={() => onModerate(r)}
+            disabled={busy}
+            title={`Remove ${r.username || 'this'} review`}
+          >
+            Remove
+          </button>
+        )}
       </div>
       {r.body && <p className="review-body">{r.body}</p>}
     </li>
@@ -84,6 +96,21 @@ export default function Reviews({ gameId }) {
     setError(null)
     try {
       await deleteReview(gameId)
+      await load()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function moderate(r) {
+    const who = r.username || 'this user'
+    if (!window.confirm(`Remove ${who}'s review? This can't be undone.`)) return
+    setBusy(true)
+    setError(null)
+    try {
+      await moderateDeleteReview(gameId, r.userId)
       await load()
     } catch (e) {
       setError(e.message)
@@ -173,7 +200,13 @@ export default function Reviews({ gameId }) {
       <ul className="review-list">
         {mine && !editing && <ReviewRow r={mine} />}
         {others.map((r) => (
-          <ReviewRow key={r.userId} r={r} />
+          <ReviewRow
+            key={r.userId}
+            r={r}
+            canModerate={data.canModerate}
+            onModerate={moderate}
+            busy={busy}
+          />
         ))}
         {reviews.length === 0 && (
           <li className="muted">No reviews yet — be the first.</li>
