@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: server
-          image: brianthemint/arcadelauncher-server:0.14.8
+          image: brianthemint/arcadelauncher-server:0.14.9
           imagePullPolicy: IfNotPresent
           envFrom:
             # Same generated arcade-secrets as the API pods (see deploy README).
