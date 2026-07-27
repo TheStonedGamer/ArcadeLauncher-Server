@@ -17,6 +17,7 @@ export default function App() {
             {user && <NavLink to="/" end>Store</NavLink>}
             {user && <NavLink to="/library">Library</NavLink>}
             <NavLink to="/download">Download</NavLink>
+            <NavLink to="/vision">Our Vision</NavLink>
           </nav>
           <div className="topnav-account">
             {user ? (
@@ -39,6 +40,7 @@ export default function App() {
       <footer className="footer">
         <div className="footer-inner">
           <span>Arcade Launcher</span>
+          <Link to="/vision" className="footer-link">Our Vision</Link>
           <span className="muted">
             Community catalog · free to add · playtime and ratings aggregated from players
           </span>

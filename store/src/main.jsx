@@ -9,6 +9,7 @@ import Login from './pages/Login.jsx'
 import Register from './pages/Register.jsx'
 import Library from './pages/Library.jsx'
 import Download from './pages/Download.jsx'
+import Vision from './pages/Vision.jsx'
 import RequireAuth from './RequireAuth.jsx'
 import './styles.css'
 
@@ -24,6 +25,8 @@ createRoot(document.getElementById('root')).render(
             <Route path="register" element={<Register />} />
             <Route path="library" element={<RequireAuth><Library /></RequireAuth>} />
             <Route path="download" element={<Download />} />
+            {/* Public, like /download — it's the pitch you read before signing up. */}
+            <Route path="vision" element={<Vision />} />
           </Route>
         </Routes>
       </AuthProvider>
