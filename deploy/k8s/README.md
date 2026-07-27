@@ -168,8 +168,7 @@ a separate Vite/React SPA (source in `../../store/`) built into an nginx image
   `/api/store/summary` = 2050 games / 9 platforms, `/api/health` = 0.13.0,
   `/art/:id` = 200, `/requests/` = 200, `/api/catalog` = 401 (expected).
 
-The QR sign-in code entered at 0.14.2; the aligned live deployment uses the
-0.14.5 API and 0.2.1 store images. Challenges
+The QR sign-in code entered at 0.14.2. Challenges
 are in MariaDB (not pod memory), so a start/approve/poll sequence remains valid
 when requests land on different API replicas. The store image also includes the
 Arcade Launcher favicon and touch icons.
@@ -180,10 +179,17 @@ Arcade Launcher favicon and touch icons.
 # workstation Docker Desktop (per the build rule):
 cd store && docker build -t brianthemint/arcadelauncher-store:<ver> -t brianthemint/arcadelauncher-store:latest .
 docker push brianthemint/arcadelauncher-store:<ver> && docker push brianthemint/arcadelauncher-store:latest
-# on the node (ssh brian@10.0.0.112):
-sudo -n k3s kubectl -n arcade set image deploy/arcade-store store=brianthemint/arcadelauncher-store:<ver>
+# note the sha256 digest the push prints, then on the node (ssh brian@10.0.0.112):
+sudo -n k3s kubectl -n arcade set image deploy/arcade-store store=brianthemint/arcadelauncher-store@sha256:<digest>
 sudo -n k3s kubectl -n arcade rollout status deploy/arcade-store
 ```
+
+**Always deploy by digest, never by tag.** `imagePullPolicy: IfNotPresent` means a
+node that already cached a tag will happily keep serving the old layers when that
+tag is re-pushed. The manifests in this directory are pinned to the digests that
+are live, so `kubectl diff -f .` is meaningful — update the manifest in the same
+commit as a deploy. The API/scanner deployments share one image; the container in
+**all three** deployments is named `server`, `server` and `store` respectively.
 
 ### Regenerating the secret (if creds rotate)
 
