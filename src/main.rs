@@ -711,4 +711,36 @@ mod tests {
         assert_eq!(rank_featured(games, &played(&[]), 1).len(), 1);
         assert!(rank_featured(Vec::new(), &played(&[]), 6).is_empty());
     }
+
+    #[test]
+    fn cold_start_platform_matches_pc_case_and_space_insensitively() {
+        assert!(is_cold_start_platform(&fg("a", "A", "PC", "", "", 0.0)));
+        assert!(is_cold_start_platform(&fg("b", "B", "pc", "", "", 0.0)));
+        assert!(is_cold_start_platform(&fg("c", "C", " PC ", "", "", 0.0)));
+        // Everything else in the catalog is a console and must not leak into the
+        // cold-start hero.
+        assert!(!is_cold_start_platform(&fg("d", "D", "GameCube", "", "", 0.0)));
+        assert!(!is_cold_start_platform(&fg("e", "E", "", "", "", 0.0)));
+    }
+
+    #[test]
+    fn cold_start_partition_splits_pc_from_the_rest() {
+        // Mirrors the handler's split: the PC side is what gets shuffled, and an
+        // empty PC side is what sends it back to the rating-ranked fallback.
+        let games = vec![
+            fg("pc1", "One", "PC", "", "", 0.0),
+            fg("nes", "Two", "NES", "", "", 0.0),
+            fg("pc2", "Three", "pc", "", "", 0.0),
+        ];
+        let (pc, rest): (Vec<Game>, Vec<Game>) =
+            games.into_iter().partition(is_cold_start_platform);
+        assert_eq!(pc.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(), ["pc1", "pc2"]);
+        assert_eq!(rest.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(), ["nes"]);
+
+        let consoles = vec![fg("nes", "Two", "NES", "", "", 0.0)];
+        let (pc, rest): (Vec<Game>, Vec<Game>) =
+            consoles.into_iter().partition(is_cold_start_platform);
+        assert!(pc.is_empty());
+        assert_eq!(rest.len(), 1);
+    }
 }

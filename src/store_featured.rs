@@ -12,6 +12,7 @@
 // SECURITY: like the rest of store_api, this requires a storefront session and
 // returns only catalog metadata — never content_path, launch or user rows.
 
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 
 // A franchise match is the strongest signal (you played Metroid, here is another
@@ -24,6 +25,9 @@ const FEATURED_PLATFORM_WEIGHT: f64 = 1.0;
 const FEATURED_RATING_WEIGHT: f64 = 0.5;
 /// How many picks the hero rotates through.
 const FEATURED_LIMIT: usize = 6;
+/// Platform shown in the cold-start hero, matched case-insensitively against
+/// `games.platform` (stored as "PC" alongside "NES", "SNES", "N64", …).
+const FEATURED_COLD_START_PLATFORM: &str = "PC";
 
 /// Attribute → share of tracked playtime, scaled so the strongest is 1.0.
 type TasteWeights = HashMap<String, f64>;
@@ -123,7 +127,9 @@ fn featured_rating(game: &Game) -> f64 {
 /// across requests.
 ///
 /// With no playtime recorded there is nothing to personalize against, so this
-/// degrades to "the highest-rated games in the catalog" — still a sensible hero.
+/// degrades to "the highest-rated games in the catalog". The handler only takes
+/// that path when the catalog has no PC titles to draw a cold-start hero from —
+/// see `is_cold_start_platform`.
 fn rank_featured(games: Vec<Game>, played: &HashMap<String, i64>, limit: usize) -> Vec<Game> {
     let profile = build_taste(&games, played);
     let mut scored: Vec<(f64, Game)> = games
@@ -146,6 +152,13 @@ fn rank_featured(games: Vec<Game>, played: &HashMap<String, i64>, limit: usize) 
     });
     scored.truncate(limit);
     scored.into_iter().map(|(_, g)| g).collect()
+}
+
+/// Is this one of the PC titles the cold-start hero draws from?
+fn is_cold_start_platform(game: &Game) -> bool {
+    game.platform
+        .trim()
+        .eq_ignore_ascii_case(FEATURED_COLD_START_PLATFORM)
 }
 
 /// One hero-sized pick. Carries `summary` and `heroArtUrl`, which the card
@@ -196,7 +209,26 @@ async fn store_featured(State(st): State<AppState>, headers: HeaderMap) -> Respo
     let played = played_seconds_for(&st.db, user.id).await.unwrap_or_default();
     let personalized = played.values().any(|s| *s > 0);
 
-    let mut picks = rank_featured(games, &played, FEATURED_LIMIT);
+    // Cold start: with no playtime there is nothing to rank against, and the
+    // rating-ordered fallback shows the same handful of retro classics to every
+    // new visitor on every load. Draw a random shortlist from the PC titles
+    // instead, so the hero looks alive and surfaces the modern end of the
+    // catalog rather than the same NES/SNES entries every time.
+    let mut picks = if personalized {
+        rank_featured(games, &played, FEATURED_LIMIT)
+    } else {
+        let (mut pc, rest): (Vec<Game>, Vec<Game>) =
+            games.into_iter().partition(is_cold_start_platform);
+        if pc.is_empty() {
+            // No PC games at all — `rest` is the whole catalog here, so this is
+            // the previous highest-rated behaviour, unchanged.
+            rank_featured(rest, &played, FEATURED_LIMIT)
+        } else {
+            pc.shuffle(&mut rand::thread_rng());
+            pc.truncate(FEATURED_LIMIT);
+            pc
+        }
+    };
     let base = public_base_url(&st, &headers).await;
     for game in &mut picks {
         hydrate_server_art_url(&st, &base, game).await;
