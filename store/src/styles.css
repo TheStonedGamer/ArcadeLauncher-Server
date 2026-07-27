@@ -93,8 +93,17 @@ a:hover { color: #fff; }
 .back-link { display: inline-block; margin-bottom: 16px; color: var(--text-dim); }
 .detail-head h1 { margin: 0; font-size: 28px; color: #fff; font-weight: 500; }
 .detail-sub { color: var(--text-dim); margin-top: 4px; margin-bottom: 20px; }
-.detail-body { display: grid; grid-template-columns: 1fr 300px; gap: 20px; }
-.detail-shot { background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16 / 9; }
+/* minmax(0, …) not 1fr: a grid track's automatic minimum is its content's
+   min-content width, and .thumbs is a row of non-shrinking 116px thumbnails —
+   with 1fr the track grows to fit every thumb instead of letting .thumbs
+   scroll, which blows out the column and the whole page horizontally. */
+.detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; }
+.detail-media { min-width: 0; }
+.detail-shot {
+  background: #000; border-radius: 4px; overflow: hidden; aspect-ratio: 16 / 9;
+  /* Keep the shot inside the fold on short/wide screens. */
+  max-height: 70vh;
+}
 .detail-shot img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .thumbs { display: flex; gap: 8px; margin-top: 10px; overflow-x: auto; }
 .thumb {
@@ -226,7 +235,7 @@ a:hover { color: #fff; }
 .dl-link { font-weight: 600; }
 
 @media (max-width: 720px) {
-  .detail-body { grid-template-columns: 1fr; }
+  .detail-body { grid-template-columns: minmax(0, 1fr); }
   .topbar-inner { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; gap: 16px; }
   .topnav-account { margin-left: 0; }
 }
@@ -283,7 +292,7 @@ a:hover { color: #fff; }
 .featured-price { color: var(--good); font-weight: 600; }
 
 @media (max-width: 720px) {
-  .featured-body { grid-template-columns: 1fr; }
+  .featured-body { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* ---- game page: wide key art ---- */
