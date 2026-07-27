@@ -27,8 +27,8 @@ spec:
           # Pinned by digest, matching how deploys are actually applied
           # (`kubectl set image ... server=…@sha256:…`). A tag would drift the
           # moment CI auto-bumps VERSION on the next push; a digest is exactly
-          # what is running. Currently server 0.14.16.
-          image: brianthemint/arcadelauncher-server@sha256:b0c88fb4a02507f22d62f328eaca7c21e0c32424c0f8065bb44108576bc695bc
+          # what is running. Currently server 0.14.18.
+          image: brianthemint/arcadelauncher-server@sha256:49a19ccbf87692fa45f238dc2300914600b5fda4c5c14a7c817c01de7615c6d2
           imagePullPolicy: IfNotPresent
           envFrom:
             # Same generated arcade-secrets as the API pods (see deploy README).
