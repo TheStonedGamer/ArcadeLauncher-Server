@@ -339,8 +339,12 @@ fn server_cover_path(library_root: &Path, game_id: &str) -> PathBuf {
     library_root.join(".arcadelauncher").join("art").join(format!("{}.jpg", safe_file_part(game_id)))
 }
 
+// Covers are cached server-side and re-served to every client, so fetch the 2x
+// retina size (528x748) rather than t_cover_big (264x374). The store's featured
+// hero and the desktop grid both draw covers far larger than 264px wide, where
+// the smaller asset visibly softens.
 fn igdb_cover_url(image_id: &str) -> String {
-    format!("https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg")
+    format!("https://images.igdb.com/igdb/image/upload/t_cover_big_2x/{image_id}.jpg")
 }
 
 // Full-resolution screenshot / artwork URL for the in-app gallery. `size` is an

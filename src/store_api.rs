@@ -51,6 +51,8 @@ struct StoreDetail {
     publisher: String,
     franchise: String,
     screenshots: Vec<String>,
+    /// Wide 1080p key art for hero banners; empty when IGDB had none.
+    hero_art_url: String,
     stats: StoreStats,
     owned: bool,
 }
@@ -208,6 +210,7 @@ async fn store_game_detail(
         publisher: game.publisher,
         franchise: game.franchise,
         screenshots: game.screenshots,
+        hero_art_url: game.hero_art_url,
         stats,
         owned,
     };

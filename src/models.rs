@@ -331,6 +331,13 @@ struct Game {
     // client as a JSON string array.
     #[serde(default)]
     screenshots: Vec<String>,
+    // Wide key art for the store's featured hero, at 1920x1080. Covers are
+    // portrait and only 528px wide even at 2x, so stretching one across a banner
+    // looks soft; this is a separate, purpose-picked asset (IGDB artwork if the
+    // game has one, else its best screenshot). Empty when IGDB has neither, in
+    // which case the client falls back to the cover as before.
+    #[serde(default)]
+    hero_art_url: String,
     // Company / franchise metadata (IGDB). Stored in the developer/publisher/
     // franchise TEXT columns; surfaced to the client as plain strings.
     #[serde(default)]
@@ -358,6 +365,7 @@ struct IgdbMatch {
     release_date: i64,
     cover_image_id: String,
     screenshots: Vec<String>,
+    hero_art_url: String,
     developer: String,
     publisher: String,
     franchise: String,

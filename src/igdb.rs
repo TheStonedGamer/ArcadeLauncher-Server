@@ -333,9 +333,19 @@ fn parse_igdb_match(v: &serde_json::Value) -> Option<IgdbMatch> {
             })
             .unwrap_or_default()
     };
-    let mut screenshots = collect("screenshots", "t_screenshot_big");
-    screenshots.extend(collect("artworks", "t_1080p"));
+    let artworks = collect("artworks", "t_1080p");
+    let mut screenshots = collect("screenshots", "t_screenshot_huge");
+    screenshots.extend(artworks.iter().cloned());
     screenshots.truncate(12); // plenty for a gallery; keeps the row/JSON bounded
+
+    // The featured hero wants one wide, high-resolution image. Prefer an artwork
+    // (key art, composed to be a banner) over a screenshot (an arbitrary moment
+    // of gameplay); both are already 1080p-class here.
+    let hero_art_url = artworks
+        .first()
+        .cloned()
+        .or_else(|| collect("screenshots", "t_1080p").into_iter().next())
+        .unwrap_or_default();
 
     // involved_companies is a list of {company:{name}, developer:bool, publisher:bool}.
     // Join the names per role; a company can hold both roles.
@@ -371,6 +381,7 @@ fn parse_igdb_match(v: &serde_json::Value) -> Option<IgdbMatch> {
         release_date: v.get("first_release_date").and_then(|d| d.as_i64()).unwrap_or_default(),
         cover_image_id: v.get("cover").and_then(|c| c.get("image_id")).and_then(|i| i.as_str()).unwrap_or_default().to_string(),
         screenshots,
+        hero_art_url,
         developer,
         publisher,
         franchise,
@@ -398,6 +409,7 @@ async fn save_game_metadata(db: &Pool, game_id: &str, meta: &IgdbMatch, cover_ar
                release_date=:release_date,
                cover_art_url=IF(:cover_art_url='',cover_art_url,:cover_art_url),
                screenshots=IF(:screenshots='',screenshots,:screenshots),
+               hero_art_url=IF(:hero_art_url='',hero_art_url,:hero_art_url),
                developer=IF(:developer='',developer,:developer),
                publisher=IF(:publisher='',publisher,:publisher),
                franchise=IF(:franchise='',franchise,:franchise),
@@ -412,6 +424,7 @@ async fn save_game_metadata(db: &Pool, game_id: &str, meta: &IgdbMatch, cover_ar
             "release_date" => meta.release_date,
             "cover_art_url" => cover_art_url,
             "screenshots" => meta.screenshots.join("\n"),
+            "hero_art_url" => &meta.hero_art_url,
             "developer" => &meta.developer,
             "publisher" => &meta.publisher,
             "franchise" => &meta.franchise,

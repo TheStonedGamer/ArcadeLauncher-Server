@@ -408,6 +408,7 @@ async fn game_entry(
         igdb_rating: 0.0,
         release_date: 0,
         screenshots: Vec::new(),
+        hero_art_url: String::new(),
         developer: String::new(),
         publisher: String::new(),
         franchise: String::new(),

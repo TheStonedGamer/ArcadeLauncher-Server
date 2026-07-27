@@ -363,7 +363,7 @@ async fn list_games(db: &Pool) -> Result<Vec<Game>> {
     let mut c = db.get_conn().await?;
     let rows: Vec<Row> = c
         .query(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,''),COALESCE(developer,''),COALESCE(publisher,''),COALESCE(franchise,'') FROM games ORDER BY platform,title,id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,''),COALESCE(developer,''),COALESCE(publisher,''),COALESCE(franchise,''),COALESCE(hero_art_url,'') FROM games ORDER BY platform,title,id",
         )
         .await?;
     Ok(rows.into_iter().map(game_from_row).collect())
@@ -373,7 +373,7 @@ async fn find_game(db: &Pool, id: &str) -> Result<Option<Game>> {
     let mut c = db.get_conn().await?;
     let row: Option<Row> = c
         .exec_first(
-            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,''),COALESCE(developer,''),COALESCE(publisher,''),COALESCE(franchise,'') FROM games WHERE id=:id",
+            "SELECT id,title,platform,install_type,version,content_path,launch_target,launch_arguments,COALESCE(cover_art_url,''),igdb_id,COALESCE(summary,''),COALESCE(genres,''),igdb_rating,release_date,COALESCE(screenshots,''),COALESCE(developer,''),COALESCE(publisher,''),COALESCE(franchise,''),COALESCE(hero_art_url,'') FROM games WHERE id=:id",
             params! {"id" => id},
         )
         .await?;
@@ -403,6 +403,7 @@ fn game_from_row(row: Row) -> Game {
     let developer = row.get::<String, _>(15).unwrap_or_default();
     let publisher = row.get::<String, _>(16).unwrap_or_default();
     let franchise = row.get::<String, _>(17).unwrap_or_default();
+    let hero_art_url = row.get::<String, _>(18).unwrap_or_default();
     Game {
         id,
         title,
@@ -417,6 +418,7 @@ fn game_from_row(row: Row) -> Game {
         igdb_rating,
         release_date,
         screenshots,
+        hero_art_url,
         developer,
         publisher,
         franchise,
