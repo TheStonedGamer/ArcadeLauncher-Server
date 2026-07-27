@@ -105,6 +105,14 @@ Reality differed from the generic manifests above in a few ways — recorded her
   because single-node makes NFS-reexport unnecessary:
   - `/srv/arcade-library/games` → NFS mount of the NAS roms export
     `10.0.0.102:/mnt/Assets Pool/Roms` (~1.3 TiB), pinned in the VM's `/etc/fstab`.
+    Use `nofail,x-systemd.automount` so a transient NAS/network delay during boot
+    does not leave the library unmounted until an operator intervenes:
+    ```fstab
+    10.0.0.102:/mnt/Assets\040Pool/Roms /srv/arcade-library/games nfs vers=3,_netdev,nofail,x-systemd.automount,hard,timeo=600,retrans=2 0 0
+    ```
+    If the NFS mount is restored after the pods have started, restart
+    `deployment/arcade-api` and `deployment/arcade-scanner`; their existing
+    hostPath bind mounts do not see a later mount placed beneath the host path.
   - the rest (emulators ~1.9 GiB + metadata) rsynced once from the CT; owned by
     uid 10001 to match the container user.
 - **Config/secret:** instead of the ConfigMap+Secret split, the live
@@ -118,6 +126,11 @@ Reality differed from the generic manifests above in a few ways — recorded her
   in `70-ingress.yaml`), not the Traefik Ingress — avoids Host-routing coupling.
   Rollback = revert the one nginx upstream line to `10.0.0.210:8721` + reload
   (a `.pre-k3s.bak` backup sits in `/etc/nginx/backups/`).
+- **Admin scanner affinity:** both `arcade-admin` Services select the singleton
+  `arcade-scanner` pod. Scan progress is process-local, so routing admin traffic
+  across API replicas makes the progress bar flicker and permits duplicate scans.
+  The LAN nginx2 vhost on `10.0.0.163` proxies
+  `arcade-admin.orlandoaio.net` to `10.0.0.112:30722`.
 - **Verified live:** `/api/health` = 0.12.0, `/api/catalog` = 2050 games (parity
   with prod), `/art/:id` = 200 JPEG, a `/files/:id/*` range read = 206 from the NAS
   mount, both API replicas connected to Redis fan-out, `/requests/` = 200, and

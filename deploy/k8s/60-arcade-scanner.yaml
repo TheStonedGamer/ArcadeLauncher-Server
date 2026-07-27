@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: server
-          image: brianthemint/arcadelauncher-server:0.13.0
+          image: brianthemint/arcadelauncher-server:0.14.8
           imagePullPolicy: IfNotPresent
           envFrom:
             # Same generated arcade-secrets as the API pods (see deploy README).
@@ -35,6 +35,8 @@ spec:
           ports:
             - name: api
               containerPort: 8721
+            - name: admin
+              containerPort: 8722
           volumeMounts:
             - name: library
               mountPath: /srv/arcade-library
