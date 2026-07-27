@@ -4,13 +4,15 @@ import { fetchDownloads, fmtBytes } from '../api.js'
 // Best-effort OS guess for highlighting the primary button.
 function detectOS() {
   const p = (navigator.userAgent + ' ' + (navigator.platform || '')).toLowerCase()
+  // Android must be checked before linux: its user agent contains both.
+  if (p.includes('android')) return 'android'
   if (p.includes('win')) return 'windows'
   if (p.includes('mac')) return 'macos'
   if (p.includes('linux') || p.includes('x11')) return 'linux'
   return 'windows'
 }
 
-const OS_LABEL = { windows: 'Windows', linux: 'Linux', macos: 'macOS' }
+const OS_LABEL = { windows: 'Windows', linux: 'Linux', macos: 'macOS', android: 'Android' }
 
 export default function Download() {
   const [info, setInfo] = useState(null)
@@ -66,6 +68,13 @@ export default function Download() {
               ))}
             </tbody>
           </table>
+          {files.some((f) => f.platform === 'android') && (
+            <p className="muted">
+              The Android build is the companion app — remote control, chat and QR sign-in for a
+              launcher running on your PC. Installing it means allowing your browser to install
+              unknown apps; pick the arm64 APK unless you are on an emulator.
+            </p>
+          )}
         </div>
       )}
 

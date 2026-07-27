@@ -128,6 +128,9 @@ export default function Login() {
         <div className="auth-alt">
           No account? <Link to="/register">Create one</Link>
         </div>
+        <div className="auth-alt">
+          Not sure yet? Read <Link to="/vision">our vision</Link> for Arcade Launcher.
+        </div>
       </form>
     </div>
   )

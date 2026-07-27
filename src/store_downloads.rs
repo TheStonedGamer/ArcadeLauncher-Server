@@ -10,7 +10,7 @@
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadFile {
-    platform: String, // "windows" | "macos" | "linux"
+    platform: String, // "windows" | "macos" | "linux" | "android"
     arch: String,     // "x64" | "arm64" | "universal" | ""
     label: String,    // human label, e.g. "Windows installer (.exe)"
     filename: String,
@@ -55,6 +55,12 @@ fn classify_download(name: &str) -> Option<(String, String, String, u32)> {
         Some(("linux".into(), a, "Linux package (.deb)".into(), 1))
     } else if lower.ends_with(".rpm") {
         Some(("linux".into(), a, "Linux package (.rpm)".into(), 2))
+    } else if lower.ends_with(".apk") {
+        // Companion APKs are per-ABI; phones and tablets are arm64, so that one
+        // is the primary and x86_64 (emulators, a few Chromebooks) trails it.
+        let rank = if arch == "arm64" { 0 } else { 1 };
+        let arch2 = if arch.is_empty() { "arm64".into() } else { a };
+        Some(("android".into(), arch2, "Android companion app (.apk)".into(), rank))
     } else {
         None
     }
