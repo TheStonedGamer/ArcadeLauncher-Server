@@ -362,7 +362,9 @@ fn igdb_platform_ids(platform: &str) -> &'static [i32] {
         "Dolphin" => &[21, 5],
         "GameCube" => &[21],
         "Wii" => &[5],
-        "Ryujinx" => &[130],
+        // "Ryujinx" is the pre-rename label; still matched so rows catalogued
+        // before the rename keep resolving artwork until the next scan.
+        "Switch" | "Ryujinx" => &[130],
         "RPCS3" => &[9],
         "N64" => &[4],
         "NES" => &[18],

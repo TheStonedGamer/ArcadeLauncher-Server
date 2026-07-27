@@ -18,7 +18,7 @@ async fn scan_single_file_platforms(library_root: &Path) -> Result<Vec<Game>> {
         ("Nintendo/NES", "NES", &["nes", "fds", "unf", "unif"]),
         ("Nintendo/SNES", "SNES", &["sfc", "smc", "fig", "bs", "st", "zip", "7z"]),
         ("Nintendo/N64", "N64", &["z64", "n64", "v64", "rom"]),
-        ("Nintendo/Switch", "Ryujinx", &["nsp", "xci", "nca", "nro"]),
+        ("Nintendo/Switch", "Switch", &["nsp", "xci", "nca", "nro"]),
         ("Nintendo/Gamecube", "GameCube", &["iso", "gcm", "rvz", "gcz"]),
         ("Nintendo/Wii", "Wii", &["iso", "rvz", "gcz", "wbfs", "dol", "elf"]),
     ];
@@ -558,7 +558,19 @@ fn stable_sig(meta: &std::fs::Metadata) -> String {
 }
 
 fn stable_id(platform: &str, relative: &Path) -> String {
-    format!("{}-{}", platform.to_lowercase(), sha1_short(&relative.to_string_lossy().replace('\\', "/")))
+    format!("{}-{}", id_namespace(platform), sha1_short(&relative.to_string_lossy().replace('\\', "/")))
+}
+
+/// The prefix a platform's game ids are minted under. Normally just the
+/// lowercased platform, but a platform that has been *renamed* must keep hashing
+/// under its original name: the id is the primary key clients store in their
+/// libraries and install records, so re-keying would orphan every owned copy.
+/// Switch games were first catalogued under the emulator's name, "Ryujinx".
+fn id_namespace(platform: &str) -> String {
+    match platform {
+        "Switch" => "ryujinx".to_string(),
+        other => other.to_lowercase(),
+    }
 }
 
 fn sha1_short(text: &str) -> String {

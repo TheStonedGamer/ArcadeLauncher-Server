@@ -294,7 +294,8 @@ async fn main() -> Result<()> {
     // Only the scanner-owning process runs this. On k3s the stateless API
     // replicas set ARCADE_ENABLE_SCANNER=false so they never watch or rescan the
     // shared library; a single dedicated scanner pod keeps it enabled. Manual
-    // admin rescan (spawn_rescan via the admin UI) still works everywhere.
+    // The k3s admin Services target the singleton scanner so manual rescans and
+    // their in-memory status polling stay on this scanner-owning process.
     if !auto_rescan_state.cfg.scanner_enabled {
         info!("catalog scanner disabled (ARCADE_ENABLE_SCANNER=false); this instance serves only");
     } else if !start_library_watcher(auto_rescan_state.clone()) {
@@ -443,6 +444,16 @@ mod tests {
         let b = stable_id("Xbox360", Path::new("games/Xbox360/Halo.iso"));
         assert_eq!(a, b);
         assert!(a.starts_with("xbox360-"));
+    }
+
+    #[test]
+    fn switch_ids_stay_under_the_pre_rename_ryujinx_namespace() {
+        // The platform was renamed Ryujinx -> Switch for display. Ids are the
+        // key clients store in libraries and install records, so they must not
+        // move with the label.
+        let id = stable_id("Switch", Path::new("games/Nintendo/Switch/Zelda.nsp"));
+        assert!(id.starts_with("ryujinx-"), "got {id}");
+        assert_eq!(id, stable_id("Ryujinx", Path::new("games/Nintendo/Switch/Zelda.nsp")));
     }
 
     #[test]
