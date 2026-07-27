@@ -79,6 +79,7 @@ include!("social_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");
 include!("store_api.rs");
+include!("store_featured.rs");
 include!("store_auth.rs");
 include!("qr_auth.rs");
 include!("store_lib.rs");
@@ -173,6 +174,8 @@ async fn main() -> Result<()> {
         .route("/api/store/summary", get(store_summary))
         .route("/api/store/games", get(store_games))
         .route("/api/store/games/:id", get(store_game_detail))
+        // Personalized "Featured & Recommended" hero picks — see store_featured.rs.
+        .route("/api/store/featured", get(store_featured))
         // Storefront browser sessions (cookie auth) — see store_auth.rs. Register
         // reuses the launcher's admin-approval flow at /api/auth/register.
         .route("/api/store/auth/login", post(store_login))
@@ -586,5 +589,84 @@ mod tests {
         // Same inputs are deterministic; a different expiry changes the credential.
         assert_eq!(turn_credentials("s3cr3t", 42, 1_700_000_000), (user, cred));
         assert_ne!(turn_credentials("s3cr3t", 42, 1_700_000_001).1, "4m+gopKcl0HXw6KRLkDWn63gfQE=");
+    }
+
+    // --- storefront featured picks (store_featured.rs) ---------------------
+
+    /// Minimal catalog row; only the fields the ranking actually reads vary.
+    fn fg(id: &str, title: &str, platform: &str, franchise: &str, genres: &str, rating: f64) -> Game {
+        Game {
+            id: id.into(),
+            title: title.into(),
+            platform: platform.into(),
+            install_type: "rom".into(),
+            version: "1".into(),
+            content_path: String::new(),
+            cover_art_url: String::new(),
+            igdb_id: 0,
+            summary: String::new(),
+            genres: genres.into(),
+            igdb_rating: rating,
+            release_date: 0,
+            screenshots: Vec::new(),
+            hero_art_url: String::new(),
+            developer: String::new(),
+            publisher: String::new(),
+            franchise: franchise.into(),
+            launch: Launch { target: String::new(), arguments: String::new() },
+        }
+    }
+
+    fn played(pairs: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
+        pairs.iter().map(|(id, s)| ((*id).to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn featured_without_playtime_ranks_by_rating() {
+        let games = vec![
+            fg("a", "Alpha", "SNES", "", "Action", 70.0),
+            fg("b", "Beta", "SNES", "", "Action", 92.0),
+            fg("c", "Gamma", "SNES", "", "Action", 81.0),
+        ];
+        let picks = rank_featured(games, &played(&[]), 6);
+        assert_eq!(picks.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn featured_prefers_the_played_franchise_over_a_higher_rating() {
+        let games = vec![
+            fg("played", "Metroid", "SNES", "Metroid", "Action", 90.0),
+            fg("same", "Metroid II", "SNES", "Metroid", "Action", 60.0),
+            fg("other", "Unrelated", "PS2", "", "Puzzle", 95.0),
+        ];
+        let picks = rank_featured(games, &played(&[("played", 7200)]), 6);
+        // The played game itself is never a recommendation.
+        assert!(!picks.iter().any(|g| g.id == "played"));
+        assert_eq!(picks[0].id, "same");
+    }
+
+    #[test]
+    fn featured_genre_uses_the_best_tag_not_the_sum() {
+        // "kitchen" carries five tags including the played one; "focused" carries
+        // only the played tag. Summing would rank the padded entry first.
+        let games = vec![
+            fg("played", "Played", "SNES", "", "Shooter", 80.0),
+            fg("kitchen", "Kitchen", "PS2", "", "Shooter,Puzzle,Racing,Sports,Sim", 70.0),
+            fg("focused", "Focused", "PS2", "", "Shooter", 70.0),
+        ];
+        let picks = rank_featured(games, &played(&[("played", 3600)]), 6);
+        let ids: Vec<&str> = picks.iter().map(|g| g.id.as_str()).collect();
+        // Equal affinity and equal rating, so the tiebreak is the title.
+        assert_eq!(ids, ["focused", "kitchen"]);
+    }
+
+    #[test]
+    fn featured_respects_the_limit_and_tolerates_an_empty_catalog() {
+        let games = vec![
+            fg("a", "A", "SNES", "", "", 10.0),
+            fg("b", "B", "SNES", "", "", 20.0),
+        ];
+        assert_eq!(rank_featured(games, &played(&[]), 1).len(), 1);
+        assert!(rank_featured(Vec::new(), &played(&[]), 6).is_empty());
     }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { fetchGames, fetchSummary, fmtRating } from '../api.js'
+import { fetchFeatured, fetchGames, fetchSummary, fmtRating } from '../api.js'
+import Featured from '../components/Featured.jsx'
 import LibraryButton from '../components/LibraryButton.jsx'
 
 function GameCard({ g }) {
@@ -34,9 +35,13 @@ export default function Home() {
   const [error, setError] = useState(null)
   const [query, setQuery] = useState('')
   const [platform, setPlatform] = useState('all')
+  const [featured, setFeatured] = useState(null)
 
   useEffect(() => {
     fetchSummary().then(setSummary).catch(() => {})
+    // The hero is a highlight, not the page: a failure here leaves the banner
+    // out rather than blocking the catalog below.
+    fetchFeatured().then(setFeatured).catch(() => {})
     fetchGames()
       .then((d) => setGames(d.games || []))
       .catch((e) => setError(e.message))
@@ -69,6 +74,12 @@ export default function Home() {
           </p>
         )}
       </section>
+
+      {/* Shown only while browsing unfiltered — once you are searching or have
+          picked a platform, the grid is the answer and a hero is in the way. */}
+      {featured && featured.picks?.length > 0 && !query && platform === 'all' && (
+        <Featured picks={featured.picks} personalized={featured.personalized} />
+      )}
 
       <div className="toolbar">
         <input

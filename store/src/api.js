@@ -37,6 +37,8 @@ async function send(path, method, form) {
 export const fetchSummary = () => getJSON('/api/store/summary')
 export const fetchGames = () => getJSON('/api/store/games')
 export const fetchGame = (id) => getJSON(`/api/store/games/${encodeURIComponent(id)}`)
+// Hero picks for the home page, personalized server-side from tracked playtime.
+export const fetchFeatured = () => getJSON('/api/store/featured')
 
 // --- Auth (session cookie) ---
 export const login = (username, password, totp) =>
