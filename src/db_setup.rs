@@ -115,6 +115,11 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
     // Steam-style ownership. A row means "this user added this game to their
     // library" — free, but required before the launcher will install/show it.
     // player_count on the storefront is derived from this table.
+    //
+    // The collation is pinned, not left to the server default: `games` was
+    // created under utf8mb4_general_ci, and newer MariaDB defaults to
+    // utf8mb4_uca1400_ai_ci. A mismatch makes every `user_library JOIN games`
+    // fail outright with "Illegal mix of collations" (ERROR 1267).
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS user_library (
           user_id  BIGINT UNSIGNED NOT NULL,
@@ -122,9 +127,15 @@ async fn ensure_schema(db: &Pool) -> Result<()> {
           added_at BIGINT          NOT NULL,
           PRIMARY KEY (user_id, game_id),
           INDEX idx_lib_game (game_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"#,
     )
     .await?;
+    // Self-heal deployments created before the collation was pinned above.
+    let _ = c
+        .query_drop(
+            "ALTER TABLE user_library CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+        )
+        .await;
     // Browser sessions for the public storefront (distinct from admin_sessions,
     // which gate the :8722 admin UI). A cookie carries the token; we store only
     // its SHA-256 hash. Same shape as admin_sessions.
