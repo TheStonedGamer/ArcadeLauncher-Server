@@ -80,6 +80,7 @@ include!("registration.rs");
 include!("password_reset.rs");
 include!("store_api.rs");
 include!("store_featured.rs");
+include!("store_reviews.rs");
 include!("store_auth.rs");
 include!("qr_auth.rs");
 include!("store_lib.rs");
@@ -176,6 +177,13 @@ async fn main() -> Result<()> {
         .route("/api/store/games/:id", get(store_game_detail))
         // Personalized "Featured & Recommended" hero picks — see store_featured.rs.
         .route("/api/store/featured", get(store_featured))
+        // Player reviews on the storefront game pages - same `game_reviews`
+        // rows the launcher writes, cookie-authenticated. See store_reviews.rs.
+        .route("/api/store/games/:id/reviews", get(store_reviews_get))
+        .route(
+            "/api/store/games/:id/review",
+            put(store_review_put).delete(store_review_delete),
+        )
         // Storefront browser sessions (cookie auth) — see store_auth.rs. Register
         // reuses the launcher's admin-approval flow at /api/auth/register.
         .route("/api/store/auth/login", post(store_login))
@@ -619,6 +627,34 @@ mod tests {
 
     fn played(pairs: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
         pairs.iter().map(|(id, s)| ((*id).to_string(), *s)).collect()
+    }
+
+    // --- storefront reviews (store_reviews.rs) ------------------------------
+
+    fn rv(rating: i8) -> StoreReview {
+        StoreReview {
+            user_id: 1,
+            username: "u".into(),
+            rating,
+            body: String::new(),
+            updated_at: 0,
+            mine: false,
+        }
+    }
+
+    #[test]
+    fn review_average_is_two_decimals_and_zero_when_empty() {
+        assert_eq!(rating_average(&[]), 0.0);
+        // 4 + 5 + 5 = 14 / 3 = 4.666… -> 4.67
+        assert_eq!(rating_average(&[rv(4), rv(5), rv(5)]), 4.67);
+    }
+
+    #[test]
+    fn review_histogram_buckets_by_star_and_ignores_out_of_range() {
+        // Ratings outside 1..=5 cannot be written through the handler, but a row
+        // predating the check must not panic on the index.
+        let hist = rating_histogram(&[rv(1), rv(5), rv(5), rv(0), rv(9)]);
+        assert_eq!(hist, [1, 0, 0, 0, 2]);
     }
 
     #[test]

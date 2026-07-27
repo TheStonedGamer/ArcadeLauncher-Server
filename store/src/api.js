@@ -40,6 +40,13 @@ export const fetchGame = (id) => getJSON(`/api/store/games/${encodeURIComponent(
 // Hero picks for the home page, personalized server-side from tracked playtime.
 export const fetchFeatured = () => getJSON('/api/store/featured')
 
+// --- Player reviews (one per user per game; shared with the launcher) ---
+export const fetchReviews = (id) => getJSON(`/api/store/games/${encodeURIComponent(id)}/reviews`)
+export const putReview = (id, rating, body) =>
+  send(`/api/store/games/${encodeURIComponent(id)}/review`, 'PUT', { rating: String(rating), body: body || '' })
+export const deleteReview = (id) =>
+  send(`/api/store/games/${encodeURIComponent(id)}/review`, 'DELETE')
+
 // --- Auth (session cookie) ---
 export const login = (username, password, totp) =>
   send('/api/store/auth/login', 'POST', { username, password, totp: totp || '' })

@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { fetchGame, fmtDate, fmtRating, fmtHours } from '../api.js'
 import LibraryButton from '../components/LibraryButton.jsx'
+import Reviews from '../components/Reviews.jsx'
+import Stars from '../components/Stars.jsx'
 
 function Stat({ label, value }) {
   return (
@@ -38,6 +40,15 @@ export default function GameDetail() {
   return (
     <div className="detail">
       <Link to="/" className="back-link">← Back to store</Link>
+
+      {/* Wide key art above the fold when the game has it. Falls back to nothing
+          rather than the portrait cover — the cover already sits in the sidebar. */}
+      {game.heroArtUrl && (
+        <div className="detail-hero">
+          <img className="detail-hero-blur" src={game.heroArtUrl} alt="" aria-hidden="true" />
+          <img className="detail-hero-img" src={game.heroArtUrl} alt={game.title} />
+        </div>
+      )}
 
       <div className="detail-head">
         <h1>{game.title}</h1>
@@ -99,7 +110,12 @@ export default function GameDetail() {
         </aside>
       </div>
 
-      {game.summary && <p className="detail-summary">{game.summary}</p>}
+      {game.summary && (
+        <section className="detail-about">
+          <h2>About this game</h2>
+          <p className="detail-summary">{game.summary}</p>
+        </section>
+      )}
 
       <section className="community">
         <h2>Community stats</h2>
@@ -109,11 +125,22 @@ export default function GameDetail() {
           <Stat label="Sessions" value={(s.playCount || 0).toLocaleString()} />
           <Stat
             label="Player rating"
-            value={s.avgUserRating ? `${s.avgUserRating.toFixed(1)}/5` : '—'}
+            value={
+              s.avgUserRating ? (
+                <span className="stat-stars">
+                  <Stars value={s.avgUserRating} size={15} />
+                  <span>{s.avgUserRating.toFixed(1)}</span>
+                </span>
+              ) : (
+                '—'
+              )
+            }
           />
           <Stat label="Reviews" value={(s.reviewCount || 0).toLocaleString()} />
         </div>
       </section>
+
+      <Reviews gameId={game.id} />
     </div>
   )
 }
