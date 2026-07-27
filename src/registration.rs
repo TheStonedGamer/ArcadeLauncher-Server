@@ -247,7 +247,7 @@ async fn api_auth_register(
         registration_email(&username, &email, ip.as_deref().unwrap_or(""), &approve_url, &deny_url);
     // Notify EVERY enabled admin at their configured email, deduped
     // case-insensitively.
-    let recipients = collect_admin_recipients(&mut c).await;
+    let recipients = collect_admin_recipients(&st.cfg, &mut c).await;
     // Best-effort: a mail failure must never fail the signup. send_admin_email
     // logs the links when SMTP is unconfigured so the admin can still act.
     if recipients.is_empty() {
@@ -363,7 +363,7 @@ async fn api_auth_deny(
 
 // Gather the set of admin notification recipients: every enabled admin's
 // non-empty email, deduped case-insensitively (preserving first-seen casing).
-async fn collect_admin_recipients(c: &mut mysql_async::Conn) -> Vec<String> {
+async fn collect_admin_recipients(cfg: &Config, c: &mut mysql_async::Conn) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     let mut push = |addr: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
@@ -375,6 +375,15 @@ async fn collect_admin_recipients(c: &mut mysql_async::Conn) -> Vec<String> {
             out.push(a.to_string());
         }
     };
+    // The explicitly configured notify address comes first, so the operator
+    // gets the mail even when no admin_users row carries a deliverable address
+    // (ARCADE_ADMIN_EMAIL is often a placeholder like admin@host.local).
+    // ARCADE_ADMIN_EMAIL is the fallback the "no recipient" warning names.
+    if !cfg.registration_notify_email.trim().is_empty() {
+        push(&cfg.registration_notify_email, &mut seen, &mut out);
+    } else {
+        push(&cfg.admin_email, &mut seen, &mut out);
+    }
     let rows: Vec<String> = c
         .query("SELECT email FROM admin_users WHERE is_admin=TRUE AND enabled=TRUE AND email IS NOT NULL AND email<>''")
         .await

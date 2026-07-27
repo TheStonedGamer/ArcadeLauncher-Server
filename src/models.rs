@@ -100,6 +100,9 @@ struct Config {
     auth_token: String,
     admin_username: String,
     admin_email: String,
+    // Where signup approval mail goes. Falls back to admin_email when unset;
+    // either way the enabled admin_users addresses are also notified.
+    registration_notify_email: String,
     admin_password: String,
     admin_secure_cookie: bool,
     db_host: String,
@@ -225,6 +228,7 @@ impl Config {
             auth_token: env_string("ARCADE_AUTH_TOKEN", ""),
             admin_username: env_string("ARCADE_ADMIN_USERNAME", "admin"),
             admin_email: env_string("ARCADE_ADMIN_EMAIL", ""),
+            registration_notify_email: env_string("ARCADE_REGISTRATION_NOTIFY_EMAIL", ""),
             admin_password: env_string("ARCADE_ADMIN_PASSWORD", ""),
             admin_secure_cookie: env_string("ARCADE_ADMIN_SECURE_COOKIE", "false") == "true",
             db_host: env_string("ARCADE_DB_HOST", "127.0.0.1"),
