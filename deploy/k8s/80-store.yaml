@@ -20,8 +20,8 @@ spec:
       containers:
         - name: store
           # Pinned by digest for the same reason as the API deployment.
-          # Currently store 0.2.6.
-          image: brianthemint/arcadelauncher-store@sha256:1209c6e6130ad04dfb7b68e6f5f4d78313ed92261f169e9d0cefffafc53fa9e7
+          # Currently store 0.2.7.
+          image: brianthemint/arcadelauncher-store@sha256:4d3711d419c96ada93065806a5abc39732c0b21ab22ed6655a7d575a8ddac775
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
