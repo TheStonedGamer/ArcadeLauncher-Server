@@ -65,7 +65,14 @@ export default function Featured({ picks, personalized }) {
       <div className="featured-body">
         <Link to={href} className="featured-art" title={game.title}>
           {art ? (
-            <img src={art} alt={game.title} />
+            <>
+              {/* Same image twice: a blurred, cropped copy fills the 16:9 slot,
+                  and the real one sits on top uncropped. The art may be wide key
+                  art or — until IGDB enrichment fills heroArtUrl — a portrait
+                  cover, and cropping a cover to a banner cuts off the title. */}
+              <img className="featured-art-blur" src={art} alt="" aria-hidden="true" />
+              <img className="featured-art-img" src={art} alt={game.title} />
+            </>
           ) : (
             <span className="featured-logo">{game.title}</span>
           )}

@@ -250,8 +250,19 @@ a:hover { color: #fff; }
   background: linear-gradient(180deg, var(--panel), var(--bg-2));
   border: 1px solid #0e1620; border-radius: 3px; overflow: hidden;
 }
-.featured-art { display: block; aspect-ratio: 16 / 9; background: var(--bg-2); }
-.featured-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.featured-art { display: block; position: relative; aspect-ratio: 16 / 9; background: var(--bg-2); overflow: hidden; }
+/* Blurred, cropped fill behind the art, so a portrait cover in a 16:9 slot reads
+   as deliberate letterboxing instead of dead panel. scale() hides the soft edge
+   the blur leaves at the boundary. */
+.featured-art-blur {
+  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  filter: blur(28px) saturate(1.3) brightness(.45); transform: scale(1.2);
+}
+/* `contain`, not `cover`: never crop the art. Wide key art fills the slot edge
+   to edge; a portrait cover is centred at full height. */
+.featured-art-img {
+  position: relative; width: 100%; height: 100%; object-fit: contain; display: block;
+}
 .featured-logo {
   display: flex; align-items: center; justify-content: center; height: 100%;
   padding: 16px; text-align: center; color: var(--text-dim); font-size: 20px;
