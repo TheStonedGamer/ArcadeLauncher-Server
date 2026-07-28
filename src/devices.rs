@@ -16,7 +16,7 @@
 const DEVICE_FIELD_MAX: usize = 64;
 
 /// A signed-in client on one machine.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Device {
     /// Stable per-install identifier chosen by the client and persisted there.
     pub id: String,
@@ -185,6 +185,40 @@ pub fn check_install_target(
     Ok(target)
 }
 
+/// One server instance's contribution to the cross-instance device registry:
+/// the machines it currently holds sockets for, and when it last said so.
+///
+/// This exists because `SocialHub` is per-process. With more than one API
+/// replica behind a load balancer the phone and the PC routinely land on
+/// different instances, and a picker built only from local sockets shows the
+/// user an empty list even though their PC is plainly signed in.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceRegistryEntry {
+    /// Unix seconds, as measured by the publishing instance.
+    pub at: u64,
+    pub devices: Vec<Device>,
+}
+
+/// Fold every instance's registry entry into the one list the picker shows.
+///
+/// Entries older than `ttl_secs` are dropped: an instance that was killed
+/// without unregistering would otherwise advertise machines nobody can reach,
+/// and offering a dead target is worse than a briefly short list. The clocks
+/// belong to different hosts, so an entry stamped in the future is kept rather
+/// than treated as expired — skew must not delete a live device.
+pub fn merge_device_registry(
+    entries: Vec<DeviceRegistryEntry>,
+    now: u64,
+    ttl_secs: u64,
+) -> Vec<Device> {
+    let fresh: Vec<Device> = entries
+        .into_iter()
+        .filter(|e| now.saturating_sub(e.at) <= ttl_secs)
+        .flat_map(|e| e.devices)
+        .collect();
+    collapse_devices(fresh)
+}
+
 #[cfg(test)]
 mod devices_tests {
     use super::*;
@@ -320,5 +354,66 @@ mod devices_tests {
         let codes: std::collections::HashSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len());
         assert!(all.iter().all(|r| !r.message().is_empty()));
+    }
+
+    fn entry(at: u64, devices: Vec<Device>) -> DeviceRegistryEntry {
+        DeviceRegistryEntry { at, devices }
+    }
+
+    #[test]
+    fn registry_merges_devices_from_every_instance() {
+        // The exact bug: phone on one replica, PC on another.
+        let merged = merge_device_registry(
+            vec![
+                entry(1000, vec![dev("phone", "Pixel", "mobile")]),
+                entry(1000, vec![dev("pc", "Living Room", "desktop")]),
+            ],
+            1000,
+            75,
+        );
+        let ids: Vec<&str> = merged.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["pc", "phone"]); // desktops first, per collapse_devices
+    }
+
+    #[test]
+    fn registry_drops_entries_from_instances_that_stopped_reporting() {
+        let merged = merge_device_registry(
+            vec![
+                entry(900, vec![dev("dead", "Old Replica PC", "desktop")]),
+                entry(1000, vec![dev("pc", "Living Room", "desktop")]),
+            ],
+            1000,
+            75,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "pc");
+    }
+
+    #[test]
+    fn registry_keeps_entries_stamped_in_the_future() {
+        // Clock skew between hosts must never hide a live machine.
+        let merged = merge_device_registry(vec![entry(1100, vec![dev("pc", "PC", "desktop")])], 1000, 75);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn registry_dedupes_a_device_reported_by_two_instances() {
+        // Happens across a reconnect: the old instance has not yet expired.
+        let merged = merge_device_registry(
+            vec![
+                entry(1000, vec![dev("pc", "PC", "desktop")]),
+                entry(1000, vec![dev("pc", "PC", "desktop")]),
+            ],
+            1000,
+            75,
+        );
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn registry_entry_survives_a_json_round_trip() {
+        let e = entry(1000, vec![dev("pc", "Living Room", "desktop")]);
+        let text = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<DeviceRegistryEntry>(&text).unwrap(), e);
     }
 }

@@ -25,6 +25,23 @@ use redis::AsyncCommands;
 const ONLINE_TTL_SECS: u64 = 75;
 const FANOUT_CHANNEL: &str = "social:fanout";
 
+// The device registry is a hash per user, field = publishing instance id. Redis
+// cannot expire individual hash fields, so freshness is decided on read from the
+// timestamp inside each entry (see `merge_device_registry`); this TTL only stops
+// the key itself outliving an account that never signs in again.
+const DEVICES_KEY_TTL_SECS: u64 = 3600;
+
+fn devices_key(user_id: u64) -> String {
+    format!("social:devices:{user_id}")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 struct Fanout {
     instance: u64,
     // Connection manager for publishes + online-key ops (cheap to clone).
@@ -38,6 +55,11 @@ static FANOUT: std::sync::OnceLock<Option<Fanout>> = std::sync::OnceLock::new();
 
 fn fanout() -> Option<&'static Fanout> {
     FANOUT.get().and_then(|o| o.as_ref())
+}
+
+/// True when frames can reach other instances at all.
+fn fanout_enabled() -> bool {
+    fanout().is_some()
 }
 
 // Initialize the fan-out bus. Called once from main when a Redis URL is set; a
@@ -93,7 +115,15 @@ async fn init_fanout(url: &str) {
                             if env.origin == instance {
                                 continue; // we already delivered locally
                             }
-                            social_hub().deliver_local(env.user_id, &env.frame);
+                            match env.device.as_deref() {
+                                // Addressed to one machine (remote install): only
+                                // the instance actually holding that socket
+                                // delivers, the rest no-op.
+                                Some(device_id) => {
+                                    social_hub().send_to_device(env.user_id, device_id, &env.frame);
+                                }
+                                None => social_hub().deliver_local(env.user_id, &env.frame),
+                            }
                         }
                     }
                     Err(e) => {
@@ -115,21 +145,91 @@ struct FanoutEnvelope {
     #[serde(rename = "userId")]
     user_id: u64,
     frame: String,
+    // Some(device_id) narrows delivery to a single machine; None means every
+    // socket the account has on the receiving instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
 }
 
 // Publish a text frame to peer instances (no-op when Redis is disabled). Never
 // blocks: serializes and enqueues onto the publisher task.
 fn fanout_publish(user_id: u64, frame: &str) {
+    fanout_publish_inner(user_id, frame, None);
+}
+
+// Publish a frame meant for one machine of the account. Used by remote install
+// when the target PC's socket lives on another instance.
+fn fanout_publish_device(user_id: u64, device_id: &str, frame: &str) {
+    fanout_publish_inner(user_id, frame, Some(device_id.to_string()));
+}
+
+fn fanout_publish_inner(user_id: u64, frame: &str, device: Option<String>) {
     if let Some(f) = fanout() {
         let env = FanoutEnvelope {
             origin: f.instance,
             user_id,
             frame: frame.to_string(),
+            device,
         };
         if let Ok(payload) = serde_json::to_string(&env) {
             let _ = f.tx.send(payload);
         }
     }
+}
+
+// Publish (or, when the list is empty, withdraw) this instance's device list for
+// one user. Fire-and-forget: a missed write costs at most one stale picker until
+// the next heartbeat rewrites it.
+fn fanout_set_devices(user_id: u64, devices: &[Device]) {
+    let Some(f) = fanout() else { return };
+    let mut conn = f.conn.clone();
+    let field = f.instance.to_string();
+    let key = devices_key(user_id);
+    if devices.is_empty() {
+        tokio::spawn(async move {
+            let _: redis::RedisResult<i64> = conn.hdel(key, field).await;
+        });
+        return;
+    }
+    let entry = DeviceRegistryEntry {
+        at: unix_now(),
+        devices: devices.to_vec(),
+    };
+    let Ok(payload) = serde_json::to_string(&entry) else { return };
+    tokio::spawn(async move {
+        let _: redis::RedisResult<i64> = conn.hset(&key, field, payload).await;
+        let _: redis::RedisResult<bool> = conn.expire(&key, DEVICES_KEY_TTL_SECS as i64).await;
+    });
+}
+
+// Every machine of this account the cluster can currently reach: `local` (this
+// instance's live sockets, always trusted) unioned with what peers published.
+// Falls back to `local` alone whenever Redis is off or unreachable, which is
+// exactly the old single-instance behavior.
+async fn fanout_devices(user_id: u64, local: Vec<Device>) -> Vec<Device> {
+    let Some(f) = fanout() else {
+        return collapse_devices(local);
+    };
+    let mut conn = f.conn.clone();
+    let raw: std::collections::HashMap<String, String> = match conn.hgetall(devices_key(user_id)).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("redis: device registry read failed ({e}); using local devices only");
+            return collapse_devices(local);
+        }
+    };
+    let mut entries: Vec<DeviceRegistryEntry> = raw
+        .iter()
+        // Our own field is ignored: `local` is the live truth for this instance
+        // and is never stale, whereas our published copy can lag a disconnect.
+        .filter(|(field, _)| *field != &f.instance.to_string())
+        .filter_map(|(_, v)| serde_json::from_str(v).ok())
+        .collect();
+    entries.push(DeviceRegistryEntry {
+        at: unix_now(),
+        devices: local,
+    });
+    merge_device_registry(entries, unix_now(), ONLINE_TTL_SECS)
 }
 
 // Mark / refresh / clear a user's cross-instance online key. Fire-and-forget;

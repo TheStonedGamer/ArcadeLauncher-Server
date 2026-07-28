@@ -2289,7 +2289,7 @@ async fn social_socket(
 
     // Every one of this account's own sockets learns the new device list, so a
     // phone that is already open sees a PC appear without polling.
-    push_device_list(uid);
+    push_device_list(uid).await;
 
     // Outbound pump: drains the hub channel to the socket. Also emits a server
     // heartbeat every 25s so idle connections (and proxies) stay alive.
@@ -2348,7 +2348,7 @@ async fn social_socket(
 
     // Teardown: drop this connection; if it was the last, go offline + notify.
     let last = social_hub().unregister(uid, conn_id);
-    push_device_list(uid);
+    push_device_list(uid).await;
     if last {
         social_hub().drop_voice_for(uid);
         // A client that dies mid-ring never sends `end`; the callee is still
@@ -2430,15 +2430,25 @@ struct WsEnvelope {
     action: String,
 }
 
-// Broadcast the account's current device list to its own sockets. Local-only on
-// purpose: the list describes sockets held by *this* instance, so fanning it out
-// over Redis would let a peer instance advertise targets it cannot reach.
-fn push_device_list(uid: u64) {
-    let devices = social_hub().devices_for(uid);
-    social_hub().deliver_local(
-        uid,
-        &serde_json::json!({ "type": "devices", "devices": devices }).to_string(),
-    );
+// The account's machines across the whole cluster: this instance's live sockets,
+// republished to the shared registry, unioned with what the other instances
+// published. Without this the picker only ever sees devices that happened to
+// land on the same replica as the asking client — which, with more than one API
+// replica and no session affinity, is usually not the user's PC.
+async fn all_devices(uid: u64) -> Vec<Device> {
+    let local = social_hub().devices_for(uid);
+    fanout_set_devices(uid, &local);
+    fanout_devices(uid, local).await
+}
+
+// Broadcast the account's current device list to its own sockets, everywhere.
+// The frame is fanned out because the list is now cluster-wide: a phone on
+// another instance must learn that a PC appeared without having to poll.
+async fn push_device_list(uid: u64) {
+    let devices = all_devices(uid).await;
+    let frame = serde_json::json!({ "type": "devices", "devices": devices }).to_string();
+    social_hub().deliver_local(uid, &frame);
+    fanout_publish(uid, &frame);
 }
 
 async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt: &str) {
@@ -2451,6 +2461,9 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
             // (no fan-out) and refresh the cross-instance online TTL.
             social_hub().deliver_local(uid, &serde_json::json!({ "type": "pong" }).to_string());
             fanout_refresh_online(uid);
+            // Restamp our device registry entry too: peers decide freshness from
+            // that timestamp, so a long-idle PC must keep saying it is here.
+            fanout_set_devices(uid, &social_hub().devices_for(uid));
         }
         "presence" => {
             // dnd is an alias for busy (ROADMAP 1.6). 'offline' is accepted so a
@@ -2608,14 +2621,14 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
         "devices" => {
             // The phone asks for the picker contents; everyone on the account
             // gets the same answer so no socket holds a stale list.
-            push_device_list(uid);
+            push_device_list(uid).await;
         }
         "remote_install" => {
             // Install a game on another machine *of the same account*. There is
             // no cross-account addressing here at all: the candidate list is
             // this user's own live sockets, so nothing to authorise beyond the
             // token that already opened this connection.
-            let devices = social_hub().devices_for(uid);
+            let devices = all_devices(uid).await;
             match check_install_target(&env.device_id, &env.game_id, &devices) {
                 Ok(target) => {
                     let cmd = serde_json::json!({
@@ -2625,7 +2638,17 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
                         "fromDeviceId": my_device,
                     })
                     .to_string();
-                    let delivered = social_hub().send_to_device(uid, &target, &cmd);
+                    // Local socket first (the common case, and the only one that
+                    // can be confirmed synchronously). Otherwise the PC is on a
+                    // peer instance: relay it there. Nobody can hand back a
+                    // delivery receipt over pub/sub, so we report success on the
+                    // strength of the registry entry `check_install_target` just
+                    // matched — at most ONLINE_TTL_SECS old. The PC itself
+                    // reports install progress afterwards either way.
+                    let delivered = social_hub().send_to_device(uid, &target, &cmd) || {
+                        fanout_publish_device(uid, &target, &cmd);
+                        fanout_enabled()
+                    };
                     // Report acceptance to every socket on the account, not just
                     // the requester, so a second phone sees the install too.
                     social_hub().deliver_local(
