@@ -149,6 +149,97 @@ async fn push_call(st: &AppState, callee: u64, caller_id: u64, video: bool) -> b
     delivered
 }
 
+// ----------------------------------------------------------------------------
+// Admin-originated alerts: a test send, and a broadcast to everyone
+// ----------------------------------------------------------------------------
+
+/// Send one alert to one account's devices.
+async fn push_alert_to_user(st: &AppState, user_id: u64, alert: &Alert) -> SendReport {
+    let tokens = load_push_tokens(st, user_id).await;
+    push_alert_to_tokens(st, &[(user_id, tokens)], alert).await
+}
+
+/// Send one alert to every registered device on the server.
+///
+/// Sends are sequential on purpose. A broadcast is rare and never urgent, and a
+/// burst of parallel requests is the reliable way to meet FCM's rate limits.
+async fn push_alert_everyone(st: &AppState, alert: &Alert) -> SendReport {
+    push_alert_to_tokens(st, &load_all_push_tokens(st).await, alert).await
+}
+
+/// The shared send loop. `groups` is per-account so the report can say how many
+/// people were reached, not just how many handsets.
+async fn push_alert_to_tokens(
+    st: &AppState,
+    groups: &[(u64, Vec<PushToken>)],
+    alert: &Alert,
+) -> SendReport {
+    let mut report = SendReport::default();
+    for (_, tokens) in groups {
+        if !tokens.is_empty() {
+            report.accounts += 1;
+            report.devices += tokens.len();
+        }
+    }
+    if report.devices == 0 {
+        return report;
+    }
+    let Some(svc) = push_service() else { return report };
+    let Some(access) = svc.access_token().await else { return report };
+    let endpoint = send_endpoint(&svc.account);
+    for (user_id, tokens) in groups {
+        for token in tokens {
+            let body = alert_push_message(token, alert);
+            match svc.http.post(&endpoint).bearer_auth(&access).json(&body).send().await {
+                Ok(r) if r.status().is_success() => report.delivered += 1,
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    let text = r.text().await.unwrap_or_default();
+                    if token_is_dead(status, &text) {
+                        forget_push_token(st, *user_id, token.as_str()).await;
+                        report.dead += 1;
+                    } else {
+                        tracing::warn!("push: alert send failed ({status}): {text}");
+                    }
+                }
+                Err(e) => tracing::warn!("push: alert send error: {e}"),
+            }
+        }
+    }
+    report
+}
+
+/// Every registered device, grouped by account.
+async fn load_all_push_tokens(st: &AppState) -> Vec<(u64, Vec<PushToken>)> {
+    let Ok(mut c) = st.db.get_conn().await else { return Vec::new() };
+    let rows: Vec<(u64, String)> = c
+        .query("SELECT user_id, token FROM push_tokens ORDER BY user_id")
+        .await
+        .unwrap_or_default();
+    let mut out: Vec<(u64, Vec<PushToken>)> = Vec::new();
+    for (user_id, raw) in rows {
+        let Some(token) = parse_push_token(&raw) else { continue };
+        match out.last_mut() {
+            Some((id, tokens)) if *id == user_id => tokens.push(token),
+            _ => out.push((user_id, vec![token])),
+        }
+    }
+    out
+}
+
+/// How many devices each account has registered, for the admin page. Accounts
+/// with no device are omitted — the page is about who can actually be reached.
+async fn push_device_counts(st: &AppState) -> Vec<(u64, String, u64)> {
+    let Ok(mut c) = st.db.get_conn().await else { return Vec::new() };
+    c.query(
+        r#"SELECT p.user_id, COALESCE(u.username, CONCAT('#', p.user_id)), COUNT(*)
+           FROM push_tokens p LEFT JOIN admin_users u ON u.id = p.user_id
+           GROUP BY p.user_id, u.username ORDER BY u.username"#,
+    )
+    .await
+    .unwrap_or_default()
+}
+
 /// The name to show on the phone's lock screen. Falls back to empty, which
 /// push.rs renders as "Someone is calling" rather than a blank.
 async fn display_name_of(st: &AppState, user_id: u64) -> String {

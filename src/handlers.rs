@@ -519,12 +519,25 @@ async fn admin_post(State(st): State<AppState>, headers: HeaderMap, Form(form): 
                 _ => "missing bot or target".to_string(),
             },
             "bot_cleanup" => st_cleanup_bots(&st).await,
+            // ── Admin push (Notifications admin page) ──
+            "push_test" => match form.target_id {
+                Some(target) => admin_send_alert(&st, Some(target), &test_alert()).await,
+                None => "missing target".to_string(),
+            },
+            "push_broadcast" => match parse_alert(
+                form.alert_title.as_deref().unwrap_or(""),
+                form.alert_body.as_deref().unwrap_or(""),
+            ) {
+                Ok(alert) => admin_send_alert(&st, None, &alert).await,
+                Err(e) => e,
+            },
             _ => "No action taken.".to_string(),
         };
         match return_to.as_str() {
             "accounts" => Html(accounts_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
             "requests" => Html(requests_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
             "social-test" => Html(social_test_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
+            "notifications" => Html(notifications_page_html(&st, Some(admin), &msg).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
             _ => Html(admin_html(&st, Some(admin), &msg, &matcher_game_id, &matcher_query).await.unwrap_or_else(|e| format!("error: {e}"))).into_response(),
         }
     }

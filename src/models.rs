@@ -502,6 +502,9 @@ struct AdminForm {
     activity_kind: Option<String>,
     activity_value: Option<i64>,
     message_body: Option<String>,
+    // Admin push (push_test / push_broadcast on the Notifications page).
+    alert_title: Option<String>,
+    alert_body: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

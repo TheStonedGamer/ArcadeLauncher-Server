@@ -133,10 +133,11 @@ fn admin_subnav(active: &str) -> String {
     format!(
         "<aside class=\"sidebar\"><div class=\"brand-block\"><div class=\"brand-mark\">AL</div>\
          <div><div class=\"brand-title\">ArcadeLauncher</div><div class=\"brand-subtitle\">Rust Server</div></div></div>\
-         <nav><a href=\"/admin\">Dashboard</a><a href=\"/admin/metadata\">Metadata</a>{}{}{}</nav></aside>",
+         <nav><a href=\"/admin\">Dashboard</a><a href=\"/admin/metadata\">Metadata</a>{}{}{}{}</nav></aside>",
         item("/admin/accounts", "Accounts", "accounts"),
         item("/admin/requests", "Game Requests", "requests"),
         item("/admin/social-test", "Social Test", "social-test"),
+        item("/admin/notifications", "Notifications", "notifications"),
     )
 }
 
@@ -419,4 +420,102 @@ async fn admin_social_test_page(State(st): State<AppState>, headers: HeaderMap) 
         .into_response(),
         _ => Html(login_html("Please sign in first.")).into_response(),
     }
+}
+
+// ── Notifications page ───────────────────────────────────────────────────────
+
+async fn notifications_page_html(st: &AppState, admin: Option<User>, message: &str) -> Result<String> {
+    let signed = admin.map(|a| a.username).unwrap_or_default();
+    let counts = push_device_counts(st).await;
+    let total_devices: u64 = counts.iter().map(|(_, _, n)| n).sum();
+
+    // The page leads with whether push works at all, because every control on it
+    // is a no-op otherwise and "nothing happened" is a miserable thing to debug.
+    let status = if push_enabled() {
+        format!(
+            "<p class=\"muted\">FCM is configured. {total_devices} device(s) registered across {} account(s).</p>",
+            counts.len()
+        )
+    } else {
+        format!("<p class=\"muted\"><strong>{}</strong></p>", esc(PUSH_DISABLED_MESSAGE))
+    };
+
+    let device_opts: String = counts
+        .iter()
+        .map(|(id, name, n)| {
+            format!("<option value='{id}'>{} — {n} device(s)</option>", esc(name))
+        })
+        .collect();
+    let no_devices = if counts.is_empty() {
+        "<p class=\"muted\">No account has registered a device yet. Sign in on the phone app and allow notifications.</p>"
+    } else {
+        ""
+    };
+    let test_form = if counts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<form method=\"post\" class=\"row\"><input type=\"hidden\" name=\"return_to\" value=\"notifications\"><input type=\"hidden\" name=\"action\" value=\"push_test\">\
+             <label>Account<select name=\"target_id\">{device_opts}</select></label>\
+             <button type=\"submit\">Send Test</button></form>"
+        )
+    };
+
+    Ok(shell(&format!(
+        r##"
+        <div class="admin-layout">
+          {subnav}
+          <div class="content">
+            <section class="topbar"><div><div class="eyebrow">Operations</div><h1>Notifications</h1></div><div class="account-box"><span>Signed in as <strong>{signed}</strong></span><a class="buttonlink" href="/admin/logout">Sign Out</a></div></section>
+            {notice}
+
+            <section class="section"><div class="section-heading"><h2>Push Status</h2><span class="muted">Whether this server can wake a phone, and which accounts have a device registered.</span></div>
+              {status}
+              {no_devices}
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Send Test Notification</h2><span class="muted">Delivers a clearly-labelled test to every device registered to one account. Safe to repeat.</span></div>
+              {test_form}
+            </section>
+
+            <section class="section"><div class="section-heading"><h2>Broadcast Alert</h2><span class="muted">Sends to every registered device on the server, once. There is no recall — check the wording before sending.</span></div>
+              <form method="post" onsubmit="return confirm('Send this alert to all {total_devices} registered device(s)? This cannot be undone.');"><input type="hidden" name="return_to" value="notifications"><input type="hidden" name="action" value="push_broadcast">
+                <div class="row"><label>Title<input name="alert_title" maxlength="{title_max}" placeholder="{default_title}"></label></div>
+                <div class="row"><label>Message<input name="alert_body" maxlength="{body_max}" placeholder="e.g. Server maintenance at 10pm — expect a short outage." size="60"></label></div>
+                <div class="row"><button type="submit" class="danger">Send To Everyone</button></div>
+              </form>
+            </section>
+          </div>
+        </div>
+        "##,
+        subnav = admin_subnav("notifications"),
+        signed = esc(&signed),
+        notice = notice(message),
+        title_max = ALERT_TITLE_MAX,
+        body_max = ALERT_BODY_MAX,
+        default_title = ALERT_DEFAULT_TITLE,
+    )))
+}
+
+async fn admin_notifications_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match current_admin(&st.db, &headers).await {
+        Ok(Some(admin)) => Html(
+            notifications_page_html(&st, Some(admin), "").await.unwrap_or_else(|e| format!("error: {e}")),
+        )
+        .into_response(),
+        _ => Html(login_html("Please sign in first.")).into_response(),
+    }
+}
+
+/// Shared by the test and broadcast actions: refuse early when push is off, so
+/// the admin gets the real reason instead of "delivered to 0 devices".
+async fn admin_send_alert(st: &AppState, target: Option<u64>, alert: &Alert) -> String {
+    if !push_enabled() {
+        return PUSH_DISABLED_MESSAGE.to_string();
+    }
+    let report = match target {
+        Some(user_id) => push_alert_to_user(st, user_id, alert).await,
+        None => push_alert_everyone(st, alert).await,
+    };
+    send_summary(&report)
 }
