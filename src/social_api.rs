@@ -172,6 +172,13 @@ async fn ensure_social_schema(c: &mut mysql_async::Conn) -> Result<()> {
     let _ = c
         .query_drop("ALTER TABLE social_messages ADD COLUMN client_nonce VARCHAR(40) NULL")
         .await;
+    // Device push tokens, so a call can ring a phone whose app is closed.
+    ensure_push_tables(&mut *c).await?;
+    // Non-chat conversation entries (missed calls today). Defaulting to 'text'
+    // means every pre-existing row keeps its meaning without a backfill.
+    let _ = c
+        .query_drop("ALTER TABLE social_messages ADD COLUMN kind VARCHAR(24) NOT NULL DEFAULT 'text'")
+        .await;
     // User profiles (ROADMAP 1.4).
     c.query_drop(
         r#"CREATE TABLE IF NOT EXISTS social_profiles (
@@ -583,6 +590,9 @@ struct SocialHub {
     // Audio frames are relayed only between pairs in this set so the hot path
     // never touches the database (verification happens once at invite/accept).
     voice_pairs: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+    // Invites relayed but not yet answered, so the server (not a client) decides
+    // what an unanswered call leaves behind. See calls.rs.
+    rings: std::sync::Mutex<Rings>,
 }
 
 static SOCIAL_HUB: std::sync::OnceLock<SocialHub> = std::sync::OnceLock::new();
@@ -592,6 +602,7 @@ fn social_hub() -> &'static SocialHub {
         conns: std::sync::Mutex::new(std::collections::HashMap::new()),
         next_id: std::sync::atomic::AtomicU64::new(1),
         voice_pairs: std::sync::Mutex::new(std::collections::HashSet::new()),
+        rings: std::sync::Mutex::new(Rings::new()),
     })
 }
 
@@ -692,6 +703,28 @@ impl SocialHub {
     fn voice_allowed(&self, a: u64, b: u64) -> bool {
         self.voice_pairs.lock().unwrap().contains(&pair(a, b))
     }
+    fn ring_start(&self, caller: u64, callee: u64, video: bool, now: i64) {
+        self.rings.lock().unwrap().start(caller, callee, video, now);
+    }
+    fn ring_answered(&self, caller: u64, callee: u64) {
+        self.rings.lock().unwrap().answered(caller, callee);
+    }
+    /// Resolve a ring an `end` frame refers to, in whichever direction it ran.
+    fn ring_ended(&self, a: u64, b: u64) -> Option<(u64, u64, Ringing)> {
+        self.rings.lock().unwrap().ended_either_way(a, b)
+    }
+    fn rings_for(&self, user_id: u64) -> Vec<(u64, u64, Ringing)> {
+        self.rings.lock().unwrap().drop_for(user_id)
+    }
+    /// Calls still ringing this user, left live — for replay to a socket that
+    /// has just connected.
+    fn rings_incoming(&self, user_id: u64) -> Vec<(u64, Ringing)> {
+        self.rings.lock().unwrap().incoming_for(user_id)
+    }
+    fn rings_expired(&self, now: i64) -> Vec<(u64, u64, Ringing)> {
+        self.rings.lock().unwrap().expired(now, RING_TIMEOUT_SECS)
+    }
+
     // Drop every open call pair involving `user_id` (called when they go offline).
     fn drop_voice_for(&self, user_id: u64) {
         self.voice_pairs
@@ -1982,10 +2015,11 @@ async fn api_social_history(
     };
     // `before>0` pages backwards (older than the cursor) for infinite scroll;
     // otherwise the default forward window (newer than `since`) is returned.
-    type HistRow = (u64, u64, u64, String, i64, Option<i64>, Option<i64>, Option<i64>, Option<u64>);
+    type HistRow =
+        (u64, u64, u64, String, i64, Option<i64>, Option<i64>, Option<i64>, Option<u64>, String);
     let rows: Vec<HistRow> = match if q.before > 0 {
         c.exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to, kind
                FROM social_messages
                WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
                  AND id < :before
@@ -1995,7 +2029,7 @@ async fn api_social_history(
         .await
     } else {
         c.exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, edited_at, deleted_at, reply_to, kind
                FROM social_messages
                WHERE ((sender_id=:me AND receiver_id=:other) OR (sender_id=:other AND receiver_id=:me))
                  AND id > :since
@@ -2022,7 +2056,7 @@ async fn api_social_history(
     let msgs: Vec<_> = rows
         .into_iter()
         .rev()
-        .map(|(id, sndr, rcvr, body, ts, read_at, edited_at, deleted_at, reply_to)| {
+        .map(|(id, sndr, rcvr, body, ts, read_at, edited_at, deleted_at, reply_to, kind)| {
             serde_json::json!({
                 "messageId": id,
                 "senderId": sndr,
@@ -2033,6 +2067,7 @@ async fn api_social_history(
                 "editedAt": edited_at,
                 "deleted": deleted_at.is_some(),
                 "replyTo": reply_to,
+                "kind": kind,
                 "reactions": react_map.get(&id).cloned().unwrap_or_default(),
                 "attachmentId": att_map.get(&id).copied().unwrap_or(0),
             })
@@ -2133,6 +2168,23 @@ async fn social_socket(
     // Redeliver anything that happened while this user was offline.
     deliver_pending_notifications(&st, uid, &tx).await;
 
+    // A call can still be ringing us right now — typically because a push woke
+    // this phone up for it. The invite itself was never delivered (there was no
+    // socket), so replay it here; from the client's point of view it is an
+    // ordinary incoming call, and the ring in calls.rs is still the authority
+    // on whether it is live.
+    for (caller, ring) in social_hub().rings_incoming(uid) {
+        social_hub().allow_voice(caller, uid);
+        let _ = tx.send(OutMsg::Text(
+            serde_json::json!({
+                "type": "voice_signal",
+                "fromId": caller,
+                "payload": { "kind": "invite", "video": ring.video },
+            })
+            .to_string(),
+        ));
+    }
+
     // Mark online (unless invisible already chosen) and announce to friends.
     let was_online = social_hub()
         .conns
@@ -2210,6 +2262,11 @@ async fn social_socket(
     push_device_list(uid);
     if last {
         social_hub().drop_voice_for(uid);
+        // A client that dies mid-ring never sends `end`; the callee is still
+        // owed the record, and a callee that dropped genuinely missed the call.
+        for (caller, callee, ring) in social_hub().rings_for(uid) {
+            record_missed_call(&st, caller, callee, ring.video).await;
+        }
         fanout_clear_online(uid); // remove from cross-instance registry
         set_presence(&st.db, uid, "offline", None, None, None).await;
         push_presence_diff(&st, uid).await;
@@ -2368,9 +2425,60 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
                     .get("kind")
                     .and_then(|k| k.as_str())
                     .unwrap_or("");
+                let video = env
+                    .payload
+                    .get("video")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // An invite to somebody with no live socket used to be pushed
+                // into nothing, leaving the caller ringing forever with no way
+                // to find out. Answer the caller instead, and leave the callee
+                // a record of the call they never saw.
+                // ...unless we can wake the phone. A push that FCM accepts
+                // means the callee is asleep rather than absent, so the ring is
+                // left standing: when the app opens, its socket connect replays
+                // the still-live invite and the call proceeds normally. The
+                // sweeper in calls.rs still closes it out if nobody comes.
+                if kind == "invite"
+                    && !social_hub().is_online(env.to)
+                    && push_call(st, env.to, uid, video).await
+                {
+                    social_hub().allow_voice(uid, env.to);
+                    social_hub().ring_start(uid, env.to, video, now());
+                    return;
+                }
+                if kind == "invite" && !social_hub().is_online(env.to) {
+                    social_hub().push(
+                        uid,
+                        &serde_json::json!({
+                            "type": "voice_signal",
+                            "fromId": env.to,
+                            "payload": { "kind": "unreachable" },
+                        })
+                        .to_string(),
+                    );
+                    record_missed_call(st, uid, env.to, video).await;
+                    return;
+                }
                 match kind {
-                    "invite" | "accept" => social_hub().allow_voice(uid, env.to),
-                    "end" => social_hub().disallow_voice(uid, env.to),
+                    "invite" => {
+                        social_hub().allow_voice(uid, env.to);
+                        social_hub().ring_start(uid, env.to, video, now());
+                    }
+                    "accept" => {
+                        social_hub().allow_voice(uid, env.to);
+                        // `uid` is the callee accepting, so the ring runs the
+                        // other way round.
+                        social_hub().ring_answered(env.to, uid);
+                    }
+                    "end" => {
+                        social_hub().disallow_voice(uid, env.to);
+                        // Still ringing → nobody picked up, whether the caller
+                        // gave up or the callee declined.
+                        if let Some((caller, callee, ring)) = social_hub().ring_ended(uid, env.to) {
+                            record_missed_call(st, caller, callee, ring.video).await;
+                        }
+                    }
                     _ => {}
                 }
                 social_hub().push(
@@ -2564,6 +2672,7 @@ async fn handle_ws_chat(
         "text": trimmed,
         "timestamp": ts,
         "replyTo": reply_final,
+        "kind": KIND_TEXT,
     });
     if let Some(ref n) = nonce_opt {
         evt["clientNonce"] = serde_json::Value::String(n.clone());
@@ -2575,6 +2684,70 @@ async fn handle_ws_chat(
     // Deliver to recipient (if online) and echo back to sender for ack + multi-device sync.
     social_hub().push(to, &evt);
     social_hub().push(uid, &evt);
+}
+
+// Resolve rings that outlived their timeout. Normally a client ends its own
+// call and this finds nothing; it exists for the caller that disappeared
+// without a word, so the callee's history is still correct.
+fn start_ring_sweeper(st: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            for (caller, callee, ring) in social_hub().rings_expired(now()) {
+                // Tell the caller so its UI stops ringing, then log the miss.
+                social_hub().push(
+                    caller,
+                    &serde_json::json!({
+                        "type": "voice_signal",
+                        "fromId": callee,
+                        "payload": { "kind": "timeout" },
+                    })
+                    .to_string(),
+                );
+                social_hub().disallow_voice(caller, callee);
+                record_missed_call(&st, caller, callee, ring.video).await;
+            }
+        }
+    });
+}
+
+// Write the conversation line an unanswered call leaves behind, and deliver it
+// to both parties like any other message. Stored as a real `social_messages`
+// row so it survives a restart and reaches a client that was offline for the
+// call — which is the whole point: the caller's client cannot record anything
+// on a device that was not running.
+//
+// The body is human-readable on purpose. A client that predates the `kind`
+// column shows "Missed call" as an ordinary message rather than an empty bubble.
+async fn record_missed_call(st: &AppState, caller: u64, callee: u64, video: bool) {
+    let Ok(mut c) = st.db.get_conn().await else { return; };
+    let ts = now();
+    let body = missed_call_body(video);
+    let ins = c
+        .exec_iter(
+            "INSERT INTO social_messages (sender_id, receiver_id, body, created_at, kind) VALUES (:s, :r, :b, :t, :k)",
+            params! {"s" => caller, "r" => callee, "b" => body, "t" => ts, "k" => KIND_MISSED_CALL},
+        )
+        .await;
+    let msg_id = match ins {
+        Ok(r) => r.last_insert_id().unwrap_or(0),
+        Err(_) => return,
+    };
+    let evt = serde_json::json!({
+        "type": "chat",
+        "messageId": msg_id,
+        "senderId": caller,
+        "receiverId": callee,
+        "text": body,
+        "timestamp": ts,
+        "kind": KIND_MISSED_CALL,
+        "video": video,
+    })
+    .to_string();
+    social_hub().push(callee, &evt);
+    social_hub().push(caller, &evt);
 }
 
 // Toggle a reaction on a message (ROADMAP 1.2b). Only the sender or receiver of
@@ -2755,9 +2928,9 @@ async fn backfill_messages(st: &AppState, uid: u64, after_id: u64) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>)> = match c
+    let rows: Vec<(u64, u64, u64, String, i64, Option<i64>, String)> = match c
         .exec(
-            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at
+            r#"SELECT id, sender_id, receiver_id, body, created_at, read_at, kind
                FROM social_messages
                WHERE (sender_id=:u OR receiver_id=:u) AND id > :since
                ORDER BY id ASC LIMIT 500"#,
@@ -2770,7 +2943,7 @@ async fn backfill_messages(st: &AppState, uid: u64, after_id: u64) {
     };
     let msgs: Vec<_> = rows
         .into_iter()
-        .map(|(id, sndr, rcvr, body, ts, read_at)| {
+        .map(|(id, sndr, rcvr, body, ts, read_at, kind)| {
             serde_json::json!({
                 "messageId": id,
                 "senderId": sndr,
@@ -2778,6 +2951,7 @@ async fn backfill_messages(st: &AppState, uid: u64, after_id: u64) {
                 "text": body,
                 "timestamp": ts,
                 "isRead": read_at.is_some(),
+                "kind": kind,
             })
         })
         .collect::<Vec<_>>();

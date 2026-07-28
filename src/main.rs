@@ -75,6 +75,9 @@ include!("fanout.rs");
 include!("s3.rs");
 include!("devices.rs");
 include!("guard.rs");
+include!("calls.rs");
+include!("push.rs");
+include!("push_api.rs");
 include!("social_api.rs");
 include!("registration.rs");
 include!("password_reset.rs");
@@ -236,6 +239,8 @@ async fn main() -> Result<()> {
         .route("/api/social/attachments/presign", post(api_social_attachment_presign))
         .route("/api/social/attachments/:id", get(api_social_attachment_get))
         .route("/api/social/messages/:id", get(api_social_history))
+        .route("/api/push/register", post(api_push_register))
+        .route("/api/push/unregister", post(api_push_unregister))
         .route("/api/social/notifications", get(api_social_notifications))
         .route(
             "/api/social/notifications/read",
@@ -283,6 +288,7 @@ async fn main() -> Result<()> {
         .with_state(state.clone());
 
     let auto_rescan_state = state.clone();
+    let ring_sweeper_state = state.clone();
     let admin_app = Router::new()
         .route("/", get(admin_page))
         .route("/admin", get(admin_page).post(admin_post))
@@ -332,6 +338,12 @@ async fn main() -> Result<()> {
             });
         }
     }
+
+    // Backstop for calls whose ring never resolved: a caller that vanishes
+    // without closing its socket (killed process, dead network) leaves the ring
+    // live, and the callee is still owed the missed-call record. Every replica
+    // can run this safely — it only touches rings it holds in its own memory.
+    start_ring_sweeper(ring_sweeper_state);
 
     let public_server = axum::serve(listener, public_app);
     let admin_server = axum::serve(admin_listener, admin_app);
