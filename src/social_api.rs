@@ -784,6 +784,23 @@ async fn is_blocked_either(db: &Pool, a: u64, b: u64) -> bool {
     n.unwrap_or(0) > 0
 }
 
+/// Which way round a block runs between `me` and `other`. One query, so the two
+/// directions cannot disagree, and the answer is what `blocks.rs` reasons over.
+async fn block_pair(db: &Pool, me: u64, other: u64) -> BlockPair {
+    let Ok(mut c) = db.get_conn().await else { return BlockPair::default() };
+    let rows: Vec<u64> = c
+        .exec(
+            "SELECT blocker_id FROM social_blocks WHERE (blocker_id=:a AND blocked_id=:b) OR (blocker_id=:b AND blocked_id=:a)",
+            params! {"a" => me, "b" => other},
+        )
+        .await
+        .unwrap_or_default();
+    BlockPair {
+        i_blocked_them: rows.contains(&me),
+        they_blocked_me: rows.contains(&other),
+    }
+}
+
 async fn are_friends(db: &Pool, a: u64, b: u64) -> bool {
     let (lo, hi) = pair(a, b);
     let Ok(mut c) = db.get_conn().await else { return false; };
@@ -984,8 +1001,14 @@ async fn api_social_request(
     if target.id == me.id {
         return (StatusCode::BAD_REQUEST, "Cannot friend yourself").into_response();
     }
-    if is_blocked_either(&st.db, me.id, target.id).await {
-        return (StatusCode::FORBIDDEN, "Blocked").into_response();
+    // "Blocked" told both sides the same thing, which quietly disclosed to the
+    // sender that the other person had blocked them. blocks.rs words the two
+    // directions differently for that reason.
+    if let Some(reason) = interaction_refusal(
+        block_pair(&st.db, me.id, target.id).await,
+        Interaction::FriendRequest,
+    ) {
+        return (StatusCode::FORBIDDEN, reason).into_response();
     }
     // Persistent ignore (ROADMAP 1.1b): if the target has ignored me, or I have
     // ignored the target, pretend the request was sent but create/notify nothing.
@@ -1214,18 +1237,25 @@ async fn api_social_block(
     let Some(me) = launcher_user(&st, &headers).await else {
         return unauthorized();
     };
+    if !valid_block_target(me.id, body.user_id) {
+        return (StatusCode::BAD_REQUEST, "invalid userId").into_response();
+    }
     let mut c = match st.db.get_conn().await {
         Ok(c) => c,
         Err(e) => return server_error(e),
     };
     if body.block {
-        let (lo, hi) = pair(me.id, body.user_id);
-        let _ = c
-            .exec_drop(
-                "DELETE FROM social_friendships WHERE user_lo=:lo AND user_hi=:hi",
-                params! {"lo" => lo, "hi" => hi},
-            )
-            .await;
+        // ON_BLOCK spells out that a block is not only a filter on what comes
+        // next; it ends what is already running. Each field is honoured below.
+        if ON_BLOCK.drop_friendship {
+            let (lo, hi) = pair(me.id, body.user_id);
+            let _ = c
+                .exec_drop(
+                    "DELETE FROM social_friendships WHERE user_lo=:lo AND user_hi=:hi",
+                    params! {"lo" => lo, "hi" => hi},
+                )
+                .await;
+        }
         if let Err(e) = c
             .exec_drop(
                 "INSERT IGNORE INTO social_blocks (blocker_id, blocked_id, created_at) VALUES (:a, :b, :t)",
@@ -1235,6 +1265,28 @@ async fn api_social_block(
         {
             return server_error(e);
         }
+        if ON_BLOCK.end_live_call {
+            // A call in progress survived a block until now: the audio relay is
+            // gated on an in-memory pair that nothing was clearing. Close it in
+            // both directions and tell each side the call ended.
+            social_hub().disallow_voice(me.id, body.user_id);
+            social_hub().disallow_voice(body.user_id, me.id);
+            let _ = social_hub().ring_ended(me.id, body.user_id);
+            for (who, peer) in [(me.id, body.user_id), (body.user_id, me.id)] {
+                social_hub().push(
+                    who,
+                    &serde_json::json!({
+                        "type": "voice_signal",
+                        "fromId": peer,
+                        "payload": { "kind": "end" },
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        // Presence stops flowing as a consequence of the friendship going away
+        // (broadcast_to_friends reads the friendship table), and the removal
+        // notification is what makes each client drop the other from its roster.
         notify_relationship(&st, me.id, body.user_id, "friend_removed").await;
         Json(serde_json::json!({ "status": "blocked" })).into_response()
     } else {
@@ -1249,6 +1301,43 @@ async fn api_social_block(
         }
         Json(serde_json::json!({ "status": "unblocked" })).into_response()
     }
+}
+
+// GET /api/social/blocks — who the caller has blocked.
+//
+// Blocking has been possible since the first social schema, but there was no
+// way to see or undo it: the block removed the friendship, so the person
+// vanished from the roster and took the only Unblock button with them. This is
+// what makes the list recoverable. It returns only blocks the *caller* made —
+// who has blocked you is never disclosed.
+async fn api_social_blocks_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(me) = launcher_user(&st, &headers).await else {
+        return unauthorized();
+    };
+    let mut c = match st.db.get_conn().await {
+        Ok(c) => c,
+        Err(e) => return server_error(e),
+    };
+    let rows: Vec<(u64, i64)> = match c
+        .exec(
+            "SELECT blocked_id, created_at FROM social_blocks WHERE blocker_id=:id ORDER BY created_at DESC",
+            params! {"id" => me.id},
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    // Names are resolved per row rather than joined: the users table lives
+    // behind the same helper every other handler uses, and a deleted account
+    // should leave the block listed (and removable) rather than the whole
+    // request failing.
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, since) in rows {
+        let name = st_username(&st.db, id).await.unwrap_or_default();
+        out.push(serde_json::json!({ "userId": id, "username": name, "since": since }));
+    }
+    Json(serde_json::json!({ "blocked": out })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2419,7 +2508,15 @@ async fn handle_ws_message(st: &AppState, uid: u64, my_device: Option<&str>, txt
             // gate the binary audio relay here: a friendship-verified invite or
             // accept opens the (uid,to) pair for audio; an end closes it. This
             // keeps the per-frame audio path off the database entirely.
-            if env.to != 0 && are_friends(&st.db, uid, env.to).await {
+            //
+            // Friendship *and* the block check. Blocking deletes the friendship,
+            // so asking twice looks redundant — but that made a safety rule
+            // depend on a side effect of an unrelated one. Asked directly, it
+            // holds however a friendship comes to exist.
+            let call_blocked = env.to != 0
+                && interaction_refusal(block_pair(&st.db, uid, env.to).await, Interaction::Call)
+                    .is_some();
+            if env.to != 0 && !call_blocked && are_friends(&st.db, uid, env.to).await {
                 let kind = env
                     .payload
                     .get("kind")
@@ -2595,7 +2692,8 @@ async fn handle_ws_chat(
         return;
     }
     let trimmed: String = text.chars().take(4000).collect();
-    if is_blocked_either(&st.db, uid, to).await {
+    if interaction_refusal(block_pair(&st.db, uid, to).await, Interaction::DirectMessage).is_some()
+    {
         return;
     }
     // DM privacy (ROADMAP 1.1b): honour the recipient's dm_policy, and drop if the

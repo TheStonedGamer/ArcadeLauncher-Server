@@ -76,6 +76,7 @@ include!("s3.rs");
 include!("devices.rs");
 include!("guard.rs");
 include!("calls.rs");
+include!("blocks.rs");
 include!("push.rs");
 include!("push_api.rs");
 include!("social_api.rs");
@@ -213,6 +214,7 @@ async fn main() -> Result<()> {
         .route("/api/social/friends/request", post(api_social_request))
         .route("/api/social/friends/respond", post(api_social_respond))
         .route("/api/social/friends/block", post(api_social_block))
+        .route("/api/social/blocks", get(api_social_blocks_get))
         .route(
             "/api/social/privacy",
             get(api_social_privacy_get).put(api_social_privacy_put),
